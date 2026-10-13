@@ -1,0 +1,20 @@
+# Arquivos do jogo e do console (copyright da Sony e dos estúdios): NUNCA versionar
+# Game and console files: NEVER commit
+/dump/
+/game/
+*.psarc
+*.bin
+*.prx
+*.sprx
+*.sfo
+*.plt
+eboot*
+
+# Saídas de build e dados locais / build outputs and local data
+port/out/
+port/pgo/
+port/user/
+port/dist/
+__pycache__/
+*.pyc
+.DS_Store

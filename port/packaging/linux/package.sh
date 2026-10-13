@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Builds dist/$PORT_SLUG-linux-x86_64.tar.gz after `bash build.sh`: "$PORT_NAME" (the launcher,
+# frozen with PyInstaller so players need no Python or Tk), out/tlg-probe with libtlggpu.so, the
+# libraries they need that a desktop may lack (out/lib: SDL3, FFmpeg, Zydis, fmt, ...), the
+# preparation scripts and the player README. No game or console file may ship.
+set -euo pipefail
+cd -- "$(dirname -- "$0")/../.."
+# shellcheck source=../port.env
+source packaging/port.env
+[[ -f out/tlg-probe && -f out/gpu/libtlggpu.so ]] || { echo 'Build first: bash build.sh' >&2; exit 1; }
+name=${TLG_PACKAGE_NAME:-$PORT_SLUG-linux-x86_64}
+python=${PYTHON:-python3}
+if [[ ! -x out/pyenv/bin/python ]]; then
+    "$python" -m venv out/pyenv
+fi
+out/pyenv/bin/python -m pip install -q --disable-pip-version-check pyinstaller
+# The scripts run inside the executable (--script): the standard modules they import come along.
+hidden=()
+for module in argparse base64 collections hashlib json re shutil struct tempfile xml.etree.ElementTree \
+              urllib.request runpy; do
+    hidden+=(--hidden-import "$module")
+done
+out/pyenv/bin/python -m PyInstaller --noconfirm --clean --log-level WARN --windowed \
+    --name "$PORT_NAME" --distpath out/pyi-dist --workpath out/pyi-work --specpath out/pyi-work \
+    --paths "$PWD/scripts" --paths "$PWD/launcher" "${hidden[@]}" launcher/$PORT_LAUNCHER
+
+dest=out/stage/$name
+rm -rf -- out/stage
+mkdir -p "$dest/out/gpu" "$dest/out/lib" "$dest/launcher" "$dest/system_lib"
+cp -r "out/pyi-dist/$PORT_NAME/." "$dest/"
+cp launcher/$PORT_ICON.png "$dest/launcher/"
+strip --strip-debug -o "$dest/out/tlg-probe" out/tlg-probe
+strip --strip-debug -o "$dest/out/gpu/libtlggpu.so" out/gpu/libtlggpu.so
+[[ -f out/tlg-gpu-capabilities ]] && strip -o "$dest/out/tlg-gpu-capabilities" out/tlg-gpu-capabilities
+# Libraries to bundle: everything the two ELF files load except the base system (glibc, the C++
+# runtime, the Vulkan loader and drivers, X11/Wayland, audio servers), which must come from the
+# player's distribution to match its drivers.
+system='^(ld-linux|libc|libm|libdl|libpthread|librt|libmvec|libresolv|libutil|libstdc\+\+|libgcc_s|libvulkan|libGL|libEGL|libGLX|libGLdispatch|libX|libxcb|libwayland|libdrm|libasound|libpulse|libpipewire|libudev|libdbus|libsystemd|libz\.|libgomp|libcap|libffi)'
+ldd out/tlg-probe out/gpu/libtlggpu.so | awk '/=> \// {print $1, $3}' | sort -u | while read -r soname path; do
+    [[ $soname == libtlggpu.so ]] && continue
+    [[ $soname =~ $system ]] && continue
+    cp -L "$path" "$dest/out/lib/$soname"
+done
+# SDL3 loads its video/audio backends at run time from the player's system: nothing else to copy.
+cp -r scripts "$dest/"
+find "$dest" -name __pycache__ -prune -exec rm -r {} +
+cp LICENSE packaging/README-player.md "$dest/"
+cp packaging/linux/install_desktop.sh packaging/port.env "$dest/"
+cat > "$dest/system_lib/LEIA-ME.txt" <<'TXT'
+Este jogo não precisa de módulos do firmware do console: a pasta fica vazia.
+This game needs no console firmware modules: leave this folder empty.
+TXT
+bash packaging/check_package.sh "$dest"
+mkdir -p dist
+tar -C out/stage -czf "dist/$name.tar.gz" "$name"
+du -sh "$dest" "dist/$name.tar.gz"

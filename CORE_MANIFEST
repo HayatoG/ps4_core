@@ -1,0 +1,61 @@
+# Arquivos do núcleo compartilhado (ps4_core) / Shared-core file list.
+# Caminhos relativos à raiz de um repositório de port (iguais aqui e no port).
+# Paths are relative to a port repo root (identical here and in the port).
+# Linhas: glob de inclusão (fnmatch, "**" casa subpastas); "!" exclui; "@" marca submódulo.
+# Lines: include glob; "!" excludes; "@" marks a submodule (compared by commit, not content).
+
+# Runtime nativo / native runtime
+port/src/*
+!port/src/runtime_tlg.c
+!port/src/runtime_gr2*.c
+!port/src/runtime_infamous*.c
+# Patches de FPS e afins de cada jogo / per-game patch tables
+!port/scripts/tlg_*
+!port/scripts/gr2_*
+!port/scripts/infamous_*
+
+# Loader, link, scripts de preparação / loader and link scripts
+port/scripts/*
+port/build.sh
+port/run.sh
+port/run.py
+port/msys2-env.sh
+port/shell.nix
+port/LICENSE
+port/UPSTREAM.md
+port/.gitignore
+port/docs/*
+
+# Camada de GPU (shadPS4 fork + shim) / GPU layer
+port/gpu/*
+@port/gpu/third_party/fsr-vulkan
+@port/gpu/third_party/imgui
+@port/gpu/third_party/magic_enum
+@port/gpu/third_party/miniz
+@port/gpu/third_party/vulkan-headers
+@port/gpu/third_party/xbyak
+@port/third_party/LibAtrac9
+
+# Testes e ferramentas / tests and tools
+port/tests/*
+port/tools/*
+port/launcher/tlg_vulkan.py
+
+# Empacotamento genérico / generic packaging (per-game: port.env, icon, README-player, *.rc)
+port/packaging/*
+!port/packaging/port.env
+!port/packaging/icon/*
+!port/packaging/README-player.md
+!port/packaging/windows/*.rc
+
+# Ferramentas genéricas do repositório / generic repo tools
+scripts/make_game_view.py
+scripts/session_chart.py
+scripts/sce_imports.py
+scripts/psarc_toc.py
+scripts/watch_session.sh
+scripts/ftp_mirror.sh
+scripts/ftp_verify.sh
+scripts/import_usb_dump.sh
+scripts/usb_dump_progress.sh
+scripts/install_desktop.sh
