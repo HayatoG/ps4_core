@@ -3,8 +3,11 @@
 # Paths are relative to a port repo root (identical here and in the port).
 # Linhas: glob de inclusão (fnmatch, "**" casa subpastas); "!" exclui; "@" marca submódulo.
 # Lines: include glob; "!" excludes; "@" marks a submodule (compared by commit, not content).
+# A raiz docs/ e tools/ é só do ps4_core (não está aqui) / root docs/ and tools/ belong to ps4_core only.
+# Conferido em 13/10/2026 contra tlg_pc, gr2_pc e infamous_pc origin/main: fora do manifesto ficam só
+# arquivos do jogo (runtime_<slug>*.c, <slug>_patches.py, launchers, ícones, port.env, .rc, README).
 
-# Runtime nativo / native runtime
+# Runtime nativo / native runtime (inclui runtime_game.h, rascunho / includes the runtime_game.h draft)
 port/src/*
 !port/src/runtime_tlg.c
 !port/src/runtime_gr2*.c
