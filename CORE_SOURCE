@@ -1,4 +1,4 @@
 # De onde veio o núcleo (linhagem usada pelo tools/core_sync.py para saber quem está atrás).
 # Where the core came from (lineage that tools/core_sync.py checks to tell who is behind).
 # <repositório/repo> <ref> [commit importado/imported commit]
-~/decomp/infamous_pc main 4448ef2a3d73ab3032f69082f5c80051dfbd517b
+~/decomp/infamous_pc origin/main f76850a  # whole core (base import 4448ef2; + 35d2aba loader binding fix, 335c0b7 write merge / download window)

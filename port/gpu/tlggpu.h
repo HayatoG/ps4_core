@@ -37,6 +37,9 @@ int tlggpu_choice_poll(void);
 int tlggpu_overlay_captures_input(void);
 /* A short message at the top of the screen (any thread). */
 void tlggpu_overlay_notice(const char *text, float seconds);
+/* Guest memcpy (src) / memset (src NULL, fill) into GPU-modified memory without a fault or a
+ * GPU wait (TLG_WRITE_MERGE=1); 0: the caller writes normally. */
+int tlggpu_cpu_write(void *dst, const void *src, int fill, uint64_t size);
 /* Number of symbols registered by the vendored libraries (diagnostics). */
 unsigned tlggpu_symbol_count(void);
 #ifdef __cplusplus

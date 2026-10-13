@@ -161,11 +161,17 @@ static ABI __attribute__((noreturn)) void stack_fail(void) {
     fputs("STOP: guest stack protector detected corruption\n", stderr);
     exit(22);
 }
+/* Writes of 64 bytes or more into GPU-modified memory go through tlggpu_cpu_write (no fault and no
+ * GPU wait with TLG_WRITE_MERGE=1); smaller ones and other memory write normally. */
 static ABI void *guest_memset(void *dst, int value, size_t size) {
-    atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed); return memset(dst, value, size);
+    atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed);
+    if (size >= 64 && tlggpu_cpu_write(dst, NULL, value, size)) return dst;
+    return memset(dst, value, size);
 }
 static ABI void *guest_memcpy(void *dst, const void *src, size_t size) {
-    atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed); return memcpy(dst, src, size);
+    atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed);
+    if (size >= 64 && tlggpu_cpu_write(dst, src, -1, size)) return dst;
+    return memcpy(dst, src, size);
 }
 static ABI void *guest_memmove(void *dst, const void *src, size_t size) {
     atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed); return memmove(dst, src, size);

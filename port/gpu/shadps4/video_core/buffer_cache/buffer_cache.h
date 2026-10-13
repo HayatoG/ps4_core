@@ -5,7 +5,10 @@
 
 #include "tlg_copy.h"
 
+#include <atomic>
 #include <deque>
+#include <map>
+#include <mutex>
 #include <boost/container/small_vector.hpp>
 
 #include "common/interval_set.h"
@@ -134,6 +137,20 @@ private:
     void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
 
     void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
+
+public:
+    /// tlg: TLG_WRITE_MERGE=1 (precise readbacks): a guest memcpy/memset into memory with
+    /// GPU-modified pages writes through the backing view without a fault or a GPU wait, and the
+    /// exact byte range is uploaded before the GPU next uses or downloads it. Bytes the GPU
+    /// wrote elsewhere on those pages stay intact. False: the caller writes normally.
+    bool CpuWriteMerge(VAddr dst, const void* src, int fill, u64 size);
+
+private:
+    /// Uploads the merged guest writes inside [device_addr, device_addr + size) of `arena`.
+    void FlushMergedWrites(const Buffer* arena, VAddr device_addr, u64 size);
+    std::mutex merge_mutex;
+    std::map<VAddr, VAddr> merged_writes; ///< start -> end, disjoint
+    std::atomic<u64> merged_count{0};
 
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
                            bool is_texel_buffer);

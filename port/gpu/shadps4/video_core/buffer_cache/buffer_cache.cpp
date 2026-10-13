@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstring>
 #include <chrono>
 #include <array>
 #include <map>
@@ -153,8 +154,15 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         const auto* arena = GetArena(first_block, last_block);
 
         // GPU-modified ranges come as many small scattered islands,
-        // so the download is widened to a window around the request
-        constexpr u64 WindowSize = 512_KB;
+        // so the download is widened to a window around the request.
+        // tlg: TLG_DOWNLOAD_WINDOW_KB sizes it (default 512). Each download waits for the GPU;
+        // a game that writes records across megabytes the GPU also updates (inFAMOUS particles)
+        // otherwise faults and waits once per window, many times per frame.
+        static const u64 WindowSize = [] {
+            const char* e = std::getenv("TLG_DOWNLOAD_WINDOW_KB");
+            const u64 kb = e && *e ? std::strtoull(e, nullptr, 10) : 512;
+            return std::max<u64>(kb, 64) * 1024;
+        }();
         const VAddr arena_end = arena->cpu_addr + arena->size_bytes;
         const VAddr window_start =
             std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), arena->cpu_addr);
@@ -177,6 +185,7 @@ void BufferCache::ReleaseReadProtection(VAddr device_addr, u64 size) {
 }
 
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
+    FlushMergedWrites(arena, device_addr, size); // merged CPU bytes precede the download
     boost::container::small_vector<vk::BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
     const VAddr arena_base = arena->cpu_addr;
@@ -518,8 +527,97 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     runtime.CopyBuffer(staging.buffer, bda_pagetable_buffer.get(), copies);
 }
 
+bool BufferCache::CpuWriteMerge(VAddr dst, const void* src, int fill, u64 size) {
+    static const bool enabled = [] {
+        const char* e = std::getenv("TLG_WRITE_MERGE");
+        return e && *e == '1' && EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise;
+    }();
+    if (!enabled || size < 16 || !memory_tracker->IsRegionGpuModified(dst, size)) {
+        return false;
+    }
+    if (src) {
+        if (!memory->TryWriteBacking(reinterpret_cast<void*>(dst), src, size)) {
+            return false;
+        }
+    } else {
+        std::array<u8, 4096> chunk;
+        chunk.fill(static_cast<u8>(fill));
+        for (u64 done = 0; done < size;) {
+            const u64 n = std::min<u64>(chunk.size(), size - done);
+            if (!memory->TryWriteBacking(reinterpret_cast<void*>(dst + done), chunk.data(), n)) {
+                return done == 0 ? false : (std::memset(reinterpret_cast<void*>(dst + done), fill, size - done), true);
+            }
+            done += n;
+        }
+    }
+    std::scoped_lock lock{merge_mutex};
+    VAddr start = dst, end = dst + size;
+    auto it = merged_writes.upper_bound(start);
+    if (it != merged_writes.begin() && std::prev(it)->second >= start) {
+        --it;
+        start = it->first;
+        end = std::max(end, it->second);
+        it = merged_writes.erase(it);
+    }
+    while (it != merged_writes.end() && it->first <= end) {
+        end = std::max(end, it->second);
+        it = merged_writes.erase(it);
+    }
+    merged_writes.emplace(start, end);
+    merged_count.store(merged_writes.size(), std::memory_order_release);
+    return true;
+}
+
+void BufferCache::FlushMergedWrites(const Buffer* arena, VAddr device_addr, u64 size) {
+    if (!merged_count.load(std::memory_order_acquire)) {
+        return;
+    }
+    const VAddr lo = std::max<VAddr>(device_addr, arena->cpu_addr);
+    const VAddr hi = std::min<VAddr>(device_addr + size, arena->cpu_addr + arena->size_bytes);
+    if (lo >= hi) {
+        return;
+    }
+    boost::container::small_vector<std::pair<VAddr, VAddr>, 16> ranges;
+    {
+        std::scoped_lock lock{merge_mutex};
+        auto it = merged_writes.upper_bound(lo);
+        if (it != merged_writes.begin() && std::prev(it)->second > lo) {
+            --it;
+        }
+        while (it != merged_writes.end() && it->first < hi) {
+            const VAddr a = it->first, b = it->second;
+            const VAddr s = std::max(a, lo), e = std::min(b, hi);
+            ranges.emplace_back(s, e);
+            it = merged_writes.erase(it);
+            if (a < s) merged_writes.emplace(a, s);
+            if (e < b) it = merged_writes.emplace(e, b).first, ++it;
+        }
+        merged_count.store(merged_writes.size(), std::memory_order_release);
+    }
+    if (ranges.empty()) {
+        return;
+    }
+    u64 total = 0;
+    for (const auto& [s, e] : ranges) {
+        total += Common::AlignUp(e - s, 16);
+    }
+    const auto staging = staging_pool.Request(total, MemoryType::HostUncached);
+    boost::container::small_vector<vk::BufferCopy, 16> copies;
+    u64 offset = 0;
+    for (const auto& [s, e] : ranges) {
+        memory->CopySparseMemory(s, staging.mapped + offset, e - s);
+        copies.push_back(vk::BufferCopy{.srcOffset = staging.offset + offset,
+                                        .dstOffset = s - arena->cpu_addr,
+                                        .size = e - s});
+        offset += Common::AlignUp(e - s, 16);
+    }
+    staging.Flush();
+    runtime.CopyBuffer(staging.buffer, arena, copies);
+}
+
 bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
                                     bool is_written, bool is_texel_buffer) {
+    FlushMergedWrites(arena, device_addr, size);
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes{};
     const Buffer* src_buffer{};

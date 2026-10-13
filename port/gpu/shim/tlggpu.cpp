@@ -332,6 +332,14 @@ u32 ConsumeWithOverlaysScreenshotRequests() { return 0; }
 ScreenshotRequests ConsumeScreenshotRequests() { return {}; }
 } // namespace VideoCore
 
+extern "C" int tlggpu_cpu_write(void* dst, const void* src, int fill, uint64_t size) {
+    auto* rasterizer = Core::Memory::Instance()->GetRasterizer();
+    return rasterizer && rasterizer->GetBufferCache().CpuWriteMerge(
+                             reinterpret_cast<VAddr>(dst), src, fill, size)
+               ? 1
+               : 0;
+}
+
 extern "C" void tlggpu_overlay_notice(const char* text, float seconds) {
     TlgOverlay::Notice(text ? text : "", seconds);
 }

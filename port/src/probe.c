@@ -881,9 +881,10 @@ int main(int argc, char **argv) {
                         : (uintptr_t)image + relocs[i].value;
         if (relocs[i].kind) {
             uintptr_t resolved = runtime_resolve(names[relocs[i].value], relocs[i].kind == 2);
-            if (resolved) value = resolved + relocs[i].addend;
-            if (resolved && trace_stubs && relocs[i].kind == 1 && !relocs[i].addend) value = trace_stub(relocs[i].value, resolved);
-            else if (native_libc && bindings[relocs[i].value]) {
+            if (resolved) {
+                value = resolved + relocs[i].addend;
+                if (trace_stubs && relocs[i].kind == 1 && !relocs[i].addend) value = trace_stub(relocs[i].value, resolved);
+            } else if (native_libc && bindings[relocs[i].value]) {
                 uint64_t address=bindings[relocs[i].value];
                 if (binding_kinds[relocs[i].value]!=relocs[i].kind || !mapped(segments,ns,address,relocs[i].addend+1)) fail("native export kind/range mismatch");
                 value=(uintptr_t)image+address+relocs[i].addend;
