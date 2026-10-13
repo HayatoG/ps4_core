@@ -11,6 +11,7 @@ the relative paths are identical here and in every port.
   core_sync.py --diff ~/decomp/gr2_pc          also show a unified diff (core -> port)
   core_sync.py --pull ~/decomp/infamous_pc     copy the port's NEWER core files into ps4_core
   core_sync.py --summary --ref main A B C      one line per port
+  core_sync.py --status-all [--fetch]          sync table of tlg_pc, gr2_pc and infamous_pc (origin/main)
 
 Status of each differing file:
   port-newer   the ps4_core version is in the port's history: the port moved past it (--pull takes it)
@@ -111,8 +112,8 @@ class Tree:
         return self.blobs[path]
 
     def history(self, path):
-        """Every blob this path ever had in the history of ref (or HEAD)."""
-        out = git(self.repo, 'log', '--format=', '--raw', '--no-abbrev', '--no-renames',
+        """Every blob this path ever had in the history of ref (or HEAD), merge results included (-m)."""
+        out = git(self.repo, 'log', '-m', '--format=', '--raw', '--no-abbrev', '--no-renames',
                   self.ref or 'HEAD', '--', path, check=False)
         seen = set()
         for line in out.decode(errors='replace').splitlines():
@@ -130,7 +131,9 @@ def lineage():
         for line in source.read_text().splitlines():
             parts = line.split('#', 1)[0].split()
             if len(parts) >= 2 and Path(os.path.expanduser(parts[0])).is_dir():
-                repos.append(History(Path(os.path.expanduser(parts[0])), parts[1]))
+                # The pinned commit, when given: a moving ref (origin/main) would also contain
+                # the port's later changes and report them as "core-newer".
+                repos.append(History(Path(os.path.expanduser(parts[0])), parts[2] if len(parts) > 2 else parts[1]))
     return repos
 
 
@@ -181,18 +184,61 @@ def show_diff(core, port, path, label):
     sys.stdout.writelines(difflib.unified_diff(a, b, f'ps4_core/{path}', f'{label}/{path}'))
 
 
+PORTS = ('tlg_pc', 'gr2_pc', 'infamous_pc')
+STATES = ('port-newer', 'port-only', 'diverged', 'core-newer', 'core-only', 'submodule')
+
+
+def status_all(manifest, ref, fetch, ports):
+    """One Markdown table row per port: what ps4_core would take (port-newer, port-only,
+    diverged) and what the port is missing (core-newer, core-only, submodule)."""
+    core = Tree(CORE)
+    ancestors = lineage()
+    head = git(CORE, 'rev-parse', '--short', 'HEAD').decode().strip()
+    dirty = ' (+ uncommitted changes)' if git(CORE, 'status', '--porcelain').strip() else ''
+    print(f'ps4_core {head}{dirty} vs <port>@{ref}\n')
+    print('| Port | Checked out | ' + ref + ' | Differ | ' + ' | '.join(STATES) + ' |')
+    print('|---|---|---|---|' + '---|' * len(STATES))
+    for repo in ports or [CORE.parent / name for name in PORTS]:
+        repo = repo.expanduser().resolve()
+        if not (repo / '.git').exists():
+            print(f'| {repo.name} | (missing) | | | ' + ' | ' * (len(STATES) - 1) + ' |')
+            continue
+        if fetch:
+            git(repo, 'fetch', '--quiet', 'origin', check=False)
+        branch = git(repo, 'branch', '--show-current', check=False).decode().strip() or 'detached'
+        commit = git(repo, 'rev-parse', '--short', ref, check=False).decode().strip() or '?'
+        if commit == '?':
+            print(f'| {repo.name} | {branch} | (no {ref}) | | ' + ' | ' * (len(STATES) - 1) + ' |')
+            continue
+        counts = dict.fromkeys(STATES, 0)
+        for status, _ in compare(Tree(repo, ref), ref, manifest, core, ancestors):
+            counts[status] += 1
+        cells = ' | '.join(str(counts[k] or '·') for k in STATES)
+        print(f'| {repo.name} | {branch} | `{commit}` | {sum(counts.values())} | {cells} |')
+    print('\nport-newer/port-only/diverged: the port has core work ps4_core lacks (--pull, merge diverged by hand).'
+          '\ncore-newer/core-only/submodule: the port is behind ps4_core.')
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('ports', nargs='+', type=Path, help='port repository (e.g. ~/decomp/tlg_pc)')
+    p.add_argument('ports', nargs='*', type=Path, help='port repository (e.g. ~/decomp/tlg_pc)')
     p.add_argument('--ref', help='compare a branch/commit of the port instead of its working tree')
     p.add_argument('--diff', action='store_true', help='show a unified diff (ps4_core -> port)')
     p.add_argument('--pull', action='store_true', help="copy the port's newer core files into ps4_core")
     p.add_argument('--force', action='store_true', help='with --pull: also take diverged files')
     p.add_argument('--summary', action='store_true', help='only the counts per port')
     p.add_argument('--files', action='store_true', help="print the port's core file list (by the manifest) and exit")
+    p.add_argument('--status-all', action='store_true',
+                   help=f'sync table of the known ports ({", ".join(PORTS)}) against --ref (default origin/main)')
+    p.add_argument('--fetch', action='store_true', help='with --status-all: git fetch origin in each port first (never pushes)')
     args = p.parse_args()
 
     manifest = Manifest(CORE / 'CORE_MANIFEST')
+    if args.status_all:
+        status_all(manifest, args.ref or 'origin/main', args.fetch, args.ports)
+        return
+    if not args.ports:
+        p.error('give at least one port repository (or --status-all)')
     if args.files:
         for port_path in args.ports:
             tree = Tree(port_path, args.ref)
