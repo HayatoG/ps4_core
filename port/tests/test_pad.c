@@ -8,6 +8,15 @@
 
 static int capture;
 int tlggpu_overlay_captures_input(void) { return capture; }
+/* The window's mouse (gpu/shim/window.cpp), driven by the test. */
+static TlgGpuMouse test_mouse;
+void tlggpu_mouse_take(TlgGpuMouse *m) {
+    *m=test_mouse;
+    test_mouse.dx=test_mouse.dy=0; test_mouse.pressed=0;
+    test_mouse.wheel_up=test_mouse.wheel_down=test_mouse.wheel_left=test_mouse.wheel_right=0;
+}
+static TlgGpuInputSettings test_input={1,0,1.0f,0.0f,0.0f,0.1f,""};
+void tlggpu_input_settings(TlgGpuInputSettings *s) { *s=test_input; }
 uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *name) {
     (void)table; (void)count; (void)name;
     return 0;
@@ -188,7 +197,66 @@ int main(void) {
     if (gamepad) SDL_CloseGamepad(gamepad);
     gamepad=NULL;
     assert(SDL_DetachVirtualJoystick(id));
+
+    /* Mouse: motion turns the right stick and stops with the mouse; buttons and wheel notches
+     * press their default PS4 buttons (left Triangle, right R1, middle Square). */
+    test_mouse.captured=1;
+    data=read_pad(); /* first sample: the time base */
+    usleep(20000);
+    test_mouse.dx=96; /* ~4800 counts/s over 20 ms: past a full deflection */
+    data=read_pad();
+    assert(data.right_x>=250 && data.right_y==128);
+    usleep(20000);
+    data=read_pad(); /* still: back to the centre at once without smoothing */
+    usleep(20000);
+    data=read_pad();
+    assert(data.right_x==128 && data.right_y==128);
+    usleep(20000);
+    test_mouse.dy=-12; /* up, slower: a partial deflection past the anti-dead zone */
+    data=read_pad();
+    assert(data.right_y<128-13 && data.right_y>20 && data.right_x==128);
+    test_input.invert_y=1;
+    usleep(20000);
+    test_mouse.dy=-12;
+    data=read_pad();
+    assert(data.right_y>128+13);
+    test_input.invert_y=0;
+    test_mouse.held=1u<<2; /* right button held */
+    data=read_pad();
+    assert(data.buttons & BTN_R1);
+    test_mouse.held=0;
+    test_mouse.pressed=1u<<0; /* a left click between two samples is still seen once */
+    data=read_pad();
+    assert((data.buttons & BTN_TRIANGLE) && !(data.buttons & BTN_R1));
+    data=read_pad();
+    assert(!(data.buttons & BTN_TRIANGLE));
+    test_mouse.held=1u<<1;
+    data=read_pad();
+    assert(data.buttons & BTN_SQUARE);
+    test_mouse.held=0;
+    /* The wheel is free by default; mapped, each notch is one press. */
+    key_map.entries[key_map.count++]=(ButtonSource){WHEEL_DOWN,BTN_DOWN};
+    test_mouse.wheel_down=2;
+    data=read_pad();
+    assert(data.buttons & BTN_DOWN);
+    usleep(100000);
+    data=read_pad();
+    assert(!(data.buttons & BTN_DOWN)); /* the gap between the two notches */
+    usleep(50000);
+    data=read_pad();
+    assert(data.buttons & BTN_DOWN);
+    usleep(130000);
+    data=read_pad();
+    assert(!(data.buttons & BTN_DOWN));
+    /* Released (Esc, menu, focus lost) or turned off: nothing from the mouse. */
+    test_mouse.held=1u<<0; test_mouse.dx=500; test_mouse.captured=0;
+    data=read_pad();
+    assert(data.right_x==128 && !(data.buttons & BTN_TRIANGLE));
+    test_mouse.captured=1; test_input.mouse_enabled=0;
+    data=read_pad();
+    assert(data.right_x==128 && !(data.buttons & BTN_TRIANGLE));
+    test_mouse.held=0;
     SDL_Quit();
     unlink(path);
-    puts("PASS: pad ABI, staged left/right clicks, L1 chord, SDL touch coordinates, overlay capture");
+    puts("PASS: pad ABI, staged left/right clicks, L1 chord, SDL touch coordinates, overlay capture, mouse");
 }

@@ -2,6 +2,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <utility>
 #include <SDL3/SDL.h>
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -9,6 +11,24 @@
 #include "tlg_overlay.h"
 #include "tlg_graphics.h"
 #include "tlg_settings.h"
+#include "../tlggpu.h"
+
+namespace {
+std::mutex mouse_mutex;
+TlgGpuMouse mouse_state{}; // window thread adds, the pad (runtime_pad.c) takes
+
+u32 MouseBit(u8 button) {
+    return button >= 1 && button <= 32 ? 1u << (button - 1) : 0;
+}
+} // namespace
+
+extern "C" void tlggpu_mouse_take(TlgGpuMouse* out) {
+    std::scoped_lock lock{mouse_mutex};
+    *out = mouse_state;
+    mouse_state.dx = mouse_state.dy = 0.0f;
+    mouse_state.pressed = 0;
+    mouse_state.wheel_up = mouse_state.wheel_down = mouse_state.wheel_left = mouse_state.wheel_right = 0;
+}
 
 namespace Frontend {
 
@@ -76,6 +96,143 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     width = w;
     height = h;
     LOG_INFO(Frontend, "Window {}x{} on {}", w, h, driver);
+    focused = (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS) != 0;
+    if (const char* test = std::getenv("TLG_MOUSE_TEST"); test && test[0] == '1') {
+        mouse_test_start = SDL_GetTicksNS();
+        std::printf("Mouse: TLG_MOUSE_TEST synthesizes motion, clicks and wheel notches\n");
+    }
+}
+
+// The game's mouse. Taken (relative mode) while the window has focus, the port's menu, text
+// box and save list are closed, and the player did not release it with Esc; a click in the
+// window takes it again. Returns true for events the game must not see.
+bool WindowSDL::HandleMouse(const SDL_Event& event) {
+    switch (event.type) {
+    case SDL_EVENT_WINDOW_FOCUS_GAINED:
+        focused = true;
+        return false;
+    case SDL_EVENT_WINDOW_FOCUS_LOST:
+        focused = mouse_test_start != 0; // the test runs unattended
+        return false;
+    case SDL_EVENT_KEY_DOWN:
+        // Esc is free in the game's layout; the menu (open) and the text/save boxes take it first.
+        if (event.key.key == SDLK_ESCAPE && !event.key.repeat && mouse_captured) {
+            mouse_released = true;
+            return true;
+        }
+        return false;
+    case SDL_EVENT_MOUSE_MOTION:
+        if (mouse_captured) {
+            std::scoped_lock lock{mouse_mutex};
+            mouse_state.dx += event.motion.xrel;
+            mouse_state.dy += event.motion.yrel;
+        }
+        return mouse_captured;
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+    case SDL_EVENT_MOUSE_BUTTON_UP: {
+        const u32 bit = MouseBit(event.button.button);
+        const bool down = event.type == SDL_EVENT_MOUSE_BUTTON_DOWN;
+        if (!down && (mouse_swallow & bit)) {
+            mouse_swallow &= ~bit;
+            return true;
+        }
+        if (!mouse_captured) {
+            // A click takes the mouse back after Esc; that click is not a game button.
+            if (down && mouse_released && TlgSettings::Get().mouse_enabled && focused) {
+                mouse_released = false;
+                mouse_swallow |= bit;
+                return true;
+            }
+            return false;
+        }
+        std::scoped_lock lock{mouse_mutex};
+        if (down) {
+            mouse_state.held |= bit;
+            mouse_state.pressed |= bit;
+        } else {
+            mouse_state.held &= ~bit;
+        }
+        return true;
+    }
+    case SDL_EVENT_MOUSE_WHEEL: {
+        if (!mouse_captured) {
+            return false;
+        }
+        const float flip = event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -1.0f : 1.0f;
+        wheel_x += event.wheel.x * flip;
+        wheel_y += event.wheel.y * flip;
+        std::scoped_lock lock{mouse_mutex};
+        for (; wheel_y >= 1.0f; wheel_y -= 1.0f) ++mouse_state.wheel_up;
+        for (; wheel_y <= -1.0f; wheel_y += 1.0f) ++mouse_state.wheel_down;
+        for (; wheel_x >= 1.0f; wheel_x -= 1.0f) ++mouse_state.wheel_right;
+        for (; wheel_x <= -1.0f; wheel_x += 1.0f) ++mouse_state.wheel_left;
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+void WindowSDL::UpdateMouseCapture() {
+    const bool want = TlgSettings::Get().mouse_enabled && focused && !mouse_released &&
+                      !TlgOverlay::CapturesInput();
+    if (want == mouse_captured) {
+        return;
+    }
+    if (!SDL_SetWindowRelativeMouseMode(window, want) && want) {
+        LOG_WARNING(Frontend, "Mouse capture: {}", SDL_GetError());
+    }
+    mouse_captured = want;
+    wheel_x = wheel_y = 0.0f;
+    {
+        std::scoped_lock lock{mouse_mutex};
+        mouse_state = TlgGpuMouse{};
+        mouse_state.captured = want;
+    }
+    std::printf("Mouse: %s\n", want ? "captured for the camera (Esc releases)"
+                                     : mouse_released ? "released (click in the window to capture)"
+                                                      : "released");
+}
+
+// TLG_MOUSE_TEST=1: an 8 s loop of synthetic input through the real event path: 2 s right at
+// 1500 counts/s, 1 s still, 2 s left, 1 s up at 1200 counts/s, then a right click (R1, call
+// Trico) at 6.5 s and a wheel notch up at 7.5 s.
+void WindowSDL::MouseTest() {
+    const u64 now = SDL_GetTicksNS();
+    const u64 last = mouse_test_last ? mouse_test_last : now;
+    mouse_test_last = now;
+    const double t = double((now - mouse_test_start) % 8000000000ull) / 1e9;
+    const double prev = t - double(now - last) / 1e9;
+    const float dt = float(now - last) / 1e9f;
+    SDL_Event e{};
+    const float vx = t < 2.0 ? 1500.0f : t >= 3.0 && t < 5.0 ? -1500.0f : 0.0f;
+    const float vy = t >= 5.0 && t < 6.0 ? -1200.0f : 0.0f;
+    if (vx != 0.0f || vy != 0.0f) {
+        e.type = SDL_EVENT_MOUSE_MOTION;
+        e.motion.windowID = SDL_GetWindowID(window);
+        e.motion.xrel = vx * dt;
+        e.motion.yrel = vy * dt;
+        SDL_PushEvent(&e);
+    }
+    const auto crossed = [&](double at) { return prev < at && t >= at; };
+    for (const auto& [at, down] : {std::pair{6.5, true}, std::pair{6.7, false}}) {
+        if (crossed(at)) {
+            e = SDL_Event{};
+            e.type = down ? SDL_EVENT_MOUSE_BUTTON_DOWN : SDL_EVENT_MOUSE_BUTTON_UP;
+            e.button.windowID = SDL_GetWindowID(window);
+            e.button.button = SDL_BUTTON_RIGHT;
+            e.button.down = down;
+            SDL_PushEvent(&e);
+        }
+    }
+    if (crossed(7.5)) {
+        e = SDL_Event{};
+        e.type = SDL_EVENT_MOUSE_WHEEL;
+        e.wheel.windowID = SDL_GetWindowID(window);
+        e.wheel.y = 1.0f;
+        e.wheel.direction = SDL_MOUSEWHEEL_NORMAL;
+        SDL_PushEvent(&e);
+    }
 }
 
 // Windowed, borderless (desktop-sized, no mode change) or exclusive fullscreen at the desktop
@@ -137,6 +294,10 @@ bool WindowSDL::PollEvents() {
     if (const int mode = TlgSettings::Get().display_mode; mode != display_mode) {
         ApplyDisplayMode(mode);
     }
+    if (mouse_test_start) {
+        focused = true;
+        MouseTest();
+    }
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
         if (text_active && (event.type == SDL_EVENT_TEXT_INPUT || event.type == SDL_EVENT_KEY_DOWN)) {
@@ -166,7 +327,7 @@ bool WindowSDL::PollEvents() {
             UpdateTextTitle();
             continue;
         }
-        if (TlgOverlay::HandleEvent(event)) {
+        if (TlgOverlay::HandleEvent(event) || HandleMouse(event)) {
             continue;
         }
         switch (event.type) {
@@ -186,6 +347,7 @@ bool WindowSDL::PollEvents() {
             break;
         }
     }
+    UpdateMouseCapture();
     return is_open;
 }
 

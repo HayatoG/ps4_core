@@ -18,6 +18,12 @@ public:
         float gamma = 1.0f;
         u32 hdr = 0;
         u32 srgb_input = 0;
+        // tlg: color adjustments (post_process.frag), off unless color_adjust.
+        u32 color_adjust = 0;
+        float brightness = 0.0f;
+        float contrast = 1.0f;
+        float saturation = 1.0f;
+        float user_gamma = 1.0f;
     };
 
     void Create(vk::Device device, vk::Format surface_format);

@@ -40,6 +40,25 @@ void tlggpu_overlay_notice(const char *text, float seconds);
 /* Guest memcpy (src) / memset (src NULL, fill) into GPU-modified memory without a fault or a
  * GPU wait (TLG_WRITE_MERGE=1); 0: the caller writes normally. */
 int tlggpu_cpu_write(void *dst, const void *src, int fill, uint64_t size);
+/* The mouse, gathered by the window thread while the game has it (SDL relative mode: the window
+ * has focus, the port's menu is closed and Esc did not release it; a click takes it again).
+ * take: motion in mouse counts and wheel notches since the last call, then cleared. Buttons are
+ * bits (1 << (SDL button - 1)): held now, and pressed since the last call (a short click). */
+typedef struct {
+    float dx, dy;
+    uint32_t held, pressed;
+    int32_t wheel_up, wheel_down, wheel_left, wheel_right;
+    int32_t captured;
+} TlgGpuMouse;
+void tlggpu_mouse_take(TlgGpuMouse *mouse);
+/* Mouse and keyboard settings (tlg.ini; the menu changes the mouse ones live). key_map: the
+ * tlg.ini key_map value, the TLG_KEY_MAP syntax (runtime_pad.c), read once at start. */
+typedef struct {
+    int32_t mouse_enabled, invert_y;
+    float sensitivity, smoothing, accel, deadzone;
+    char key_map[512];
+} TlgGpuInputSettings;
+void tlggpu_input_settings(TlgGpuInputSettings *settings);
 /* Number of symbols registered by the vendored libraries (diagnostics). */
 unsigned tlggpu_symbol_count(void);
 #ifdef __cplusplus

@@ -8,6 +8,10 @@
 #include "tlg_graphics.h"
 #include "tlg_settings.h"
 
+#ifndef _WIN32
+static int _putenv_s(const char* name, const char* value) { return setenv(name, value, 1); }
+#endif
+
 namespace G = TlgGraphics;
 
 static std::string Read(const char* path) {
@@ -25,6 +29,9 @@ int main() {
     assert(G::ParseFramesQueued(2) == 2 && G::ParseFramesQueued(0) == 0 && G::ParseFramesQueued(5) == 1);
     assert(G::ParseRcasStrength(100) == 100 && G::ParseRcasStrength(101) == 75 && G::ParseRcasStrength(-1) == 75);
     assert(G::RcasAttenuation(100) == 0.0f && G::RcasAttenuation(0) == 2.0f && G::RcasAttenuation(75) == 0.5f);
+    assert(G::ParseRcasStrength(101, 50) == 50 && G::CasSharpness(100) == 1.0f && G::CasSharpness(-3) == 0.5f);
+    assert(G::ClampColor(G::Gamma, 9.0f) == 2.0f && G::ClampColor(G::Contrast, 0.1f) == 0.5f);
+    assert(G::ClampColor(G::Saturation, 0.0f / 0.0f) == 1.0f && G::ClampColor(G::Brightness, 0.25f) == 0.25f);
     assert(G::FsrPassRuns(true, false, 1280, 720, 2560, 1440) && !G::FsrPassRuns(false, false, 1280, 720, 2560, 1440));
     assert(G::FsrPassRuns(false, true, 1920, 1080, 1920, 1080) && !G::FsrPassRuns(true, false, 1920, 1080, 1920, 1080));
     assert(!G::FsrPassRuns(true, true, 2560, 1440, 1920, 1080));  // larger image: regular scaling
@@ -38,15 +45,21 @@ int main() {
         std::ofstream out(path);
         out << "display_mode=borderless\nvsync=0\nfps_limit=240\nasync_shaders=0\n"
                "render_resolution=1440p\nengine_fps=240\ndeferred_readback=0\nstale_readback=1\n"
-               "fsr1=1\nrcas=0\nrcas_strength=40\nframes_queued=2\n";
+               "fsr1=1\nrcas=0\nrcas_strength=40\nframes_queued=2\n"
+               "smaa=1\ncas=1\ncas_strength=30\ncolor_adjust=1\ncolor_brightness=0.10\n"
+               "color_contrast=1.20\ncolor_saturation=0.80\ncolor_gamma=9\n";
     }
     _putenv_s("TLG_CONFIG", path);
     _putenv_s("TLG_ASYNC_SHADERS", "");
     auto& v = TlgSettings::Get();
+    // Filters on the final image are off by default.
+    assert(!v.smaa && !v.cas && !v.color_adjust && v.cas_strength == 50 && v.color_gamma == 1.0f);
     TlgSettings::Load();
     assert(v.display_mode == G::Borderless && !v.vsync && v.fps_limit == 240 && !v.async_shaders);
     assert(v.render_resolution == 3 && v.engine_fps == 240 && !v.deferred_readback && v.stale_readback);
     assert(v.fsr1 && !v.rcas && v.rcas_strength == 40 && v.frames_queued == 2);
+    assert(v.smaa && v.cas && v.cas_strength == 30 && v.color_adjust && v.color_gamma == 2.0f);
+    assert(v.brightness == 0.10f && v.contrast == 1.20f && v.saturation == 0.80f);
     assert(!TlgSettings::GraphicsNeedRestart());
     assert(v.applied_engine_fps == 240);  // no TLG_ENGINE_FPS: the configured rate
     _putenv_s("TLG_ENGINE_FPS", "60");    // run.py: the frame rate patch did not apply
@@ -64,7 +77,9 @@ int main() {
     for (const char* line : {"display_mode=borderless\n", "vsync=0\n", "fps_limit=60\n", "async_shaders=0\n",
                              "render_resolution=1440p\n", "engine_fps=240\n", "deferred_readback=0\n",
                              "stale_readback=1\n", "fsr1=1\n", "rcas=0\n", "rcas_strength=40\n",
-                             "frames_queued=2\n"}) {
+                             "frames_queued=2\n", "smaa=1\n", "cas=1\n", "cas_strength=30\n",
+                             "color_adjust=1\n", "color_brightness=0.10\n", "color_contrast=1.20\n",
+                             "color_saturation=0.80\n", "color_gamma=2.00\n"}) {
         assert(saved.find(line) != std::string::npos);
     }
 

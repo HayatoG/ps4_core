@@ -659,11 +659,15 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     // until its slot; slots advance by one period (no drift) but never lag behind by more.
     // tlg: the in-game menu changes the limit live (TlgSettings::fps_limit); TLG_FPS_LIMIT
     // and the uncapped presets keep their fixed limit.
-    const bool fixed_limit = std::getenv("TLG_FPS_LIMIT") || EmulatorSettings.GetVblankFrequency() == 480;
+    // tlg: with the 480 Hz vblank (TLG_FPS=unlocked) a menu limit still applies; "Unlimited"
+    // falls back to the preset's limit (the display refresh, at most 120).
+    const bool fixed_limit = std::getenv("TLG_FPS_LIMIT") != nullptr;
+    const bool fast_vblank = EmulatorSettings.GetVblankFrequency() == 480;
     const auto current_limit = [&] {
         const auto& s = TlgSettings::Get();
-        return fixed_limit ? EmulatorSettings.GetFrameLimit()
-                           : u32(TlgGraphics::PresentLimit(s.fps_limit, s.applied_engine_fps));
+        if (fixed_limit) return EmulatorSettings.GetFrameLimit();
+        const u32 limit = u32(TlgGraphics::PresentLimit(s.fps_limit, s.applied_engine_fps));
+        return limit || !fast_vblank ? limit : EmulatorSettings.GetFrameLimit();
     };
     u32 frame_limit = current_limit();
     auto frame_period = frame_limit ? std::chrono::nanoseconds(1000000000 / frame_limit)

@@ -8,3 +8,8 @@ Backported from upstream after b4e7ae7 (2026-10-02), recompiler correctness fixe
   mode (#5126), e518a6515 S_SUBB_U32 SCC wrap (#5031), 282e5c792 S_ADDC_U32 SCC carry-out (#5030),
   fb6367d29 32-bit literals in the high dword of 64-bit floats (#5114), 94e217781 V_BFM_B32 (#5185),
   d1cb90dbb ADDC (#5200), dd43d1cac V_CVT_PK_U8_F32 (#5194), ef08b1e1f V_ALIGNBIT/ALIGNBYTE (#5186).
+Post-processing on the presented image (host_passes/postfx_pass.cpp), MIT licensed, licenses kept next to the files:
+  host_shaders/smaa/: SMAA.hlsl, AreaTex.h, SearchTex.h from https://github.com/iryoku/smaa commit
+  71c806a838bdd7d517df19192a20f0c61b3ca29d (Jimenez, Echevarria, Masia, Navarro, Gutierrez; LICENSE.txt).
+  host_shaders/cas/ffx_cas.h from https://github.com/GPUOpen-Effects/FidelityFX-CAS commit
+  9fabcc9a2c45f958aff55ddfda337e74ef894b7f (AMD; LICENSE.txt), used with FSR 1's ffx_a.h.

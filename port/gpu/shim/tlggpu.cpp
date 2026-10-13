@@ -348,6 +348,17 @@ extern "C" int tlggpu_overlay_captures_input(void) {
     return TlgOverlay::CapturesInput() ? 1 : 0;
 }
 
+extern "C" void tlggpu_input_settings(TlgGpuInputSettings* out) {
+    const auto& s = TlgSettings::Get();
+    out->mouse_enabled = s.mouse_enabled ? 1 : 0;
+    out->invert_y = s.mouse_invert_y ? 1 : 0;
+    out->sensitivity = s.mouse_sensitivity;
+    out->smoothing = s.mouse_smoothing;
+    out->accel = s.mouse_accel;
+    out->deadzone = s.mouse_deadzone;
+    std::snprintf(out->key_map, sizeof(out->key_map), "%s", s.key_map.c_str());
+}
+
 extern "C" int tlggpu_text_input_begin(const char* initial, const char* prompt) {
     if (!g_window) return 0;
     g_window->BeginTextInput(initial ? initial : "", prompt ? prompt : "Text");

@@ -4,6 +4,8 @@
 #include "../src/runtime_pad.c"
 
 int tlggpu_overlay_captures_input(void) { return 0; }
+void tlggpu_mouse_take(TlgGpuMouse *m) { memset(m,0,sizeof(*m)); }
+void tlggpu_input_settings(TlgGpuInputSettings *s) { memset(s,0,sizeof(*s)); }
 uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *name) {
     (void)table; (void)count; (void)name;
     return 0;
@@ -56,5 +58,24 @@ int main(void) {
     ButtonMap sides=key_map;
     assert(apply_button_map(&sides,"touchpad_right=Delete",true)==1);
     assert(pressed_by(&sides,SDL_SCANCODE_BACKSPACE)==0 && pressed_by(&sides,SDL_SCANCODE_DELETE)==CLICK_RIGHT);
+    /* Mouse defaults: left Triangle, right R1, middle Square; mouse names in the keyboard map. */
+    assert(pressed_by(&key_map,MOUSE_LEFT)==BTN_TRIANGLE && pressed_by(&key_map,MOUSE_RIGHT)==BTN_R1);
+    assert(pressed_by(&key_map,MOUSE_MIDDLE)==BTN_SQUARE && pressed_by(&key_map,WHEEL_UP)==0);
+    ButtonMap mouse=key_map;
+    assert(apply_button_map(&mouse,"cross=mouse x1,up=Wheel Up,down=Wheel Down",true)==3);
+    assert(pressed_by(&mouse,MOUSE_X1)==BTN_CROSS && pressed_by(&mouse,SDL_SCANCODE_SPACE)==0);
+    assert(pressed_by(&mouse,WHEEL_UP)==BTN_UP && pressed_by(&mouse,SDL_SCANCODE_I)==0);
+    assert(pressed_by(&mouse,WHEEL_DOWN)==BTN_DOWN);
+    assert(apply_button_map(&mouse,"cross=Mouse X1",false)==0); /* not a gamepad button */
+    /* '|': several sources; "none": no source; an unknown part is skipped. */
+    ButtonMap multi=key_map;
+    assert(apply_button_map(&multi,"triangle=Q|Mouse Left|Bogus,r1=none,l1=3 | Mouse Right",true)==3);
+    assert(pressed_by(&multi,SDL_SCANCODE_Q)==BTN_TRIANGLE && pressed_by(&multi,MOUSE_LEFT)==BTN_TRIANGLE);
+    assert(pressed_by(&multi,SDL_SCANCODE_3)==BTN_L1 && pressed_by(&multi,MOUSE_RIGHT)==BTN_L1);
+    assert(pressed_by(&multi,SDL_SCANCODE_1)==0);
+    for (size_t i=0;i<multi.count;++i) assert(multi.entries[i].ps!=BTN_R1);
+    ButtonMap gp=pad_map;
+    assert(apply_button_map(&gp,"cross=a|b",false)==1);
+    assert(pressed_by(&gp,SDL_GAMEPAD_BUTTON_SOUTH)==BTN_CROSS && pressed_by(&gp,SDL_GAMEPAD_BUTTON_EAST)==(BTN_CROSS|BTN_CIRCLE));
     puts("PASS: pad and key maps");
 }

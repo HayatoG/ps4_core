@@ -9,6 +9,7 @@
 
 #include "core/libraries/videoout/buffer.h"
 #include "video_core/renderer_vulkan/host_passes/fsr_pass.h"
+#include "video_core/renderer_vulkan/host_passes/postfx_pass.h"
 #include "video_core/renderer_vulkan/host_passes/pp_pass.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -121,6 +122,9 @@ private:
     HostPasses::FsrPass::Settings fsr_settings{};
     HostPasses::PostProcessingPass::Settings pp_settings{};
     HostPasses::PostProcessingPass pp_pass;
+    HostPasses::SmaaPass smaa_pass;  ///< tlg: tlg.ini smaa
+    HostPasses::CasPass cas_pass;    ///< tlg: tlg.ini cas
+    HostPasses::PostFxTimer postfx_timer; ///< tlg: TLG_POSTFX_PROFILE=1
     AmdGpu::Liverpool* liverpool;
     Scheduler draw_scheduler;
     std::deque<u64> recent_frame_ticks; ///< tlg: TLG_FRAMES_AHEAD bound (PrepareFrame)

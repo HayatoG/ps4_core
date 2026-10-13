@@ -63,6 +63,10 @@ void Set(Values& v, const std::string& key, const std::string& value) {
             return;
         }
     }
+    if (key == "key_map") {
+        v.key_map = value;
+        return;
+    }
     if (key == "upscaler") {
         for (int u = 0; u < UpscalerCount; ++u) {
             if (value == UpscalerName(u)) {
@@ -105,6 +109,22 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.rcas = i != 0;
     } else if (key == "rcas_strength") {
         v.rcas_strength = TlgGraphics::ParseRcasStrength(value.empty() ? -1 : i);
+    } else if (key == "smaa") {
+        v.smaa = i != 0;
+    } else if (key == "cas") {
+        v.cas = i != 0;
+    } else if (key == "cas_strength") {
+        v.cas_strength = TlgGraphics::ParseRcasStrength(value.empty() ? -1 : i, 50);
+    } else if (key == "color_adjust") {
+        v.color_adjust = i != 0;
+    } else if (key == "color_brightness") {
+        v.brightness = TlgGraphics::ClampColor(TlgGraphics::Brightness, f);
+    } else if (key == "color_contrast") {
+        v.contrast = TlgGraphics::ClampColor(TlgGraphics::Contrast, value.empty() ? 1.0f : f);
+    } else if (key == "color_saturation") {
+        v.saturation = TlgGraphics::ClampColor(TlgGraphics::Saturation, value.empty() ? 1.0f : f);
+    } else if (key == "color_gamma") {
+        v.color_gamma = TlgGraphics::ClampColor(TlgGraphics::Gamma, value.empty() ? 1.0f : f);
     } else if (key == "frames_queued") {
         v.frames_queued = TlgGraphics::ParseFramesQueued(value.empty() ? -1 : i);
     } else if (key == "render_resolution") {
@@ -137,6 +157,18 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.fsr4_invert_jitter = i != 0;
     } else if (key == "live_resolution") {
         v.live_resolution = value == "auto" ? -1 : std::clamp(i, 0, 1);
+    } else if (key == "mouse_enabled") {
+        v.mouse_enabled = i != 0;
+    } else if (key == "mouse_invert_y") {
+        v.mouse_invert_y = i != 0;
+    } else if (key == "mouse_sensitivity") {
+        v.mouse_sensitivity = Clamp(value.empty() ? 1.0f : f, 0.05f, 10.0f);
+    } else if (key == "mouse_smoothing") {
+        v.mouse_smoothing = Clamp(f, 0.0f, 0.95f);
+    } else if (key == "mouse_accel") {
+        v.mouse_accel = Clamp(f, 0.0f, 2.0f);
+    } else if (key == "mouse_deadzone") {
+        v.mouse_deadzone = Clamp(f, 0.0f, 0.5f);
     } else if (key == "output_res") {
         for (int r = 0; r < OutputCount; ++r) {
             if (value == std::to_string(OutputWidths[r]) + "x" + std::to_string(OutputHeights[r])) {
@@ -153,20 +185,37 @@ Values& Get() {
     return values;
 }
 
+namespace {
+bool ReadFile(Values& v) {
+    FILE* file = std::fopen(Path(), "r");
+    if (!file) {
+        return false;
+    }
+    char line[1024]; // key_map can be long
+    while (std::fgets(line, sizeof(line), file)) {
+        std::string text{line};
+        text.erase(text.find_last_not_of(" \t\r\n") + 1);
+        const auto eq = text.find('=');
+        if (text.empty() || text[0] == '#' || eq == std::string::npos) {
+            continue;
+        }
+        Set(v, text.substr(0, eq), text.substr(eq + 1));
+    }
+    std::fclose(file);
+    return true;
+}
+} // namespace
+
+void ReloadIfRequested() {
+    static const char* trigger = std::getenv("TLG_SETTINGS_RELOAD");
+    if (trigger && trigger[0] && std::remove(trigger) == 0 && ReadFile(Get())) {
+        std::printf("Settings: reloaded %s\n", Path());
+    }
+}
+
 void Load() {
     auto& v = Get();
-    if (FILE* file = std::fopen(Path(), "r")) {
-        char line[256];
-        while (std::fgets(line, sizeof(line), file)) {
-            std::string text{line};
-            text.erase(text.find_last_not_of(" \t\r\n") + 1);
-            const auto eq = text.find('=');
-            if (text.empty() || text[0] == '#' || eq == std::string::npos) {
-                continue;
-            }
-            Set(v, text.substr(0, eq), text.substr(eq + 1));
-        }
-        std::fclose(file);
+    if (ReadFile(v)) {
         std::printf("Settings: %s\n", Path());
     }
     // Environment overrides (scripts, A/B tests).
@@ -185,6 +234,11 @@ void Load() {
         {"TLG_STALE_READBACK", "stale_readback"},     {"TLG_FSR1", "fsr1"},
         {"TLG_RCAS", "rcas"},                        {"TLG_FRAMES_AHEAD", "frames_queued"},
         {"TLG_SHOW_FPS", "show_fps"},
+        {"TLG_MOUSE", "mouse_enabled"},              {"TLG_MOUSE_SENS", "mouse_sensitivity"},
+        {"TLG_MOUSE_INVERT_Y", "mouse_invert_y"},    {"TLG_MOUSE_SMOOTHING", "mouse_smoothing"},
+        {"TLG_MOUSE_ACCEL", "mouse_accel"},          {"TLG_MOUSE_DEADZONE", "mouse_deadzone"},
+        {"TLG_SMAA", "smaa"},
+        {"TLG_CAS", "cas"},                          {"TLG_COLOR_ADJUST", "color_adjust"},
     };
     for (const auto& [env, key] : env_keys) {
         if (const char* value = std::getenv(env); value && value[0]) {
@@ -199,7 +253,7 @@ void Load() {
     v.startup_render_resolution = v.render_resolution;
     v.startup_engine_fps = v.engine_fps;
     const char* applied = std::getenv("TLG_ENGINE_FPS");
-    v.applied_engine_fps = applied && applied[0] ? TlgGraphics::ParseEngineFps(std::atoi(applied))
+    v.applied_engine_fps = applied && applied[0] ? TlgGraphics::ParseAppliedEngineFps(std::atoi(applied))
                                                  : v.engine_fps.load();
     v.startup_deferred_readback = v.deferred_readback;
     v.startup_stale_readback = v.stale_readback;
@@ -310,6 +364,17 @@ void Save() {
                  TlgGraphics::Resolutions[std::clamp(v.render_resolution.load(), 0, 5)].data(),
                  v.engine_fps.load(), int(v.deferred_readback.load()), int(v.stale_readback.load()),
                  int(v.restart_unconfirmed.load()));
+    std::fprintf(file,
+                 "mouse_enabled=%d\nmouse_sensitivity=%.2f\nmouse_invert_y=%d\nmouse_smoothing=%.2f\n"
+                 "mouse_accel=%.2f\nmouse_deadzone=%.2f\nkey_map=%s\n",
+                 int(v.mouse_enabled.load()), v.mouse_sensitivity.load(), int(v.mouse_invert_y.load()),
+                 v.mouse_smoothing.load(), v.mouse_accel.load(), v.mouse_deadzone.load(), v.key_map.c_str());
+    std::fprintf(file,
+                 "smaa=%d\ncas=%d\ncas_strength=%d\ncolor_adjust=%d\ncolor_brightness=%.2f\n"
+                 "color_contrast=%.2f\ncolor_saturation=%.2f\ncolor_gamma=%.2f\n",
+                 int(v.smaa.load()), int(v.cas.load()), v.cas_strength.load(),
+                 int(v.color_adjust.load()), v.brightness.load(), v.contrast.load(),
+                 v.saturation.load(), v.color_gamma.load());
     // Read by run.sh at start.
     std::fprintf(file, "live_resolution=%s\n", v.live_resolution < 0 ? "auto"
                                                   : v.live_resolution ? "1" : "0");

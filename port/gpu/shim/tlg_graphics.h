@@ -47,15 +47,40 @@ inline int ParseResolution(std::string_view text) {
 inline int ParseEngineFps(int value) {
     return IndexOf(EngineFps, value, -1) >= 0 ? value : 120;
 }
+/// tlg: the launch's TLG_ENGINE_FPS (launcher/tlg_run.py, TLG_FPS): 30 unpatched, 60 with the
+/// 60 FPS patches, 240 unlocked; another value is taken as a 60/120/240 ceiling.
+inline int ParseAppliedEngineFps(int value) {
+    return value == 30 ? 30 : ParseEngineFps(value);
+}
 
 /// Frames the GPU command thread may queue ahead of the GPU; 0 = unbounded.
 inline constexpr std::array<int, 3> FramesQueued = {1, 2, 0};
 inline int ParseFramesQueued(int value) {
     return IndexOf(FramesQueued, value, -1) >= 0 ? value : 1;
 }
-/// RCAS strength in percent; invalid values fall back to 75.
-inline int ParseRcasStrength(int value) {
-    return value >= 0 && value <= 100 ? value : 75;
+/// RCAS / CAS strength in percent; invalid values fall back to `fallback` (RCAS 75, CAS 50).
+inline int ParseRcasStrength(int value, int fallback = 75) {
+    return value >= 0 && value <= 100 ? value : fallback;
+}
+/// CAS sharpness (0 to 1) for a strength in percent.
+inline float CasSharpness(int strength) {
+    return float(ParseRcasStrength(strength, 50)) / 100.0f;
+}
+
+/// Color adjustments (post_process.frag): range and neutral value of each slider.
+struct ColorRange {
+    float min, max, neutral;
+};
+inline constexpr ColorRange Brightness{-0.5f, 0.5f, 0.0f};
+inline constexpr ColorRange Contrast{0.5f, 1.5f, 1.0f};
+inline constexpr ColorRange Saturation{0.0f, 2.0f, 1.0f};
+inline constexpr ColorRange Gamma{0.5f, 2.0f, 1.0f};
+/// Clamped into the range; NaN gives the neutral value.
+inline float ClampColor(const ColorRange& range, float value) {
+    return value != value ? range.neutral
+           : value < range.min ? range.min
+           : value > range.max ? range.max
+                               : value;
 }
 /// FSR RCAS attenuation for a strength: 0 is the sharpest, 2 the softest.
 inline float RcasAttenuation(int strength) {
