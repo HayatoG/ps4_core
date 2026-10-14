@@ -252,33 +252,71 @@ static ABI int32_t msg_close(void) { return dialog_close(1); }
 static ABI int32_t msg_progress(uint32_t target, uint32_t value) { (void)value; return dialog_progress(1,target); }
 static ABI int32_t msg_result(unsigned char *out) { return dialog_result(1,out,0); }
 /* SaveDataDialog. OrbisSaveDataDialogParam: BaseParam (48), size, mode @52, dispType @56,
- * animParam @64, items @72, ..., userData @112. SaveDialogItems: userId @0, titleId @8,
- * dirName @16 (32-byte names), dirNameNum @24, newItem @32 (title @0), focusPos @40.
- * A list (mode 1) is shown for the player to choose; every other mode answers for the
- * first listed save. The result names the chosen save ("" = the new item). */
+ * animParam @64, items @72, userMsgParam @80, sysMsgParam @88, errorCodeParam @96,
+ * progBarParam @104, userData @112. SaveDialogItems: userId @0, titleId @8, dirName @16
+ * (32-byte names), dirNameNum @24, newItem @32 (title @0), focusPos @40.
+ * Modes: 1 the list, 2 the game's message (buttonType @0, msg* @8), 3 a system message
+ * (sysMsgType @0, value @8), 4 an error code (@0), 5 a progress bar (msg* @8).
+ * The list and the messages the player answers are drawn over the game (tlggpu_save_*);
+ * "saving" and "saved" show for a moment while the dialog answers at once, as before.
+ * The result names the chosen save ("" = the new item). */
 #define SAVE_MODE_LIST 1
+#define SAVE_MODE_USER_MSG 2
+#define SAVE_MODE_SYSTEM_MSG 3
+#define SAVE_MODE_ERROR_CODE 4
+#define SAVE_MODE_PROGRESS_BAR 5
+#define SAVE_SYSMSG_PROGRESS 5
+#define SAVE_SYSMSG_FINISHED 7
+#define SAVE_BUTTONS_NONE 2
+#define SAVE_BUTTONS_OK_CANCEL 3
 #define SAVE_RESULT_CANCELED 1
+#define SAVE_BUTTON_NO 2
 static struct {
     uint32_t mode, result;
     void *user_data;
     char dirs[32][32];
-    int dir_count, has_new, choosing;
+    int dir_count, has_new, choosing, asking, kind, buttons, progress;
 } save_dialog;
-static char save_labels[33][200], save_icons[33][720];
-static void save_label(char *out, size_t size, const char *dir) {
-    unsigned char param[RUNTIME_SAVE_PARAM_SIZE];
-    if (runtime_savedata_param(USER_ID,dir,param)) { snprintf(out,size,"%s",dir); return; }
-    int64_t mtime; memcpy(&mtime,param+1288,8);
-    time_t t=(time_t)mtime; struct tm tm;
-#ifdef _WIN32
-    localtime_s(&tm,&t);
-#else
-    localtime_r(&t,&tm);
-#endif
-    char when[32]; strftime(when,sizeof(when),"%Y-%m-%d %H:%M",&tm);
-    const char *title=(const char *)param, *subtitle=(const char *)param+128;
-    /* Title, subtitle and date on their own lines, beside the save's picture. */
-    snprintf(out,size,"%.60s\n%.60s%s%s",title[0] ? title : dir,subtitle,subtitle[0] ? "\n" : "",when);
+/* One save's text, date, size and picture for the dialog (strings live in the static buffers). */
+static unsigned char save_params[33][RUNTIME_SAVE_PARAM_SIZE];
+static char save_icons[33][720];
+static void save_entry(TlgSaveEntry *e, int slot, const char *dir) {
+    memset(e,0,sizeof(*e));
+    unsigned char *param=save_params[slot];
+    memset(param,0,RUNTIME_SAVE_PARAM_SIZE);
+    if (!runtime_savedata_param(USER_ID,dir,param)) memcpy(&e->mtime,param+1288,8);
+    param[127]=param[255]=param[1279]=0;
+    e->title=param[0] ? (const char *)param : dir;
+    e->subtitle=(const char *)param+128;
+    e->detail=(const char *)param+256;
+    e->icon=runtime_savedata_icon(USER_ID,dir,save_icons[slot],sizeof(save_icons[slot])) ? NULL : save_icons[slot];
+    e->bytes=runtime_savedata_size(USER_ID,dir);
+}
+static int32_t save_open_list(void) {
+    TlgSaveEntry entries[33]; int n=0;
+    if (save_dialog.has_new) { memset(&entries[n],0,sizeof(entries[n])); entries[n].is_new=1; ++n; }
+    for (int i=0;i<save_dialog.dir_count;++i,++n) save_entry(&entries[n],n,save_dialog.dirs[i]);
+    const char *what=save_dialog.kind==2 ? "load" : save_dialog.kind==3 ? "delete" : "save";
+    if (!n || !tlggpu_save_list_begin(save_dialog.kind,entries,n,0)) {
+        printf("Runtime: SaveDataDialog list (%s): %s\n",what,n ? "no window, cancelled" : "no saves, cancelled");
+        save_dialog.result=SAVE_RESULT_CANCELED;
+        dialogs[2].status=DIALOG_FINISHED; dialogs[2].button=0;
+        return 0;
+    }
+    printf("Runtime: SaveDataDialog list (%s): %d entries shown\n",what,n);
+    save_dialog.choosing=1;
+    dialogs[2].status=DIALOG_RUNNING;
+    return 0;
+}
+/* A message the player answers; 0 when it could not be shown (the dialog then answers OK/YES). */
+static int save_ask(int code, uint64_t value, const char *text, int buttons) {
+    TlgSaveEntry entry; const TlgSaveEntry *about=NULL;
+    if (save_dialog.dir_count && save_dialog.dirs[0][0]) { save_entry(&entry,32,save_dialog.dirs[0]); about=&entry; }
+    if (!tlggpu_save_message_begin(save_dialog.kind,code,value,text,buttons,about)) return 0;
+    printf("Runtime: SaveDataDialog message %d shown%s%s\n",code,about ? " for " : "",about ? save_dialog.dirs[0] : "");
+    save_dialog.asking=1; save_dialog.buttons=buttons;
+    dialogs[2].status=DIALOG_RUNNING; dialogs[2].button=0;
+    return 1;
 }
 static ABI int32_t save_init(void) { return dialog_init(2); }
 static ABI int32_t save_open(const unsigned char *p) {
@@ -287,6 +325,8 @@ static ABI int32_t save_open(const unsigned char *p) {
     memset(&save_dialog,0,sizeof(save_dialog));
     memcpy(&save_dialog.mode,p+52,4);
     memcpy(&save_dialog.user_data,p+112,8);
+    uint32_t type; memcpy(&type,p+56,4);
+    save_dialog.kind=type>=1 && type<=3 ? (int)type : 1;
     const unsigned char *items; memcpy(&items,p+72,8);
     if (items) {
         const char *dirs; uint32_t count; const void *new_item;
@@ -295,30 +335,46 @@ static ABI int32_t save_open(const unsigned char *p) {
             if (dirs[i*32]) memcpy(save_dialog.dirs[save_dialog.dir_count++],dirs+i*32,31);
         save_dialog.has_new=new_item!=NULL;
     }
-    if (save_dialog.mode!=SAVE_MODE_LIST) return dialog_open_mode(2,p,52,5);
-    const char *labels[33], *icons[33]; int n=0;
-    if (save_dialog.has_new) { snprintf(save_labels[n],sizeof(save_labels[n]),"New save"); labels[n]=save_labels[n]; icons[n]=NULL; ++n; }
-    for (int i=0;i<save_dialog.dir_count;++i) {
-        save_label(save_labels[n],sizeof(save_labels[n]),save_dialog.dirs[i]); labels[n]=save_labels[n];
-        icons[n]=runtime_savedata_icon(USER_ID,save_dialog.dirs[i],save_icons[n],sizeof(save_icons[n])) ? NULL : save_icons[n];
-        ++n;
+    const unsigned char *sub=NULL;
+    switch (save_dialog.mode) {
+    case SAVE_MODE_LIST: return save_open_list();
+    case SAVE_MODE_USER_MSG: {
+        memcpy(&sub,p+80,8);
+        if (!sub) break;
+        uint32_t buttons; const char *text; memcpy(&buttons,sub,4); memcpy(&text,sub+8,8);
+        if (buttons==SAVE_BUTTONS_NONE) { tlggpu_save_progress(save_dialog.kind,2,-1,text ? text : ""); break; }
+        if (save_ask(100,0,text,buttons>SAVE_BUTTONS_OK_CANCEL ? 0 : (int)buttons)) return 0;
+        break;
     }
-    uint32_t type; memcpy(&type,p+56,4);
-    const char *title=type==1 ? "Save game" : type==2 ? "Load game" : "Delete save";
-    if (!n || !tlggpu_choice_begin(title,labels,icons,n,0)) {
-        printf("Runtime: SaveDataDialog list (%s): %s\n",title,n ? "no window, cancelled" : "no saves, cancelled");
-        save_dialog.result=SAVE_RESULT_CANCELED;
-        dialogs[2].status=DIALOG_FINISHED; dialogs[2].button=0;
-        return 0;
+    case SAVE_MODE_SYSTEM_MSG: {
+        memcpy(&sub,p+88,8);
+        if (!sub) break;
+        uint32_t kind; uint64_t value; memcpy(&kind,sub,4); memcpy(&value,sub+8,8);
+        printf("Runtime: SaveDataDialog system message %u\n",kind);
+        if (kind==SAVE_SYSMSG_PROGRESS) { tlggpu_save_progress(save_dialog.kind,2,-1,""); break; }
+        if (kind==SAVE_SYSMSG_FINISHED) { tlggpu_save_toast(save_dialog.kind); break; }
+        if (save_ask((int)kind,value,NULL,-1)) return 0;
+        break;
     }
-    printf("Runtime: SaveDataDialog list (%s): %d entries shown\n",title,n);
-    save_dialog.choosing=1;
-    dialogs[2].status=DIALOG_RUNNING;
-    return 0;
+    case SAVE_MODE_ERROR_CODE: {
+        memcpy(&sub,p+96,8);
+        uint32_t code=0; if (sub) memcpy(&code,sub,4);
+        if (save_ask(101,code,NULL,0)) return 0;
+        break;
+    }
+    case SAVE_MODE_PROGRESS_BAR: {
+        memcpy(&sub,p+104,8);
+        const char *text=NULL; if (sub) memcpy(&text,sub+8,8);
+        save_dialog.progress=1;
+        tlggpu_save_progress(save_dialog.kind,1,0,text ? text : "");
+        return dialog_open_progress(2);
+    }
+    }
+    return dialog_open(2);
 }
 static ABI int32_t save_status(void) {
     if (save_dialog.choosing) {
-        int choice=tlggpu_choice_poll();
+        int choice=tlggpu_save_list_poll();
         if (choice!=-1) {
             save_dialog.choosing=0;
             dialogs[2].status=DIALOG_FINISHED;
@@ -335,11 +391,36 @@ static ABI int32_t save_status(void) {
                    choice<0 ? "" : save_dialog.dirs[0][0] ? save_dialog.dirs[0] : "new save");
         }
     }
+    if (save_dialog.asking) {
+        int answer=tlggpu_save_message_poll();
+        if (answer!=-1) {
+            save_dialog.asking=0;
+            dialogs[2].status=DIALOG_FINISHED;
+            /* Yes/OK is button 1; "No" is button 2; "Cancel" of OK/Cancel cancels the dialog. */
+            if (answer==2 && save_dialog.buttons==SAVE_BUTTONS_OK_CANCEL) { save_dialog.result=SAVE_RESULT_CANCELED; dialogs[2].button=0; }
+            else dialogs[2].button=answer==2 ? SAVE_BUTTON_NO : 1;
+            printf("Runtime: SaveDataDialog message: %s\n",answer==2 ? "no" : "yes/ok");
+        }
+    }
     return dialog_status(2);
 }
-static ABI int32_t save_term(void) { return dialog_term(2); }
-static ABI int32_t save_close(void) { return dialog_close(2); }
-static ABI int32_t save_progress(uint32_t target, uint32_t rate) { (void)rate; return dialog_progress(2,target); }
+static void save_dialog_gone(void) {
+    if (save_dialog.choosing || save_dialog.asking) tlggpu_save_dialog_close();
+    if (save_dialog.progress) tlggpu_save_progress(save_dialog.kind,0,0,NULL);
+    save_dialog.choosing=save_dialog.asking=save_dialog.progress=0;
+}
+static ABI int32_t save_term(void) { save_dialog_gone(); return dialog_term(2); }
+static ABI int32_t save_close(void) {
+    int32_t r=dialog_close(2);
+    if (!r && (save_dialog.choosing || save_dialog.asking)) { save_dialog.result=SAVE_RESULT_CANCELED; dialogs[2].button=0; }
+    save_dialog_gone();
+    return r;
+}
+static ABI int32_t save_progress(uint32_t target, uint32_t rate) {
+    int32_t r=dialog_progress(2,target);
+    if (!r && save_dialog.progress) tlggpu_save_progress(save_dialog.kind,1,(int)(rate>100 ? 100 : rate),NULL);
+    return r;
+}
 /* OrbisSaveDataDialogResult: mode, result, buttonId, dirName* @16, param* @24, userData @32. */
 static ABI int32_t save_result(unsigned char *out) {
     int32_t r=dialog_result(2,out,4);

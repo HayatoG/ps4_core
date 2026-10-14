@@ -28,11 +28,32 @@ void tlggpu_dump_guest_writes(void *ucontext);
  * no window exists; poll returns 0 typing, 1 confirmed, 2 cancelled (UTF-8 text). */
 int tlggpu_text_input_begin(const char *initial_utf8, const char *prompt_utf8);
 int tlggpu_text_input_poll(char *out_utf8, uint64_t size);
-/* A list for the player to choose from, drawn over the game (save list). images: a PNG path per
- * item drawn beside it (NULL array or entry: none). begin: 0 when no window exists.
- * poll: -1 while open, -2 cancelled, else the chosen index. */
-int tlggpu_choice_begin(const char *title, const char *const *items, const char *const *images, int count, int focus);
-int tlggpu_choice_poll(void);
+/* The save dialogs (sceSaveDataDialog), drawn over the game. kind: 1 save, 2 load, 3 delete
+ * (the dialog's dispType); 0 for the toast of a save the game made without a dialog. */
+typedef struct TlgSaveEntry {
+    const char *title, *subtitle, *detail; /* the game's text for the save (UTF-8) */
+    const char *icon;                      /* PNG path drawn beside it, or NULL */
+    int64_t mtime;                         /* when it was saved (0: unknown) */
+    uint64_t bytes;                        /* size on disk (0: unknown) */
+    int is_new;                            /* the "New save" row */
+} TlgSaveEntry;
+/* The list. begin: 0 when no window exists. poll: -1 while open, -2 cancelled, else the index. */
+int tlggpu_save_list_begin(int kind, const TlgSaveEntry *entries, int count, int focus);
+int tlggpu_save_list_poll(void);
+/* A message the player answers. code: a system message type (1 no data ... 14 too large), 100 the
+ * game's own text, 101 an error code (value). buttons: 0 OK, 1 yes/no, 3 OK/cancel, -1 the
+ * code's own. entry: the save it is about, or NULL. begin: 0 when no window exists.
+ * poll: -1 while open, 1 yes/OK, 2 no/cancel. */
+int tlggpu_save_message_begin(int kind, int code, uint64_t value, const char *text, int buttons,
+                              const TlgSaveEntry *entry);
+int tlggpu_save_message_poll(void);
+/* The game closed its dialog: the list or message goes away unanswered. */
+void tlggpu_save_dialog_close(void);
+/* "Saving..." panel: active 1 shows it (percent < 0: no bar; text NULL keeps the last), 0 hides
+ * it; active 2 shows it briefly, for dialogs the port answers at once. */
+void tlggpu_save_progress(int kind, int active, int percent, const char *text);
+/* "Game saved" in the corner (repeats within a few seconds are dropped). */
+void tlggpu_save_toast(int kind);
 /* 1 while the in-game settings menu is open: the game's pad input is held neutral. */
 int tlggpu_overlay_captures_input(void);
 /* A short message at the top of the screen (any thread). */

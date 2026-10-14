@@ -49,11 +49,31 @@ bool CapturesInput();
 /// `active` is false; typing goes to the window (sdl_window), the box only displays it.
 void SetTextEntry(bool active, const std::string& prompt, const std::string& text);
 
-/// The game's save list: shown until the player chooses (arrows/D-pad, Enter/Cross) or
-/// cancels (Esc/Circle). `pictures`: one per item (empty = none), drawn beside its text.
-/// PollChoice: -1 while open, -2 cancelled, else the chosen index.
-void BeginChoice(const std::string& title, const std::vector<std::string>& items,
-                 std::vector<TlgPng::Image> pictures, int focus);
-int PollChoice();
+/// The game's save dialogs (sceSaveDataDialog). kind: 1 save, 2 load, 3 delete (0: a save made
+/// without a dialog). Rows carry the game's text for each save; the dates, sizes and every other
+/// word are the port's, in the menu language (pt_BR / en_US).
+struct SaveRow {
+    std::string title, subtitle, detail;
+    s64 mtime = 0;  // 0: unknown
+    u64 bytes = 0;  // 0: unknown
+    bool is_new = false;
+};
+/// The list: arrows/D-pad or the mouse choose, Enter/Cross or a click confirm, Esc/Circle or a
+/// right click cancel. `pictures`: one per row (empty = none). PollSaveList: -1 while open,
+/// -2 cancelled, else the chosen index.
+void BeginSaveList(int kind, std::vector<SaveRow> rows, std::vector<TlgPng::Image> pictures, int focus);
+int PollSaveList();
+/// A message the player answers (see tlggpu_save_message_begin). PollSaveMessage: -1 while
+/// open, 1 yes/OK, 2 no/cancel.
+void BeginSaveMessage(int kind, int code, u64 value, const std::string& text, int buttons,
+                      const SaveRow* entry, TlgPng::Image picture);
+int PollSaveMessage();
+/// The game closed its dialog first: the list or message goes away unanswered.
+void CloseSaveDialog();
+/// "Saving..." panel: active 1 on (percent < 0: no bar; text null keeps the last), 0 off,
+/// 2 on for a moment (dialogs the port answers at once).
+void SaveProgress(int kind, int active, int percent, const char* text);
+/// "Game saved" in the bottom-right corner.
+void SaveToast(int kind);
 
 } // namespace TlgOverlay

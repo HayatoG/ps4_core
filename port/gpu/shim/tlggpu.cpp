@@ -368,23 +368,66 @@ extern "C" int tlggpu_text_input_begin(const char* initial, const char* prompt) 
     return 1;
 }
 
-extern "C" int tlggpu_choice_begin(const char* title, const char* const* items, const char* const* images,
-                                    int count, int focus) {
-    if (!g_window || count <= 0) return 0;
-    // Pictures are decoded here, on the game's thread, before the list is shown.
-    std::vector<TlgPng::Image> pictures(count);
-    for (int i = 0; images && i < count; ++i) {
-        if (images[i] && !TlgPng::LoadRgba(images[i], pictures[i])) {
-            LOG_WARNING(Lib_SaveDataDialog, "save list: no picture from {}", images[i]);
-        }
+static TlgOverlay::SaveRow SaveRowOf(const TlgSaveEntry& entry) {
+    TlgOverlay::SaveRow row;
+    row.title = entry.title ? entry.title : "";
+    row.subtitle = entry.subtitle ? entry.subtitle : "";
+    row.detail = entry.detail ? entry.detail : "";
+    row.mtime = entry.mtime;
+    row.bytes = entry.bytes;
+    row.is_new = entry.is_new != 0;
+    return row;
+}
+
+static TlgPng::Image SavePicture(const char* path) {
+    TlgPng::Image picture;
+    if (path && !TlgPng::LoadRgba(path, picture)) {
+        LOG_WARNING(Lib_SaveDataDialog, "save dialog: no picture from {}", path);
     }
-    TlgOverlay::BeginChoice(title ? title : "", std::vector<std::string>(items, items + count),
-                             std::move(pictures), focus);
+    return picture;
+}
+
+extern "C" int tlggpu_save_list_begin(int kind, const TlgSaveEntry* entries, int count, int focus) {
+    if (!g_window || count <= 0 || !entries) return 0;
+    // Pictures are decoded here, on the game's thread, before the list is shown.
+    std::vector<TlgOverlay::SaveRow> rows;
+    std::vector<TlgPng::Image> pictures;
+    for (int i = 0; i < count; ++i) {
+        rows.push_back(SaveRowOf(entries[i]));
+        pictures.push_back(SavePicture(entries[i].icon));
+    }
+    TlgOverlay::BeginSaveList(kind, std::move(rows), std::move(pictures), focus);
     return 1;
 }
 
-extern "C" int tlggpu_choice_poll(void) {
-    return TlgOverlay::PollChoice();
+extern "C" int tlggpu_save_list_poll(void) {
+    return TlgOverlay::PollSaveList();
+}
+
+extern "C" int tlggpu_save_message_begin(int kind, int code, uint64_t value, const char* text,
+                                         int buttons, const TlgSaveEntry* entry) {
+    if (!g_window) return 0;
+    TlgOverlay::SaveRow row;
+    if (entry) row = SaveRowOf(*entry);
+    TlgOverlay::BeginSaveMessage(kind, code, value, text ? text : "", buttons, entry ? &row : nullptr,
+                                 SavePicture(entry ? entry->icon : nullptr));
+    return 1;
+}
+
+extern "C" int tlggpu_save_message_poll(void) {
+    return TlgOverlay::PollSaveMessage();
+}
+
+extern "C" void tlggpu_save_dialog_close(void) {
+    TlgOverlay::CloseSaveDialog();
+}
+
+extern "C" void tlggpu_save_progress(int kind, int active, int percent, const char* text) {
+    if (g_window) TlgOverlay::SaveProgress(kind, active, percent, text);
+}
+
+extern "C" void tlggpu_save_toast(int kind) {
+    if (g_window) TlgOverlay::SaveToast(kind);
 }
 
 extern "C" int tlggpu_text_input_poll(char* out, uint64_t size) {
