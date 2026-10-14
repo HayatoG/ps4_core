@@ -54,6 +54,7 @@ port/packaging/*
 # Ferramentas genéricas do repositório / generic repo tools
 scripts/make_game_view.py
 scripts/session_chart.py
+scripts/frame_diff.py
 scripts/sce_imports.py
 scripts/psarc_toc.py
 scripts/watch_session.sh
