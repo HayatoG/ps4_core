@@ -205,7 +205,8 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
         IsaRegs regs;
         uintptr_t rip;
         isa_context_regs(info->ContextRecord,&regs,0);
-        if (isa_rewrite_trap(isa_table,(uintptr_t)record->ExceptionAddress,&regs,&rip)) {
+        if (isa_rewrite_trap(isa_table,(uintptr_t)record->ExceptionAddress,&regs,
+                             &info->ContextRecord->FltSave.XmmRegisters[0],&rip)) {
             isa_context_regs(info->ContextRecord,&regs,1);
             info->ContextRecord->Rip=(DWORD64)rip;
             return EXCEPTION_CONTINUE_EXECUTION;
@@ -273,7 +274,14 @@ static void fault(int sig, siginfo_t *info, void *context) {
         uintptr_t rip;
         for (int i = 0; i < 16; ++i) regs.gpr[i] = (uint64_t)g[isa_gregs[i]];
         regs.rflags = (uint64_t)g[REG_EFL];
-        if (isa_rewrite_trap(isa_table, (uintptr_t)g[REG_RIP] - 1, &regs, &rip)) {
+        /* XMM0-15 of the signal frame (FXSAVE layout at 160): an SSE4A site changes one of them,
+         * and the kernel restores them on return. */
+        unsigned char *fpu = (unsigned char *)((ucontext_t *)context)->uc_mcontext.fpregs;
+        if (isa_rewrite_trap(isa_table, (uintptr_t)g[REG_RIP] - 1, &regs, fpu ? fpu + 160 : NULL, &rip)) {
+            /* XSAVE frame (FP_XSTATE_MAGIC1): XSTATE_BV bit 1 (SSE) set, or XRSTOR would reset the
+             * XMM registers instead of loading the changed ones. XSAVE wrote their real values. */
+            uint32_t magic;
+            if (fpu && (memcpy(&magic, fpu + 464, 4), magic == 0x46505853u)) fpu[512] |= 2;
             for (int i = 0; i < 16; ++i) g[isa_gregs[i]] = (greg_t)regs.gpr[i];
             g[REG_EFL] = (greg_t)regs.rflags;
             g[REG_RIP] = (greg_t)rip;
@@ -730,8 +738,10 @@ static int cpu_supported(char *missing, size_t size) {
 
 /* Per-game environment prefix. The core still reads TLG_* (one shared prefix, PSCORE_, once every
  * port uses ps4_core), so a port that builds with -DPORT_ENV_PREFIX="ISS_" (inFAMOUS; "GR2_" for
- * Gravity Rush 2) gets each ISS_X copied to TLG_X at start, unless TLG_X is set too. Without the
- * define (The Last Guardian, a core-only build) or with "TLG_" there is nothing to alias. */
+ * Gravity Rush 2) gets each ISS_X copied to TLG_X at start. The game's name wins over a TLG_X that
+ * is also set (gr2 5c5d84d): runners and scripts set TLG_* defaults that a player's ISS_X/GR2_X must
+ * replace. Without the define (The Last Guardian, a core-only build) or with "TLG_" there is nothing
+ * to alias. */
 #ifdef PORT_ENV_PREFIX
 #ifdef _WIN32
 #define environ _environ
@@ -755,11 +765,10 @@ static void alias_port_environment(void) {
         memcpy(name, "TLG_", 4);
         memcpy(name + 4, entry + prefix, length);
         name[4 + length] = 0;
-        if (getenv(name)) continue;
 #ifdef _WIN32
         _putenv_s(name, equals + 1);
 #else
-        setenv(name, equals + 1, 0);
+        setenv(name, equals + 1, 1);
 #endif
     }
     for (size_t i = 0; i < count; ++i) free(copy[i]);
@@ -825,12 +834,14 @@ int main(int argc, char **argv) {
     }
     if (!cpu_supported(missing, sizeof missing)) return 20;
     if (cpu_missing_sets) printf("CPU: missing %s\n", missing);
-    /* TLG_ISA_REWRITE=0 never rewrites, =1 rewrites every emulated site (MOVBE, BMI1, LZCNT: a test
-     * on a complete CPU; tlg: F16C left out, its sites are never emulated and inFAMOUS has 13);
-     * by default the sets the CPU lacks. */
+    /* TLG_ISA_REWRITE=0 never rewrites, =1 rewrites every emulated site (MOVBE, BMI1, LZCNT, SSE4A: a
+     * test on a complete CPU; F16C left out, its sites are never emulated and inFAMOUS has 13), a list
+     * such as "sse4a" or "movbe,bmi1" rewrites those sets; by default the sets the CPU lacks. */
     const char *policy = getenv("TLG_ISA_REWRITE");
-    const unsigned isa_forced = CPU_SET_MOVBE | CPU_SET_BMI1 | CPU_SET_LZCNT;
-    const int forced = policy && !strcmp(policy, "1");
+    int policy_valid;
+    const unsigned isa_forced = cpu_sets_named(policy, &policy_valid);
+    if (!policy_valid) printf("ISA: TLG_ISA_REWRITE=%s ignored (use 0, 1 or a list of movbe, bmi1, lzcnt, sse4a)\n", policy);
+    const int forced = isa_forced != 0;
     unsigned isa_sets = forced ? isa_forced | cpu_missing_sets : policy && !strcmp(policy, "0") ? 0 : cpu_missing_sets;
     if (cpu_missing_sets && !isa_sets) {
         printf("STOP: this CPU lacks %s and the rewrite is disabled (TLG_ISA_REWRITE=0)\n", missing);
@@ -1056,6 +1067,7 @@ int main(int argc, char **argv) {
                 uint64_t address=bindings[relocs[i].value];
                 if (binding_kinds[relocs[i].value]!=relocs[i].kind || !mapped(segments,ns,address,relocs[i].addend+1)) fail("native export kind/range mismatch");
                 value=(uintptr_t)image+address+relocs[i].addend;
+                if (relocs[i].kind==1 && !relocs[i].addend) value=runtime_ngs2_trace_bind(names[relocs[i].value],value);
             }
         }
         memcpy(image + relocs[i].target, &value, 8);
@@ -1093,7 +1105,8 @@ int main(int argc, char **argv) {
             fflush(NULL);
             _exit(20); /* no destructors: GPU threads are running */
         }
-        if (forced) printf("ISA: forced rewrite of %u MOVBE/BMI1/LZCNT sites (TLG_ISA_REWRITE=1), %u skipped\n", r.rewritten, r.skipped);
+        if (forced) printf("ISA: forced rewrite of %u sites (TLG_ISA_REWRITE=%s; %u jmp, %u relocated, %u int3), %u skipped\n",
+                           r.rewritten, policy, r.jmp, r.relocated, r.int3, r.skipped);
         else printf("ISA: CPU lacks %s: %u sites rewritten (%u jmp, %u relocated, %u int3), %u skipped\n",
                     missing, r.rewritten, r.jmp, r.relocated, r.int3, r.skipped);
         runtime_set_report_hook(isa_report_hook);

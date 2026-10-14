@@ -6,6 +6,7 @@
  * Metadata lives beside the directory so the guest's own files are untouched. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "gpu/tlggpu.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -65,7 +66,7 @@ _Static_assert(sizeof(SearchCond)==64 && sizeof(SearchResult)==56,"dir name sear
 static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
 static int initialized;
 static char title_id[16]="UNKNOWN";
-static struct { int used; char host[700], meta[700]; } slots[SLOTS];
+static struct { int used, saved; char host[700], meta[700]; } slots[SLOTS]; /* saved: param written */
 static char memory_path[720];
 static uint64_t memory_size;
 static size_t mounts_done, memory_writes;
@@ -129,6 +130,29 @@ int runtime_savedata_icon(int32_t user, const char *dir, char *out, size_t size)
     snprintf(out,size,"%s/%s.sce_sys/icon0.png",base,dir);
     return 0;
 }
+/* Bytes in a save's folder (the save dialog shows it); 0 when it cannot be read. */
+static uint64_t tree_size(const char *path, int depth) {
+    DIR *d=opendir(path);
+    if (!d) return 0;
+    uint64_t total=0; struct dirent *e;
+    while ((e=readdir(d))) {
+        if (!strcmp(e->d_name,".") || !strcmp(e->d_name,"..")) continue;
+        char child[1024]; struct stat st;
+        snprintf(child,sizeof(child),"%s/%s",path,e->d_name);
+        if (stat(child,&st)) continue;
+        if (S_ISDIR(st.st_mode)) { if (depth<8) total+=tree_size(child,depth+1); }
+        else total+=(uint64_t)st.st_size;
+    }
+    closedir(d);
+    return total;
+}
+uint64_t runtime_savedata_size(int32_t user, const char *dir) {
+    if (!valid_name(dir,32)) return 0;
+    char base[600], host[680];
+    root(user,NULL,base,sizeof(base));
+    snprintf(host,sizeof(host),"%s/%s",base,dir);
+    return tree_size(host,0);
+}
 static ABI int32_t save_initialize(const void *param) { (void)param; initialized=1; return 0; }
 static ABI int32_t save_terminate(void) {
     if (!initialized) return ERR_NOT_INITIALIZED;
@@ -187,8 +211,14 @@ static ABI int32_t save_umount(const MountPoint *point) {
     if (!initialized) return ERR_NOT_INITIALIZED;
     pthread_mutex_lock(&lock);
     int slot=slot_of(point);
-    if (slot>=0) { runtime_file_unmount(point->data); slots[slot].used=0; }
+    int saved=slot>=0 && slots[slot].saved;
+    if (slot>=0) { runtime_file_unmount(point->data); slots[slot].used=slots[slot].saved=0; }
     pthread_mutex_unlock(&lock);
+    /* A save the game wrote (its param set) is done: "Game saved" in the corner.
+     * TLG_SAVE_TOAST=0 turns it off. */
+    static int toast=-1;
+    if (toast<0) { const char *v=getenv("TLG_SAVE_TOAST"); toast=!(v && !strcmp(v,"0")); }
+    if (saved && toast) tlggpu_save_toast(0);
     return slot>=0 ? 0 : ERR_NOT_FOUND;
 }
 static ABI int32_t save_set_param(const MountPoint *point, uint32_t type, const void *buffer, uint64_t size) {
@@ -207,6 +237,7 @@ static ABI int32_t save_set_param(const MountPoint *point, uint32_t type, const 
     default: goto bad;
     }
     write_param(slots[slot].meta,&p);
+    slots[slot].saved=1;
     pthread_mutex_unlock(&lock);
     return 0;
 bad:

@@ -5,7 +5,7 @@
 
 **English.** Catalogue of every PS4 system library the core implements: file(s), function count, real implementations vs offline stubs (return a fixed value so the game proceeds without PSN/network), and which games exercise each one. Built from the `RuntimeExport` tables and NID-keyed resolvers, `import_names.inc` and the GPU `LIB_FUNCTION` registrations. Game columns come from each port's `port/out/link.json`. "real"/"stub" is a heuristic on the function body. Regenerate with `tools/list_exports.py -o docs/LIBRARIES.md`.
 
-Game import lists / listas de imports: TLG `link.json` 2026-10-13, GR2 `link.json` 2026-10-13, ISS `link.json` 2026-10-13; game files at `origin/main`.
+Game import lists / listas de imports: TLG `link.json` 2026-10-13, GR2 `link.json` 2026-10-13, ISS `link.json` 2026-10-14; game files at `origin/main`.
 
 ## Cobertura por jogo / Coverage per game
 
@@ -51,6 +51,7 @@ Who answers each system import of the game, in `runtime_resolve` order: core run
 | `libc` | `runtime.c`, `runtime_kernel.c` | 14 | 14 | 0 | · | · | · | The game ships its own libc.prx (linked by link_libc.py, native bindings); the core only provides the entry glue (_init_env, atexit, __cxa_*) and fast memcpy/memset. |
 | `libScePad` | `runtime_pad.c` | 13 | 13 | 0 | 11 | 9 | 7 | SDL3 gamepads, keyboard and mouse; real gyro/accelerometer when the controller has them, simulated motion otherwise; touchpad swipe; dead zone; TLG_KEY_MAP. |
 | `libSceVoice` | `runtime_services.c` | 11 | 3 | 8 | · | · | · |  |
+| `libSceNgs2` | `runtime_ngs2.c` | 10 | 10 | 0 | · | · | · |  |
 | `libSceNpTrophy` | `runtime_services.c` | 10 | 9 | 1 | 5 | · | 7 | Offline (game-side tables in the ports for now). |
 | `libScePlayGo` | `runtime_services.c` | 10 | 9 | 1 | 5 | 6 | 7 |  |
 | `libSceSaveDataDialog` | `runtime_services.c` | 9 | 8 | 1 | · | 8 | 5 |  |
@@ -633,6 +634,23 @@ Kind: **real** = implemented; *stub* = offline/fixed result; data = a variable; 
 | `sceNetCtlGetState` | `uBPlr0lbuiI` | **real** | `port/src/runtime_services.c` (`netctl_state`) | TLG ISS |
 | `sceNetCtlRegisterCallback` | `UJ+Z7Q+4ck0` | **real** | `port/src/runtime_services.c` (`netctl_register`) | ISS |
 | `sceNetCtlUnregisterCallback` | `Rqm2OnZMCz0` | *stub* | `port/src/runtime_services.c` (`netctl_unregister`) | ISS |
+
+</details>
+
+<details><summary><code>libSceNgs2</code> — 10</summary>
+
+| Function | NID | Kind | Implemented in | Games |
+|---|---|---|---|---|
+| `sceNgs2RackCreate` | `cLV4aiT9JpA` | **real** | `port/src/runtime_ngs2.c` (`ngs2_rack_create`) |  |
+| `sceNgs2RackCreateWithAllocator` | `U546k6orxQo` | **real** | `port/src/runtime_ngs2.c` (`ngs2_rack_create_alloc`) |  |
+| `sceNgs2RackDestroy` | `lCqD7oycmIM` | **real** | `port/src/runtime_ngs2.c` (`ngs2_rack_destroy`) |  |
+| `sceNgs2RackGetVoiceHandle` | `MwmHz8pAdAo` | **real** | `port/src/runtime_ngs2.c` (`ngs2_voice_handle`) |  |
+| `sceNgs2RackQueryBufferSize` | `0eFLVCfWVds` | **real** | `port/src/runtime_ngs2.c` (`ngs2_query_buffer`) |  |
+| `sceNgs2SystemCreateWithAllocator` | `mPYgU4oYpuY` | **real** | `port/src/runtime_ngs2.c` (`ngs2_system_create`) |  |
+| `sceNgs2SystemDestroy` | `u-WrYDaJA3k` | **real** | `port/src/runtime_ngs2.c` (`ngs2_system_destroy`) |  |
+| `sceNgs2SystemRender` | `i0VnXM-C9fc` | **real** | `port/src/runtime_ngs2.c` (`ngs2_render`) |  |
+| `sceNgs2VoiceControl` | `uu94irFOGpA` | **real** | `port/src/runtime_ngs2.c` (`ngs2_voice_control`) |  |
+| `sceNgs2VoiceGetState` | `-TOuuAQ-buE` | **real** | `port/src/runtime_ngs2.c` (`ngs2_voice_state`) |  |
 
 </details>
 

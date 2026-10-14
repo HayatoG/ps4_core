@@ -18,6 +18,15 @@ class RunIsaTests(unittest.TestCase):
     def test_rewrite_forced(self):
         self.assertTrue(run.isa_rewrite_wanted([], {'TLG_ISA_REWRITE': '1'}))
 
+    def test_rewrite_forced_by_set_list(self):
+        self.assertTrue(run.isa_rewrite_wanted([], {'TLG_ISA_REWRITE': 'sse4a'}))
+        self.assertTrue(run.isa_rewrite_wanted([], {'PORT_ENV_PREFIX': 'ISS_', 'ISS_ISA_REWRITE': 'sse4a,movbe'}))
+        # The game's prefix wins over TLG_; without a prefix only TLG_ counts.
+        self.assertFalse(run.isa_rewrite_wanted(['MOVBE'], {'PORT_ENV_PREFIX': 'GR2_', 'GR2_ISA_REWRITE': '0',
+                                                            'TLG_ISA_REWRITE': '1'}))
+        self.assertFalse(run.isa_rewrite_wanted([], {'PORT_ENV_PREFIX': '', 'ISS_ISA_REWRITE': '1'}))
+        self.assertEqual(run.parse_cpu_features('CPU: missing SSE4A\n'), ['SSE4A'])
+
     def test_rewrite_disabled(self):
         self.assertFalse(run.isa_rewrite_wanted(['MOVBE', 'BMI1'], {'TLG_ISA_REWRITE': '0'}))
 

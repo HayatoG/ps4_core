@@ -19,6 +19,7 @@
 #include "tlg_settings.h"
 #include "tlg_graphics.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
+#include "video_core/renderer_vulkan/vk_frame_record.h"
 #include "common/debug.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
@@ -623,6 +624,10 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
 }
 
 void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop) {
+    // tlg: frame boundaries of TLG_FRAME_RECORD_TRIGGER, in stream order on the GPU thread.
+    Vulkan::FrameRecord::OnFlip(index >= 0 ? port->buffer_slots[index].address_left : 0,
+                                std::this_thread::get_id() ==
+                                    liverpool->GetGpuCommandProcessorThread());
     Vulkan::Frame* frame;
     if (index == -1) {
         frame = presenter->PrepareBlankFrame(false);

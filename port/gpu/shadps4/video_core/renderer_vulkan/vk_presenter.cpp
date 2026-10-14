@@ -21,6 +21,7 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/texture_cache/image.h"
 
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -389,9 +390,22 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // tlg: TLG_FRAME_DUMP_TRIGGER=<file>: when the file exists it is removed and this frame's
     // guest display buffer and presented image are written to TLG_DUMP_DIR (default out/dump)
     // as raw 32-bit pixels (menus and movies included; the upscaler dumps scene frames only).
+    // TLG_FRAME_DUMP_COUNT=N: one trigger dumps N consecutive frames (flicker hunting).
     static const char* frame_dump_trigger = std::getenv("TLG_FRAME_DUMP_TRIGGER");
+    static const int frame_dump_count = [] {
+        const char* env = std::getenv("TLG_FRAME_DUMP_COUNT");
+        const int n = env ? std::atoi(env) : 1;
+        return n < 1 ? 1 : n > 600 ? 600 : n;
+    }();
     static int frame_dump_index = 0;
-    const bool frame_dump = frame_dump_trigger && std::remove(frame_dump_trigger) == 0;
+    static int frame_dump_left = 0;
+    if (frame_dump_trigger && frame_dump_left == 0 && std::remove(frame_dump_trigger) == 0) {
+        frame_dump_left = frame_dump_count;
+    }
+    const bool frame_dump = frame_dump_left > 0;
+    if (frame_dump) {
+        --frame_dump_left;
+    }
     // tlg: scaled upscaler presets: the output-size display buffer drawn by the port.
     TemporalUpscaler::Display display{};
     const bool upscaled = rasterizer->GetUpscaler().DisplayOverride(cpu_address, display);

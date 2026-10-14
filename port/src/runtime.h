@@ -50,6 +50,11 @@ void runtime_content_report(void);
 typedef struct { const char *name; void *function; } RuntimeExport;
 #define RUNTIME_LOOKUP(table, nid) runtime_lookup(table, sizeof(table)/sizeof(*(table)), nid)
 const char *runtime_symbol(const char *nid);
+uintptr_t runtime_ngs2_trace_bind(const char *nid, uintptr_t address);
+/* libSceNgs2 (runtime_ngs2.c): the built-in mixer, unless TLG_NGS2=native links the firmware module. */
+int runtime_ngs2_native(void);
+uintptr_t runtime_ngs2_resolve(const char *name);
+void *runtime_ngs2_function(const char *symbol);
 uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *nid);
 uintptr_t runtime_kernel_resolve(const char *name);
 uintptr_t runtime_file_resolve(const char *name);
@@ -115,5 +120,6 @@ void runtime_savedata_report(void);
 #define RUNTIME_SAVE_PARAM_SIZE 1328
 int runtime_savedata_param(int32_t user, const char *dir, void *param);
 int runtime_savedata_icon(int32_t user, const char *dir, char *out, size_t size);
+uint64_t runtime_savedata_size(int32_t user, const char *dir); /* bytes on disk, 0 unknown */
 void runtime_thread_attach_host(const char *name);
 #endif

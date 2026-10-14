@@ -423,11 +423,20 @@ void Scheduler::PopPendingOperations() {
         }
         work_semaphore.Refresh();
     }
+    // tlg: a callback can submit (the fault buffer's ObtainBuffer, which may upload in parts or
+    // wait for the GPU to free memory) and so come back here on this thread while it is still
+    // the front op: running it again, or popping it, would corrupt the queue. The outer loop
+    // carries on once the callback returns.
+    if (popping_pending_ops) {
+        return;
+    }
+    popping_pending_ops = true;
     while (!pending_ops.empty() && work_semaphore.IsFree(pending_ops.front().gpu_tick)) {
         pending_ops.front().callback();
         pending_ops.pop();
         num_pending_ops.fetch_sub(1, std::memory_order_release);
     }
+    popping_pending_ops = false;
 }
 
 void Scheduler::AllocateWorkerCommandBuffers() {
@@ -454,6 +463,7 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 void Scheduler::SubmitExecution(SubmitInfo& info) {
     std::scoped_lock lk{submit_mutex};
     const u64 signal_value = work_semaphore.NextTick();
+    work_since_submit.store(0, std::memory_order_relaxed);
 
 #if TRACY_GPU_ENABLED
     auto* profiler_ctx = instance.GetProfilerContext();

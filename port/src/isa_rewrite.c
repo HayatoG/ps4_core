@@ -72,11 +72,16 @@ static int register_valid(uint8_t reg) { return reg <= 15 || reg == ISA_NO_REG; 
  * The writer stores scale 0 without a memory operand, else iced's scale (1 when there is no index). */
 static int record_valid(const IsaSite *s, uint64_t image_size) {
     if (s->length < 4 || s->length > 15 || s->relocated_length > 15) return 0;
-    if (s->kind < ISA_MOVBE_LOAD || s->kind > ISA_VCVTPS2PH || s->mode > ISA_MODE_UNSUPPORTED) return 0;
+    if (s->kind < ISA_MOVBE_LOAD || s->kind > ISA_MOVNTSD || s->mode > ISA_MODE_UNSUPPORTED) return 0;
     if (!register_valid(s->dst) || !register_valid(s->src1) || !register_valid(s->src2) || !register_valid(s->base) ||
         !register_valid(s->index) || s->mem_slot > ISA_MEM_SRC)
         return 0;
     if (s->kind <= ISA_BLSR && s->width != 16 && s->width != 32 && s->width != 64) return 0;
+    /* EXTRQ/INSERTQ: register operands only; MOVNTSS/MOVNTSD are never rewritten. */
+    if ((s->kind == ISA_MOVNTSS || s->kind == ISA_MOVNTSD) && s->mode != ISA_MODE_UNSUPPORTED) return 0;
+    if (s->kind >= ISA_EXTRQ && s->kind <= ISA_INSERTQ_IMM &&
+        (s->dst > 15 || s->mem_slot != ISA_MEM_NONE || ((s->kind != ISA_EXTRQ_IMM) && s->src1 > 15)))
+        return 0;
     if (s->scale != 1 && s->scale != 2 && s->scale != 4 && s->scale != 8 && !(s->scale == 0 && s->index == ISA_NO_REG))
         return 0;
     if (s->mode == ISA_MODE_JMP && s->length < JMP_BYTES) return 0;
@@ -146,6 +151,8 @@ unsigned isa_site_set(const IsaSite *s) {
     case ISA_LZCNT: return CPU_SET_LZCNT;
     case ISA_TZCNT: case ISA_ANDN: case ISA_BEXTR: case ISA_BLSI: case ISA_BLSMSK: case ISA_BLSR: return CPU_SET_BMI1;
     case ISA_VCVTPH2PS: case ISA_VCVTPS2PH: return CPU_SET_F16C;
+    case ISA_EXTRQ: case ISA_EXTRQ_IMM: case ISA_INSERTQ: case ISA_INSERTQ_IMM: case ISA_MOVNTSS: case ISA_MOVNTSD:
+        return CPU_SET_SSE4A;
     default: return 0;
     }
 }
@@ -179,6 +186,65 @@ static int rel32_to(const unsigned char *next, const unsigned char *target, int3
     return 1;
 }
 
+/* movdqu [rsp+disp8], xmm (store) or movdqu xmm, [rsp+disp8] (load): F3 [REX.R] 0F 7F/6F modrm(01 xmm 100) SIB 24. */
+static void emit_movdqu_rsp(unsigned char **p, int store, int xmm, uint8_t disp) {
+    emit_u8(p, 0xf3);
+    if (xmm >= 8) emit_u8(p, 0x44);
+    emit_bytes(p, (const uint8_t[]){0x0f, store ? 0x7f : 0x6f, (uint8_t)(0x44 | (xmm & 7) << 3), 0x24, disp}, 5);
+}
+
+/* Shared tail: the relocated instruction (JMP_RELOCATE) and the jmp back; 0 when out of rel32 range. */
+static size_t emit_return(unsigned char *code, unsigned char *p, const unsigned char *at, const IsaSite *s,
+                          unsigned char *image) {
+    const unsigned char *back = image + s->offset + s->length;
+    if (s->mode == ISA_MODE_JMP_RELOCATE) {
+        emit_bytes(&p, s->relocated, s->relocated_length);
+        back = image + s->offset + 4 + s->relocated_length;
+    }
+    int32_t rel;
+    if (!rel32_to(at + (p - code) + JMP_BYTES, back, &rel)) return 0;
+    emit_u8(&p, 0xe9);
+    emit_u32(&p, (uint32_t)rel);
+    return (size_t)(p - code);
+}
+
+/* SSE4A stub: the operands are XMM registers, which isa_emulate's IsaRegs does not carry. It steps
+ * over the red zone, saves rflags (then clears DF for the C call) and the registers the SysV ABI
+ * lets isa_emulate_sse4a clobber, copies the destination and source XMM to a 32-byte buffer, calls
+ * it and loads the destination back. The movdqu are legacy SSE like EXTRQ itself: bits 255:128 of
+ * the YMM register stay as they were, and no other XMM register is touched. */
+static size_t emit_sse4a_stub(unsigned char *code, const unsigned char *at, const IsaSite *s, uint64_t *hit,
+                              unsigned char *image) {
+    static const uint8_t pushes[] = {0x50, 0x51, 0x52, 0x56, 0x57, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53, 0x55};
+    static const uint8_t pops[] = {0x5d, 0x41, 0x5b, 0x41, 0x5a, 0x41, 0x59, 0x41, 0x58, 0x5f, 0x5e, 0x5a, 0x59, 0x58};
+    unsigned char *p = code;
+    emit_bytes(&p, (const uint8_t[]){0x48, 0x8d, 0x64, 0x24, 0x80}, 5);   /* lea rsp,[rsp-0x80] */
+    emit_u8(&p, 0x9c);                                                     /* pushfq */
+    emit_u8(&p, 0xfc);                                                     /* cld */
+    emit_bytes(&p, pushes, sizeof pushes);                                 /* rax rcx rdx rsi rdi r8-r11 rbp */
+    emit_bytes(&p, (const uint8_t[]){0x48, 0x8d, 0x64, 0x24, 0xe0}, 5);   /* lea rsp,[rsp-0x20] */
+    emit_movdqu_rsp(&p, 1, s->dst, 0);
+    if (s->src1 != ISA_NO_REG) emit_movdqu_rsp(&p, 1, s->src1, 16);
+    emit_bytes(&p, (const uint8_t[]){0x48, 0xb8}, 2);                      /* mov rax, &hits[i] */
+    emit_u64(&p, (uint64_t)(uintptr_t)hit);
+    emit_bytes(&p, (const uint8_t[]){0x48, 0xff, 0x00}, 3);                /* inc qword [rax] */
+    emit_bytes(&p, (const uint8_t[]){0x48, 0x89, 0xe5}, 3);                /* mov rbp, rsp */
+    emit_bytes(&p, (const uint8_t[]){0x48, 0x83, 0xe4, 0xf0}, 4);          /* and rsp, -16 */
+    emit_bytes(&p, (const uint8_t[]){0x48, 0xbf}, 2);                      /* mov rdi, site */
+    emit_u64(&p, (uint64_t)(uintptr_t)s);
+    emit_bytes(&p, (const uint8_t[]){0x48, 0x89, 0xee}, 3);                /* mov rsi, rbp (the buffer) */
+    emit_bytes(&p, (const uint8_t[]){0x48, 0xb8}, 2);                      /* mov rax, isa_emulate_sse4a */
+    emit_u64(&p, (uint64_t)(uintptr_t)isa_emulate_sse4a);
+    emit_bytes(&p, (const uint8_t[]){0xff, 0xd0}, 2);                      /* call rax */
+    emit_bytes(&p, (const uint8_t[]){0x48, 0x89, 0xec}, 3);                /* mov rsp, rbp */
+    emit_movdqu_rsp(&p, 0, s->dst, 0);
+    emit_bytes(&p, (const uint8_t[]){0x48, 0x8d, 0x64, 0x24, 0x20}, 5);   /* lea rsp,[rsp+0x20] */
+    emit_bytes(&p, pops, sizeof pops);
+    emit_u8(&p, 0x9d);                                                     /* popfq */
+    emit_bytes(&p, (const uint8_t[]){0x48, 0x8d, 0xa4, 0x24, 0x80, 0x00, 0x00, 0x00}, 8); /* lea rsp,[rsp+0x80] */
+    return emit_return(code, p, at, s, image);
+}
+
 /* Writes the stub for `s` into `code` (laid out to run at `at`). Returns its size, or 0 when the
  * jmp back is out of rel32 range. */
 static size_t emit_stub(unsigned char *code, const unsigned char *at, const IsaSite *s, uint64_t *hit,
@@ -186,6 +252,7 @@ static size_t emit_stub(unsigned char *code, const unsigned char *at, const IsaS
     static const uint8_t lea_rsp_down[] = {0x48, 0x8d, 0xa4, 0x24, 0x00, 0xff, 0xff, 0xff};   /* lea rsp,[rsp-0x100] */
     static const uint8_t lea_rax_rsp_up[] = {0x48, 0x8d, 0x84, 0x24, 0x00, 0x01, 0x00, 0x00}; /* lea rax,[rsp+0x100] */
     static const uint8_t lea_rsp_up[] = {0x48, 0x8d, 0xa4, 0x24, 0x00, 0x01, 0x00, 0x00};     /* lea rsp,[rsp+0x100] */
+    if (isa_kind_is_sse4a(s->kind)) return emit_sse4a_stub(code, at, s, hit, image);
     unsigned char *p = code;
     emit_bytes(&p, lea_rsp_down, sizeof lea_rsp_down);
     for (int reg = 0; reg < 16; reg++)
@@ -209,16 +276,7 @@ static size_t emit_stub(unsigned char *code, const unsigned char *at, const IsaS
     for (int reg = 0; reg < 16; reg++)
         if (reg != 4) emit_mov_load(&p, reg, (uint8_t)(8 * reg));
     emit_bytes(&p, lea_rsp_up, sizeof lea_rsp_up);
-    const unsigned char *back = image + s->offset + s->length;
-    if (s->mode == ISA_MODE_JMP_RELOCATE) {
-        emit_bytes(&p, s->relocated, s->relocated_length);
-        back = image + s->offset + 4 + s->relocated_length;
-    }
-    int32_t rel;
-    if (!rel32_to(at + (p - code) + JMP_BYTES, back, &rel)) return 0;
-    emit_u8(&p, 0xe9);
-    emit_u32(&p, (uint32_t)rel);
-    return (size_t)(p - code);
+    return emit_return(code, p, at, s, image);
 }
 
 /* Site bytes of spec 4.3. */
@@ -290,7 +348,7 @@ IsaReport isa_rewrite_apply(IsaTable *t, unsigned char *image, unsigned char *st
 
 /* ---- int3 trap, stub lookup, report ---- */
 
-int isa_rewrite_trap(IsaTable *t, uintptr_t address, IsaRegs *regs, uintptr_t *next_rip) {
+int isa_rewrite_trap(IsaTable *t, uintptr_t address, IsaRegs *regs, void *xmm, uintptr_t *next_rip) {
     if (!t || !t->image || address < (uintptr_t)t->image) return 0;
     uint64_t offset = address - (uintptr_t)t->image;
     uint32_t lo = 0, hi = t->count;
@@ -301,7 +359,18 @@ int isa_rewrite_trap(IsaTable *t, uintptr_t address, IsaRegs *regs, uintptr_t *n
     }
     if (lo == t->count || t->sites[lo].offset != offset) return 0;
     if (t->sites[lo].mode != ISA_MODE_INT3 || *(const unsigned char *)address != 0xcc) return 0;
-    isa_emulate(&t->sites[lo], regs);
+    const IsaSite *s = &t->sites[lo];
+    if (isa_kind_is_sse4a(s->kind)) {
+        if (!xmm) return 0;
+        uint64_t operands[4] = {0, 0, 0, 0};
+        unsigned char *dst = (unsigned char *)xmm + 16 * s->dst;
+        memcpy(operands, dst, 16);
+        if (s->src1 != ISA_NO_REG) memcpy(operands + 2, (unsigned char *)xmm + 16 * s->src1, 16);
+        isa_emulate_sse4a(s, operands);
+        memcpy(dst, operands, 16);
+    } else {
+        isa_emulate(s, regs);
+    }
     t->hits[lo]++;
     *next_rip = address + t->sites[lo].length;
     return 1;
@@ -314,8 +383,9 @@ int isa_rewrite_site_of_stub(const IsaTable *t, uintptr_t rip) {
 }
 
 const char *isa_kind_name(uint8_t kind) {
-    static const char *const names[] = {"?",     "movbe", "movbe",  "lzcnt", "tzcnt",     "andn",
-                                        "bextr", "blsi",  "blsmsk", "blsr",  "vcvtph2ps", "vcvtps2ph"};
+    static const char *const names[] = {"?",       "movbe",   "movbe",   "lzcnt",   "tzcnt",     "andn",
+                                        "bextr",   "blsi",    "blsmsk",  "blsr",    "vcvtph2ps", "vcvtps2ph",
+                                        "extrq",   "extrq",   "insertq", "insertq", "movntss",   "movntsd"};
     return kind < sizeof names / sizeof names[0] ? names[kind] : "?";
 }
 

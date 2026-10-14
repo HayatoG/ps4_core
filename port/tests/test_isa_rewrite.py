@@ -17,6 +17,12 @@ TZCNT_RAX = bytes.fromhex('f3480fbcc1')          # tzcnt rax, rcx           (5)
 NOP, RET, JMP_SELF = b'\x90', b'\xc3', bytes.fromhex('ebfe')
 MOV_RIP = bytes.fromhex('8b0500000000')          # mov eax, [rip+0]         (6)
 MOV_FS = bytes.fromhex('648b042500000000')       # mov eax, fs:[0]          (8): not a site
+EXTRQ_X4_X7 = bytes.fromhex('660f79e7')          # extrq xmm4, xmm7          (4): inFAMOUS 0x8938f1
+EXTRQ_X8_X1 = bytes.fromhex('66440f79c1')        # extrq xmm8, xmm1          (5)
+EXTRQ_IMM = bytes.fromhex('660f78c00510')        # extrq xmm0, 5, 16         (6)
+INSERTQ_X1_X2 = bytes.fromhex('f20f79ca')        # insertq xmm1, xmm2        (4)
+INSERTQ_IMM = bytes.fromhex('f2450f78c80510')    # insertq xmm9, xmm8, 5, 16 (7)
+VMOVDQA_X0_X0 = bytes.fromhex('c5f97fc0')        # vmovdqa xmm0, xmm0        (4)
 
 
 @unittest.skipUnless(isa_rewrite.iced_x86, 'pip install iced-x86')
@@ -67,6 +73,25 @@ class ScanSegmentTests(unittest.TestCase):
         s, = isa_rewrite.scan_segment(bytes.fromhex('c4e2e0f2449108'), 0)   # andn rax, rbx, [rcx+rdx*4+8]
         self.assertEqual((s.kind, s.width, s.dst, s.src1, s.src2, s.mem_slot), (isa_rewrite.KIND_ANDN, 64, 0, 3, isa_rewrite.NO_REG, 2))
         self.assertEqual((s.base, s.index, s.scale, s.mem_flags, s.disp), (1, 2, 4, 0, 8))
+
+    def test_sse4a_register_forms(self):
+        a, b, c = isa_rewrite.scan_segment(EXTRQ_X8_X1 + INSERTQ_X1_X2 + VMOVDQA_X0_X0 + EXTRQ_X4_X7 + RET, 0)
+        self.assertEqual((a.kind, a.length, a.mode, a.dst, a.src1, a.src2, a.width, a.mem_slot),
+                         (isa_rewrite.KIND_EXTRQ, 5, isa_rewrite.MODE_JMP, 8, 1, isa_rewrite.NO_REG, 0, 0))
+        self.assertEqual((b.kind, b.mode, b.dst, b.src1, b.relocated),
+                         (isa_rewrite.KIND_INSERTQ, isa_rewrite.MODE_JMP_RELOCATE, 1, 2, VMOVDQA_X0_X0))
+        self.assertEqual((c.kind, c.mode, c.dst, c.src1), (isa_rewrite.KIND_EXTRQ, isa_rewrite.MODE_INT3, 4, 7))
+
+    def test_sse4a_immediate_forms_keep_length_and_index(self):
+        a, b = isa_rewrite.scan_segment(EXTRQ_IMM + INSERTQ_IMM + RET, 0)
+        self.assertEqual((a.kind, a.length, a.mode, a.dst, a.src1, a.disp),
+                         (isa_rewrite.KIND_EXTRQ_IMM, 6, isa_rewrite.MODE_JMP, 0, isa_rewrite.NO_REG, 5 | 16 << 8))
+        self.assertEqual((b.kind, b.length, b.dst, b.src1, b.disp), (isa_rewrite.KIND_INSERTQ_IMM, 7, 9, 8, 5 | 16 << 8))
+
+    def test_sse4a_nontemporal_stores_are_unsupported(self):
+        for code, kind in ((bytes.fromhex('f30f2b00'), isa_rewrite.KIND_MOVNTSS), (bytes.fromhex('f20f2b00'), isa_rewrite.KIND_MOVNTSD)):
+            s, = isa_rewrite.scan_segment(code + RET, 0)
+            self.assertEqual((s.kind, s.mode), (kind, isa_rewrite.MODE_UNSUPPORTED))
 
     def test_non_sites_are_ignored(self):
         self.assertEqual(isa_rewrite.scan_segment(MOV_FS + RET, 0), [])
@@ -148,7 +173,10 @@ class TableTests(unittest.TestCase):
     def test_summary_line(self):
         sites = isa_rewrite.scan_segment(BLSR_ECX + MOVBE_STORE + NOP + bytes.fromhex('c4e2791310') + RET, 0)
         self.assertEqual(isa_rewrite.summary(sites),
-                         'ISA: 3 sites (MOVBE 1, BMI1 1, LZCNT 0, F16C 1); 1 relocated, 0 int3, 1 unsupported')
+                         'ISA: 3 sites (MOVBE 1, BMI1 1, LZCNT 0, F16C 1, SSE4A 0); 1 relocated, 0 int3, 1 unsupported')
+        sites = isa_rewrite.scan_segment(EXTRQ_X8_X1 + EXTRQ_X4_X7 + RET, 0)
+        self.assertEqual(isa_rewrite.summary(sites),
+                         'ISA: 2 sites (MOVBE 0, BMI1 0, LZCNT 0, F16C 0, SSE4A 2); 0 relocated, 1 int3, 0 unsupported')
 
     def test_main_writes_table_for_executable_segments_only(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -156,7 +184,7 @@ class TableTests(unittest.TestCase):
             boot.write_bytes(boot_linked([(BLSR_ECX + RET, 0x1000, 5), (b'', 0x1000, 5), (BLSR_ECX, 0x1000, 6)]))
             code, out = run_main([str(boot), '--out', tmp])
             self.assertEqual(code, 0)
-            self.assertEqual(out, 'ISA: 1 sites (MOVBE 0, BMI1 1, LZCNT 0, F16C 0); 0 relocated, 0 int3, 0 unsupported\n')
+            self.assertEqual(out, 'ISA: 1 sites (MOVBE 0, BMI1 1, LZCNT 0, F16C 0, SSE4A 0); 0 relocated, 0 int3, 0 unsupported\n')
             table = (Path(tmp) / 'isa-rewrite.bin').read_bytes()
             image = isa_rewrite.read_boot_linked(boot.read_bytes())[1]
             self.assertEqual(table, isa_rewrite.encode_table(image, isa_rewrite.scan_segment(BLSR_ECX + RET, 0)))

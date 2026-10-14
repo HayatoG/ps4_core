@@ -9,11 +9,19 @@ int tlggpu_text_input_poll(char *text, uint64_t size) { (void)text; (void)size; 
 int64_t runtime_file_open(const char *path, int flags, int mode) { (void)path; (void)flags; (void)mode; return -1; }
 int64_t runtime_file_read(int fd, void *buffer, uint64_t size) { (void)fd; (void)buffer; (void)size; return -1; }
 int64_t runtime_file_close(int fd) { (void)fd; return 0; }
-static int choice_next=-1;
-int tlggpu_choice_begin(const char *title, const char *const *items, const char *const *images, int count, int focus) { (void)title; (void)items; (void)images; (void)focus; return count>0; }
-int tlggpu_choice_poll(void) { return choice_next; }
+static int choice_next=-1, message_next=-1, message_code=0, progress_shown=0, toasts=0;
+int tlggpu_save_list_begin(int kind, const TlgSaveEntry *entries, int count, int focus) { (void)kind; (void)entries; (void)focus; return count>0; }
+int tlggpu_save_list_poll(void) { return choice_next; }
+int tlggpu_save_message_begin(int kind, int code, uint64_t value, const char *text, int buttons, const TlgSaveEntry *entry) {
+    (void)kind; (void)value; (void)text; (void)buttons; (void)entry; message_code=code; return 1;
+}
+int tlggpu_save_message_poll(void) { return message_next; }
+void tlggpu_save_dialog_close(void) {}
+void tlggpu_save_progress(int kind, int active, int percent, const char *text) { (void)kind; (void)percent; (void)text; progress_shown=active; }
+void tlggpu_save_toast(int kind) { (void)kind; ++toasts; }
 int runtime_savedata_param(int32_t user, const char *dir, void *param) { (void)user; (void)dir; (void)param; return -1; }
 int runtime_savedata_icon(int32_t user, const char *dir, char *out, size_t size) { (void)user; (void)dir; (void)out; (void)size; return -1; }
+uint64_t runtime_savedata_size(int32_t user, const char *dir) { (void)user; (void)dir; return 0; }
 
 int main(void) {
     unsigned char param[128]={0}, result[64]={0}; /* the game zeroes the pointers it does not want */
@@ -64,6 +72,34 @@ int main(void) {
     assert(save_open(list)==0);
     choice_next=-2;
     assert(save_status()==DIALOG_FINISHED && save_result(out)==0);
+    memcpy(&value,out+4,4); assert(value==SAVE_RESULT_CANCELED);
+    assert(save_term()==0);
+
+    /* System messages: "overwrite?" waits for the player (No = button 2); "saving" and "saved"
+     * show for a moment and answer at once. sysMsgParam @88: type, value. */
+    unsigned char sysmsg[48]={0}, *sysmsg_ptr=sysmsg; unsigned char ask[128]={0};
+    ask[52]=3; ask[56]=1; memcpy(ask+72,&items_ptr,8); memcpy(ask+88,&sysmsg_ptr,8);
+    sysmsg[0]=3; message_next=-1;
+    assert(save_init()==0 && save_open(ask)==0 && message_code==3 && save_status()==DIALOG_RUNNING);
+    message_next=2;
+    assert(save_status()==DIALOG_FINISHED && save_result(out)==0);
+    memcpy(&value,out+8,4); assert(value==SAVE_BUTTON_NO);
+    message_next=1;
+    assert(save_open(ask)==0 && save_status()==DIALOG_FINISHED && save_result(out)==0);
+    memcpy(&value,out+8,4); assert(value==1);
+    sysmsg[0]=5; progress_shown=0;
+    assert(save_open(ask)==0 && save_status()==DIALOG_FINISHED && progress_shown==2);
+    sysmsg[0]=7;
+    assert(save_open(ask)==0 && save_status()==DIALOG_FINISHED && toasts==1);
+    /* The game's own message with OK/Cancel: Cancel cancels the dialog. userMsgParam @80. */
+    unsigned char usermsg[48]={0}, *usermsg_ptr=usermsg; const char *usertext="Hi";
+    unsigned char user[128]={0}; user[52]=2; memcpy(user+80,&usermsg_ptr,8);
+    usermsg[0]=3; memcpy(usermsg+8,&usertext,8); message_next=2;
+    assert(save_open(user)==0 && message_code==100 && save_status()==DIALOG_FINISHED && save_result(out)==0);
+    memcpy(&value,out+4,4); assert(value==SAVE_RESULT_CANCELED);
+    /* The game closes a question it asked: cancelled. */
+    message_next=-1; sysmsg[0]=3;
+    assert(save_open(ask)==0 && save_status()==DIALOG_RUNNING && save_close()==0 && save_result(out)==0);
     memcpy(&value,out+4,4); assert(value==SAVE_RESULT_CANCELED);
     assert(save_term()==0);
 

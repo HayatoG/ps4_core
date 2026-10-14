@@ -131,6 +131,19 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
         VkBuffer unsafe_buffer{};
         VkResult result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &alloc_ci, &unsafe_buffer,
                                           &allocation, out_alloc_info);
+        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+            // tlg: from shadPS4-Infamous-FixBuild e656365e. The budget shrinks as other programs
+            // take video memory, and going over it ended the game. Past it the driver moves
+            // memory out to system memory instead: slower, but the game keeps going.
+            LOG_WARNING(Render_Vulkan,
+                        "Allocating a buffer of {} bytes went over the memory budget, allocating "
+                        "it past the budget",
+                        buffer_ci.size);
+            VmaAllocationCreateInfo over_budget_ci = alloc_ci;
+            over_budget_ci.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+            result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &over_budget_ci, &unsafe_buffer,
+                                     &allocation, out_alloc_info);
+        }
         ASSERT_MSG(result == VK_SUCCESS, "Failed allocating buffer with error {} (size {:#x}, memory type {})",
                    vk::to_string(vk::Result{result}), buffer_ci.size, static_cast<int>(mem_type));
         buffer = vk::Buffer{unsafe_buffer};

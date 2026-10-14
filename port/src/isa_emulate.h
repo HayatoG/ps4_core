@@ -1,5 +1,5 @@
-/* Emulation of the guest's MOVBE, BMI1 and LZCNT instructions for hosts that lack them (Sandy and
- * Ivy Bridge, #33, #66). Each G3ISA1 record (scripts/isa_rewrite.py) describes one instruction
+/* Emulation of the guest's MOVBE, BMI1, LZCNT and SSE4A instructions for hosts that lack them (Sandy
+ * and Ivy Bridge, #33, #66; SSE4A: every Intel CPU). Each G3ISA1 record (scripts/isa_rewrite.py) describes one instruction
  * site; a stub calls isa_emulate with the guest's registers. Built with -mgeneral-regs-only and
  * no libc: it runs inside guest code and must leave the XMM/YMM registers untouched. */
 #ifndef TLG_ISA_EMULATE_H
@@ -9,7 +9,10 @@
 #define ABI __attribute__((sysv_abi))
 #endif
 
-enum { ISA_MOVBE_LOAD = 1, ISA_MOVBE_STORE, ISA_LZCNT, ISA_TZCNT, ISA_ANDN, ISA_BEXTR, ISA_BLSI, ISA_BLSMSK, ISA_BLSR, ISA_VCVTPH2PS, ISA_VCVTPS2PH };
+enum { ISA_MOVBE_LOAD = 1, ISA_MOVBE_STORE, ISA_LZCNT, ISA_TZCNT, ISA_ANDN, ISA_BEXTR, ISA_BLSI, ISA_BLSMSK, ISA_BLSR, ISA_VCVTPH2PS, ISA_VCVTPS2PH,
+       /* SSE4A (AMD only). dst/src1 are XMM numbers; the _IMM forms keep length | index << 8 in disp.
+        * MOVNTSS/MOVNTSD are only recorded (always UNSUPPORTED): no PS4 game seen uses them. */
+       ISA_EXTRQ, ISA_EXTRQ_IMM, ISA_INSERTQ, ISA_INSERTQ_IMM, ISA_MOVNTSS, ISA_MOVNTSD };
 enum { ISA_MODE_JMP = 0, ISA_MODE_JMP_RELOCATE, ISA_MODE_INT3, ISA_MODE_UNSUPPORTED };
 enum { ISA_NO_REG = 0xff, ISA_MEM_NONE = 0, ISA_MEM_DST = 1, ISA_MEM_SRC = 2, ISA_MEM_RIP_RELATIVE = 1 };
 typedef struct {                       /* one G3ISA1 record (spec 4.4), as stored in the file */
@@ -31,5 +34,12 @@ void isa_emulate_set_image(unsigned char *image);
 void ABI isa_emulate(const IsaSite *site, IsaRegs *regs);
 /* Flags the instruction defines (the test compares only these). */
 uint64_t isa_defined_flags(uint8_t kind);
+/* 1 for the SSE4A kinds, which work on XMM registers and go through isa_emulate_sse4a. */
+int isa_kind_is_sse4a(uint8_t kind);
+/* Executes an EXTRQ/INSERTQ site (AMD APM vol. 4) on xmm: xmm[0], xmm[1] = destination low and high
+ * qwords, xmm[2], xmm[3] = source register (unused by EXTRQ imm). Writes xmm[0] and xmm[1] only.
+ * Cases the APM leaves undefined follow AMD hardware (Zen 3, checked by tests/test_isa_sse4a.c):
+ * the destination's high qword is zeroed, and a field with index + length > 64 is cut at bit 63. */
+void ABI isa_emulate_sse4a(const IsaSite *site, uint64_t xmm[4]);
 
 #endif

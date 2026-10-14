@@ -4,7 +4,8 @@
 # O core_sync.py usa o commit fixado (não a ref, que anda) / core_sync.py uses the pinned commit.
 #
 # Snapshot de 13/10/2026 (ps4_core: commits "Sync with infamous_pc ..." e "Sync with tlg_pc ..."),
-# atualizado em 14/10/2026 com infamous_pc fd78ad5 (PRs #5 e #6).
+# atualizado em 14/10/2026 com infamous_pc fd78ad5 (PRs #5 e #6) e, na branch sync/2026-10-14, com
+# infamous_pc 2b82d72 (PRs #13-#15), tlg_pc c8f249b, gr2_pc 40d0391 + branches e feat/tlou-imports.
 
 # Base de tudo / base of everything: loader, runtime, GPU, scripts, packaging (import 4448ef2),
 # + 35d2aba loader: host-resolved imports not overwritten by native libc bindings (probe.c, runtime.c)
@@ -16,7 +17,12 @@
 #   window.cpp (lado do núcleo nos comentários / core side on comments); UPSTREAM.md, build.sh, CMakeLists.txt,
 #   vk_scheduler.cpp, tlg_overlay.cpp, tlggpu.cpp, test_gpu_runtime_stubs.cpp: o lado iss era o mesmo sync do
 #   upstream que já estava aqui / the iss side was the same upstream sync already here.
-~/decomp/infamous_pc origin/main fd78ad5240c35b5547eeafaf824f676da934532b
+# + 14/10/2026, 2b82d72 (PR #13 1dc82ca = fix/windows-system-window daqui; PR #14 6110de8 f00cd54 efbff18
+#   6c5051b 662a787 b1955e1 49b2f42 e5f8d0c 69aa859 45d18d1 5aaae80 c4b0956 63a2197 + 420ab44 frame recorder;
+#   PR #15 3727fde SSE4A). Mesclados em 3 vias com base fd78ad5 / 3-way merged on base fd78ad5 (sem conflito
+#   fora do VENDOR.txt: as duas listas ficaram / no conflict except VENDOR.txt: both lists kept); novos / new:
+#   vk_frame_record.*, test_isa_sse4a.c, scripts/frame_diff.py. Fora / not taken: launcher, infamous_run.*, README, CI.
+~/decomp/infamous_pc origin/main 2b82d72b51bc224eb018c844675f0881cfe78fc1
 
 # Do TLG (PR #12 mesclado) / from TLG (after PR #12):
 # + 4a375f0, 7f8fb85 pós-processamento / post-processing: postfx_pass.*, smaa*, cas*, post_process.frag,
@@ -27,11 +33,16 @@
 #   videoout/driver.cpp, VENDOR.txt, UPSTREAM.md, test_pad*.c, test_gpu_runtime_stubs.cpp
 # Mesclados à mão / merged by hand (both sides kept): build.sh, gpu/CMakeLists.txt, tlggpu.cpp, tlggpu.h,
 #   vk_rasterizer.cpp (TLG_SKIP_ADJACENCY kept), vk_scheduler.cpp, avplayer_source.cpp
-~/decomp/tlg_pc origin/main f3eece1e14c731b88faf637cae0188e958179157
+# + 14/10/2026, c8f249b (PR #18): só runtime_memory.c (= fix/windows-system-window daqui); o resto é o launcher.
+~/decomp/tlg_pc origin/main c8f249bd950341d6ae8624bebe6bbe545a22f7ff
 
 # GR2 (PR #9 mesclado): nada novo, só atrás / nothing new, only behind (lower_wave64, runtime.c/h,
 # import_names.inc, packaging, probe.c come from infamous).
-~/decomp/gr2_pc origin/main a0fd165b8a6112c2eab1fe449e5de83ec31df63a
+# + 14/10/2026, 40d0391 (PR #15): só runtime_memory.c (= fix/windows-system-window daqui); o resto é o launcher.
+# + branches fora da main / branches not on main: fix/avplayer-stop-join c5b9770 (threads.h Join),
+#   fix/isa-rewrite-sse4a 5c5d84d (o prefixo do jogo ganha do TLG_ no alias_port_environment, .gitignore
+#   com symlinks; o resto é o ISA do iss 3727fde / the rest is iss 3727fde's ISA).
+~/decomp/gr2_pc origin/main 40d0391af30569b0f168c4ca0c6ee92d5e5aaf2d
 
 # Upstream (FelipePrado0/gow3_pc), branch upstream/gow3-sync: só a parte de núcleo de 9a6d17c..2a0eac6
 # (os ports copiaram 9a6d17c em 12/10/2026). Ver docs/CHANGELOG.md, 13/10/2026 "upstream".
@@ -46,3 +57,14 @@
 #   game_update.py (5f88770: our ports use scripts/make_game_view.py), Linux AppImage (1da8050 ...), docs.
 # Pin informativo (o core_sync.py só segue caminhos locais; clone em ~/decomp/upstream/gow3_pc) / informational pin:
 https://github.com/FelipePrado0/gow3_pc main 2a0eac6522d6e2e5b0fbfe25f49abd3dbe1a644b
+
+# ps4_core feat/tlou-imports (TLOU, ~/decomp/tlou_pc), só as correções de núcleo / core fixes only, cherry-picks:
+# 02be2e2 TLG_DMEM_MB >= 4096 + capture retry Info, 6691698 merged GPU memory hooks, 1ade586 fence labels stale.
+# Ficam lá / stay there: a185ffc fibers + contratos offline, c440445 contratos do GR2/inFAMOUS (dependem da
+# feat/game-hooks: runtime_system.c, runtime_offline.c).
+
+# Branch feat/ngs2-hle (em cima de sync/2026-10-14 / on top of it): tlg_pc feat/ngs2-hle bd122ed
+# (1d116a7 trace, c9d23b0 levantamento, 74a891b mixer, bd122ed efeitos): runtime_ngs2.c, runtime_ngs2_trace.c,
+# test_ngs2.c, tools/ngs2_compare.py copiados / copied; probe.c, runtime.c/.h, build.sh à mão / by hand
+# (runtime_ngs2_resolve antes dos jogos, como no gr2_pc test/gr2-ngs2-avstop-sse4a dc84b9e). Fora / not taken:
+# runtime_tlg.c, launchers, README-player.md, docs/TECNICO.md do TLG.

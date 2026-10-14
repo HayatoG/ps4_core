@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #ifndef _WIN32
+#include <array>
+#include <atomic>
+#include <optional>
 #include <dlfcn.h>
 #endif
 #include <unordered_set>
@@ -11,7 +14,9 @@
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
 #include "video_core/renderer_vulkan/vk_lighting_test.h"
 #include "video_core/renderer_vulkan/vk_pass_census.h"
+#include "video_core/renderer_vulkan/vk_frame_record.h"
 #include "common/debug.h"
+#include "common/hash.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -70,6 +75,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     memory->SetRasterizer(this);
 
     GpuProfiler::Init(instance, scheduler);
+    FrameRecord::Attach(instance, scheduler);
     if (DrawPipeWanted()) {
         constant_ring = std::make_unique<ConstantRing>(instance, scheduler);
         draw_pipe = std::make_unique<DrawPipe>(&RunDrawPacket, this);
@@ -396,7 +402,9 @@ bool Rasterizer::DrawPipeWanted() {
 }
 
 bool Rasterizer::UseDrawPipe() const {
-    return draw_pipe && !host_markers_enabled && !TlgToggle::Disabled(TlgToggle::DrawPipeline);
+    // tlg: off while a frame is recorded: everything then runs in stream order on this thread.
+    return draw_pipe && !host_markers_enabled && !TlgToggle::Disabled(TlgToggle::DrawPipeline) &&
+           !FrameRecord::Active();
 }
 
 bool Rasterizer::OnStageA() const {
@@ -1079,6 +1087,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         return;
     }
     const auto state = BeginRendering(pipeline);
+    // tlg: before anything of the draw itself is recorded, which has to go with it.
+    SubmitIfWorkPiledUp(state);
+    scheduler.CountWork();
 
     if (!inputs_resolved) {
         ResolveVertexBuffers(pipeline, draw_prepared);
@@ -1192,6 +1203,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     }
     UpdateDynamicState(pipeline, is_indexed);
     MarkPass(pipeline, state);
+    if (FrameRecord::IsRecording()) [[unlikely]] {
+        RecordFrameInputs(pipeline, draw_prepared, &state, is_indexed, index_offset, nullptr);
+    }
     scheduler.BeginRendering(state);
 
     const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
@@ -1295,6 +1309,9 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
         return;
     }
     const auto state = BeginRendering(pipeline);
+    // tlg: before anything of the draw itself is recorded, which has to go with it.
+    SubmitIfWorkPiledUp(state);
+    scheduler.CountWork();
 
     BindVertexBuffers(pipeline);
     if (is_indexed) {
@@ -1328,6 +1345,9 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     }
     UpdateDynamicState(pipeline, is_indexed);
     MarkPass(pipeline, state);
+    if (FrameRecord::IsRecording()) [[unlikely]] {
+        RecordFrameInputs(pipeline, nullptr, &state, is_indexed, 0, &indirect);
+    }
     scheduler.BeginRendering(state);
 
     ASSERT(stride == (is_indexed ? sizeof(VkDrawIndexedIndirectCommand)
@@ -1383,6 +1403,56 @@ void Rasterizer::DispatchDirect() {
     DispatchRecord(pipeline);
 }
 
+void Rasterizer::SubmitIfWorkPiledUp(const RenderState& next_state) {
+    // tlg: commands were submitted only when a guest submission ended or something had to wait,
+    // so the GPU idled while thousands of draws were recorded and then had all of them to do,
+    // and whatever waited on the GPU (inFAMOUS' threads wait for readbacks hundreds of times a
+    // second) waited for all of it. Once TLG_SUBMIT_DRAWS (default 1024, 0: off) draws and
+    // dispatches are recorded, they are submitted where the next draw starts a render pass
+    // anyway, so the GPU works on them while the rest is recorded.
+    static const u32 limit = [] {
+        const char* env = std::getenv("TLG_SUBMIT_DRAWS");
+        return env && *env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 1024u;
+    }();
+    if (limit == 0 || scheduler.WorkSinceSubmit() < limit ||
+        !scheduler.WillBeginRendering(next_state)) {
+        return;
+    }
+    // The submission waits for the recording thread, which may be waiting for a compute
+    // pipeline being built (ComputeBind): the draw pipe would stall behind the build.
+    if (Pipeline::deferred_binds.load(std::memory_order_relaxed) != 0) {
+        return;
+    }
+    // The frame recorder and capture read back what each submission did: left as they were.
+    if (FrameRecord::IsRecording() || FrameCapture::Active()) {
+        return;
+    }
+    if ((++work_submits & 255) == 1) {
+        std::printf("GPU: %llu submissions of piled-up draws so far (TLG_SUBMIT_DRAWS=%u)\n",
+                    static_cast<unsigned long long>(work_submits), limit);
+    }
+    scheduler.Flush();
+}
+
+Rasterizer::ComputeBinder Rasterizer::ComputeBind(const ComputePipeline* pipeline) {
+    if (pipeline->IsBuilt()) {
+        return {pipeline->Handle(), nullptr};
+    }
+    // tlg: still being built on a compiler thread (vk_compute_pipeline.cpp): the thread that
+    // records the command into Vulkan waits for it, the GPU thread goes on.
+    Pipeline::deferred_binds.fetch_add(1, std::memory_order_relaxed);
+    return {vk::Pipeline{}, pipeline};
+}
+
+void Rasterizer::ComputeBinder::operator()(vk::CommandBuffer cmdbuf) const {
+    if (pending) [[unlikely]] {
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pending->Handle());
+        Pipeline::deferred_binds.fetch_sub(1, std::memory_order_relaxed);
+        return;
+    }
+    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
+}
+
 void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     FrameCapture::Poll();
     gbuffer_draw = false;
@@ -1405,7 +1475,13 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     if (upscaler->Enabled()) {
         upscaler->OnDispatch(cs.pgm_hash);
     }
+    if (FrameRecord::IsRecording()) [[unlikely]] {
+        RecordFrameInputs(pipeline, nullptr, nullptr, false, 0, nullptr);
+    }
     if (ExecuteShaderHLE(cs, Regs(), cs_program, *this)) {
+        if (FrameRecord::Open()) [[unlikely]] {
+            FrameRecord::Append(" hle");
+        }
         return;
     }
 
@@ -1421,7 +1497,7 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     mark();
     pipeline->BindResources(set_writes, push_data);
 
-    const vk::Pipeline handle = pipeline->Handle();
+    const auto bind = ComputeBind(pipeline);
     const u32 dim_x = cs_program.dim_x, dim_y = cs_program.dim_y, dim_z = cs_program.dim_z;
     if (FrameCapture::Active()) {
         FrameCapture::Dispatch(cs.pgm_hash, dim_x, dim_y, dim_z);
@@ -1430,13 +1506,14 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
         if (Scheduler::FullBarriers()) {
             Scheduler::RecordFullBarrier(cmdbuf);
         }
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
+        bind(cmdbuf);
         cmdbuf.dispatch(dim_x, dim_y, dim_z);
         if (Scheduler::FullBarriers()) {
             Scheduler::RecordFullBarrier(cmdbuf);
         }
     });
     DebugState.IncDispatch();
+    scheduler.CountWork();
 
     // tlg diagnostics: TLG_DIAG_IMAGES=1 writes the images a dispatch read and wrote, after
     // it, while a frame capture records (TLG_CAPTURE_TRIGGER).
@@ -1492,26 +1569,230 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
         runtime.FlushBarriers();
     }
 
+    if (FrameRecord::IsRecording()) [[unlikely]] {
+        const IndirectDraw indirect = {address + offset, 0, size, 1};
+        RecordFrameInputs(pipeline, nullptr, nullptr, false, 0, &indirect);
+    }
     scheduler.EndRendering();
     pipeline->BindResources(set_writes, push_data);
 
-    const vk::Pipeline handle = pipeline->Handle();
+    const auto bind = ComputeBind(pipeline);
     const vk::Buffer args = buffer->Handle();
     const u64 args_offset = base;
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
         if (Scheduler::FullBarriers()) {
             Scheduler::RecordFullBarrier(cmdbuf);
         }
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, handle);
+        bind(cmdbuf);
         cmdbuf.dispatchIndirect(args, args_offset);
         if (Scheduler::FullBarriers()) {
             Scheduler::RecordFullBarrier(cmdbuf);
         }
     });
     DebugState.IncDispatch();
+    scheduler.CountWork();
 
     ResetBindings(true);
     scheduler.KickRecording();
+}
+
+namespace {
+// tlg: frame recorder helpers. Registers as 32-bit words, '.'-separated.
+template <typename T>
+std::string RecordWords(const T& value) {
+    static_assert(sizeof(T) % 4 == 0);
+    std::array<u32, sizeof(T) / 4> words;
+    std::memcpy(words.data(), &value, sizeof(T));
+    std::string out;
+    for (size_t i = 0; i < words.size(); ++i) {
+        out += fmt::format("{}{:x}", i ? "." : "", words[i]);
+    }
+    return out;
+}
+// Indexed by Shader::SwStage.
+constexpr std::array<const char*, Shader::MaxStageTypes> RecordStageNames = {"ps", "hs", "ds",
+                                                                            "vs", "gs", "cs"};
+} // namespace
+
+void Rasterizer::RecordFrameInputs(const Pipeline* pipeline, const PreparedDraw* prepared,
+                                   const RenderState* state, bool is_indexed, u32 index_offset,
+                                   const IndirectDraw* indirect) {
+    if (!FrameRecord::Open() || DrawPipe::OnStageB()) {
+        return;
+    }
+    const auto add = [](const std::string& text) { FrameRecord::Append(text); };
+    // The copies end the render pass; a draw that clears its targets and continues the pass
+    // in progress would clear them again when it begins a new one.
+    bool gpu_ok = FrameRecord::GpuCopiesAvailable();
+    if (state && scheduler.IsRenderingWith(*state)) {
+        bool clears = state->depth_stencil_attachment.depth_clear ||
+                      state->depth_stencil_attachment.stencil_clear;
+        for (u32 i = 0; i < state->num_color_attachments; ++i) {
+            clears |= state->color_attachments[i].is_clear != 0;
+        }
+        if (clears) {
+            gpu_ok = false;
+            add(" gpu=skipped_clear");
+        }
+    }
+    // Memory the GPU wrote is read from the GPU's copy (the guest copy may be stale or
+    // read-protected); anything else from guest memory, which the cache mirrors.
+    const auto memory_input = [&](const std::string& key, VAddr address, u64 size) {
+        add(fmt::format(" {}={:#x}+{}:", key, address, size));
+        if (address == 0 || size == 0) {
+            add("null");
+            return;
+        }
+        size = memory->ClampRangeSize(address, size);
+        if (gpu_ok && size && size <= std::numeric_limits<u32>::max() &&
+            buffer_cache.IsRegionGpuModified(address, size)) {
+            const auto [buffer, offset] = buffer_cache.ObtainBuffer(address, u32(size), false);
+            FrameRecord::GpuHash("", buffer->Handle(), offset, size);
+        } else {
+            add(FrameRecord::GuestHash(address, size));
+        }
+    };
+
+    const auto* saved_prepared = bind_prepared;
+    bind_prepared = prepared;
+    const auto& regs = Regs();
+    for (const Shader::Info* info : pipeline->GetStages()) {
+        if (!info) {
+            continue;
+        }
+        const u32 s = static_cast<u32>(info->sw_stage);
+        const char* name = s < RecordStageNames.size() ? RecordStageNames[s] : "xs";
+        // Permutation: the pipeline key holds HashCombine(program hash, permutation index).
+        const u64 key_hash =
+            pipeline->IsCompute()
+                ? static_cast<const ComputePipeline*>(pipeline)->GetComputeKey().value
+                : static_cast<const GraphicsPipeline*>(pipeline)->GetGraphicsKey().stage_hashes[s];
+        std::string perm = "?";
+        for (u64 p = 0; p < 4096; ++p) {
+            if (HashCombine(info->pgm_hash, p) == key_hash) {
+                perm = std::to_string(p);
+                break;
+            }
+        }
+        const auto ud = info->FlatUserData();
+        add(fmt::format(" {}={:016x}/p{} {}.ud={:016x}", name, info->pgm_hash, perm, name,
+                        XXH3_64bits(ud.data(), ud.size() * sizeof(u32))));
+        const PreparedStage* ps = FindPreparedStage(*info);
+        for (u32 i = 0; i < info->buffers.size(); ++i) {
+            const auto& desc = info->buffers[i];
+            if (desc.IsSpecial()) {
+                continue;
+            }
+            const auto sharp = ps ? ps->buffer_sharps[i] : desc.GetSharp(*info);
+            memory_input(fmt::format("{}.b{}{}", name, i, desc.is_written ? "w" : ""),
+                         sharp.base_address, sharp.GetSize());
+        }
+        for (u32 i = 0; i < info->images.size(); ++i) {
+            const auto& desc = info->images[i];
+            const auto t = ps ? ps->image_sharps[i] : desc.GetSharp(*info);
+            add(fmt::format(" {}.t{}{}=", name, i, desc.is_written ? "w" : ""));
+            if (t.Address() == 0) {
+                add("null");
+                continue;
+            }
+            add(fmt::format("{:#x}:{}/{}:{}x{}x{}:{}:m{}-{}", t.Address(),
+                            magic_enum::enum_name(t.GetDataFmt()),
+                            magic_enum::enum_name(t.GetNumberFmt()), u32(t.width) + 1,
+                            u32(t.height) + 1, u32(t.depth) + 1,
+                            magic_enum::enum_name(t.GetType()), u32(t.base_level),
+                            u32(t.last_level)));
+        }
+        for (u32 i = 0; i < info->samplers.size(); ++i) {
+            const auto ss = ps ? ps->sampler_sharps[i] : info->samplers[i].GetSharp(*info);
+            add(fmt::format(" {}.s{}={:08x}", name, i, u32(XXH3_64bits(&ss, sizeof(ss)))));
+        }
+    }
+
+    if (pipeline->IsCompute()) {
+        if (!indirect) {
+            const auto& cs = CsRegs();
+            add(fmt::format(" groups={}x{}x{}", cs.dim_x, cs.dim_y, cs.dim_z));
+        }
+    } else {
+        const auto* graphics = static_cast<const GraphicsPipeline*>(pipeline);
+        const auto& vs = graphics->GetStage(Shader::SwStage::Vertex);
+        if (const auto& fetch = graphics->GetFetchShader()) {
+            for (u32 i = 0; i < fetch->attributes.size(); ++i) {
+                const auto sharp = fetch->attributes[i].GetSharp(vs);
+                memory_input(fmt::format("vb{}", i), sharp.base_address, sharp.GetSize());
+            }
+        }
+        if (is_indexed) {
+            const u32 index_size =
+                regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16 ? 2u : 4u;
+            const u64 count = indirect ? regs.index_size : regs.num_indices;
+            add(fmt::format(" ioff={}", index_offset));
+            memory_input("ib",
+                         regs.index_base_address.Address<VAddr>() + u64(index_offset) * index_size,
+                         count * index_size);
+        }
+        add(fmt::format(" prim={}", magic_enum::enum_name(regs.primitive_type)));
+        const auto& vp = regs.viewports[0];
+        add(fmt::format(" vp={:g},{:g},{:g},{:g},{:g},{:g} scis={}", vp.xscale, vp.xoffset,
+                        vp.yscale, vp.yoffset, vp.zscale, vp.zoffset,
+                        RecordWords(regs.screen_scissor)));
+        const u32 num_colors = state ? state->num_color_attachments : 0;
+        for (u32 cb = 0; cb < num_colors; ++cb) {
+            add(fmt::format(" rt{}=", cb));
+            if (!cb_descs[cb].first) {
+                add("null");
+            } else {
+                const auto& image = texture_cache.GetImage(cb_descs[cb].first).info;
+                add(fmt::format("{:#x}:{}:{}x{}", image.guest_address,
+                                vk::to_string(image.pixel_format), image.size.width,
+                                image.size.height));
+            }
+            add(fmt::format(" bl{}={}", cb, RecordWords(regs.blend_control[cb])));
+        }
+        if (db_desc.first) {
+            const auto& image = texture_cache.GetImage(db_desc.first).info;
+            add(fmt::format(" z={:#x}:{}:{}x{}", image.guest_address,
+                            vk::to_string(image.pixel_format), image.size.width,
+                            image.size.height));
+        }
+        add(fmt::format(" cm={} csm={} cc={} dc={} st={} sref={}.{} drc={} pc={} bc={}",
+                        RecordWords(regs.color_target_mask), RecordWords(regs.color_shader_mask),
+                        RecordWords(regs.color_control), RecordWords(regs.depth_control),
+                        RecordWords(regs.stencil_control), RecordWords(regs.stencil_ref_front),
+                        RecordWords(regs.stencil_ref_back), RecordWords(regs.depth_render_control),
+                        RecordWords(regs.polygon_control), RecordWords(regs.blend_constants)));
+        if (state) {
+            u32 clears = 0;
+            for (u32 i = 0; i < state->num_color_attachments; ++i) {
+                clears |= u32(state->color_attachments[i].is_clear != 0) << i;
+            }
+            clears |= u32(state->depth_stencil_attachment.depth_clear) << 8 |
+                      u32(state->depth_stencil_attachment.stencil_clear) << 9;
+            add(fmt::format(" clr={:x}", clears));
+        }
+    }
+
+    if (indirect) {
+        // Arguments as the guest wrote them and as the GPU reads them at this draw.
+        const u64 bytes = u64(indirect->stride) * indirect->max_count;
+        add(fmt::format(" max={} stride={} args.cpu={}", indirect->max_count, indirect->stride,
+                        FrameRecord::GuestWords(indirect->args, bytes)));
+        if (gpu_ok && bytes && bytes <= std::numeric_limits<u32>::max()) {
+            const auto [buffer, offset] = buffer_cache.ObtainBuffer(indirect->args, u32(bytes), false);
+            FrameRecord::GpuWords(" args=", buffer->Handle(), offset, bytes);
+        }
+        if (indirect->count) {
+            add(fmt::format(" count.cpu={}", FrameRecord::GuestWords(indirect->count, 4)));
+            if (gpu_ok) {
+                const auto [buffer, offset] = buffer_cache.ObtainBuffer(indirect->count, 4, false);
+                FrameRecord::GpuWords(" count=", buffer->Handle(), offset, 4);
+            }
+        }
+    }
+    bind_prepared = saved_prepared;
+    if (gpu_ok) {
+        FrameRecord::FlushGpuCopies();
+    }
 }
 
 u64 Rasterizer::Flush() {
@@ -3529,6 +3810,103 @@ vk::Pipeline Rasterizer::SquarePass(const GraphicsPipeline& pipeline) const {
     return square;
 }
 
+struct StencilFaceState {
+    vk::StencilOp fail_op;
+    vk::StencilOp pass_op;
+    vk::StencilOp depth_fail_op;
+    u32 reference;
+};
+
+// tlg: from shadPS4-Infamous-FixBuild 03db8f14 (GPL-2.0-or-later). GCN has separate stencil test
+// (STENCILTESTVAL) and replace (STENCILOPVAL) values, while a Vulkan face has a single reference
+// for both. Finds a reference that keeps the test exact and still writes what every replacing op
+// should, turning such ops into equivalent ones (zero, keep, invert, increment, decrement) where
+// the stencil value is known. Returns nullopt if it can't. inFAMOUS hits the conflict ~9500 times
+// a session (effects masked by the character silhouette). Checked by the fork against a model of
+// the GCN stencil unit (400k random face configurations).
+static std::optional<StencilFaceState> ResolveStencilFace(AmdGpu::CompareFunc func,
+                                                          const AmdGpu::StencilRefMask& ref,
+                                                          u32 write_mask, AmdGpu::StencilFunc fail,
+                                                          AmdGpu::StencilFunc zpass,
+                                                          AmdGpu::StencilFunc zfail) {
+    using AmdGpu::CompareFunc;
+    using AmdGpu::StencilFunc;
+    const u32 test_val = ref.stencil_test_val;
+    const u32 compare_mask = ref.stencil_mask;
+    write_mask &= 0xFF;
+    const bool test_uses_reference = func != CompareFunc::Always && func != CompareFunc::Never;
+
+    const auto written_value = [&](StencilFunc op) -> std::optional<u32> {
+        switch (op) {
+        case StencilFunc::ReplaceTest:
+            return test_val;
+        case StencilFunc::ReplaceOp:
+            return ref.stencil_op_val;
+        case StencilFunc::Ones:
+            return 0xFFU;
+        default:
+            return std::nullopt;
+        }
+    };
+
+    // An EQUAL test that passed, or a NOTEQUAL test that failed, means the stencil value matches
+    // test_val in the compared bits, which is enough to know what a write will change.
+    const bool written_bits_compared = (write_mask & ~compare_mask) == 0;
+    const bool whole_value_known = compare_mask == 0xFF && write_mask == 0xFF;
+    const bool known_on_pass = func == CompareFunc::Equal && written_bits_compared;
+    const bool known_on_fail = func == CompareFunc::NotEqual && written_bits_compared;
+
+    const auto resolve = [&](StencilFunc op, u32 reference,
+                             bool value_known) -> std::optional<vk::StencilOp> {
+        const auto value = written_value(op);
+        if (!value) {
+            return LiverpoolToVK::StencilOp(op);
+        }
+        const u32 target = *value & write_mask;
+        if (target == (reference & write_mask)) {
+            return vk::StencilOp::eReplace;
+        }
+        if (target == 0) {
+            return vk::StencilOp::eZero;
+        }
+        if (value_known) {
+            if (target == (test_val & write_mask)) {
+                return vk::StencilOp::eKeep;
+            }
+            if (target == (~test_val & write_mask)) {
+                return vk::StencilOp::eInvert;
+            }
+            if (whole_value_known && *value == ((test_val + 1) & 0xFF)) {
+                return vk::StencilOp::eIncrementAndWrap;
+            }
+            if (whole_value_known && *value == ((test_val - 1) & 0xFF)) {
+                return vk::StencilOp::eDecrementAndWrap;
+            }
+        }
+        return std::nullopt;
+    };
+
+    // Try each written value as the reference. When the test reads the reference, its compared
+    // bits must stay those of test_val, and only the rest can carry the written value.
+    const std::array<std::optional<u32>, 4> candidates = {
+        written_value(zpass), written_value(zfail), written_value(fail), test_val};
+    for (const auto& candidate : candidates) {
+        if (!candidate) {
+            continue;
+        }
+        const u32 reference = test_uses_reference
+                                  ? (test_val & compare_mask) | (*candidate & ~compare_mask & 0xFF)
+                                  : *candidate;
+        const auto fail_op = resolve(fail, reference, known_on_fail);
+        const auto pass_op = resolve(zpass, reference, known_on_pass);
+        const auto depth_fail_op = resolve(zfail, reference, known_on_pass);
+        if (fail_op && pass_op && depth_fail_op) {
+            return StencilFaceState{*fail_op, *pass_op, *depth_fail_op, reference};
+        }
+    }
+    return std::nullopt;
+}
+
 void Rasterizer::UpdateDepthStencilState() const {
     const auto& regs = Regs();
     auto& dynamic_state = scheduler.GetDynamicState();
@@ -3562,74 +3940,63 @@ void Rasterizer::UpdateDepthStencilState() const {
     const bool stencil_test_enabled = depth_stencil.stencil_test_enable;
     dynamic_state.SetStencilTestEnabled(stencil_test_enabled);
     if (stencil_test_enabled) {
-        const StencilOps front_ops{
-            .fail_op = LiverpoolToVK::StencilOp(regs.stencil_control.stencil_fail_front),
-            .pass_op = LiverpoolToVK::StencilOp(regs.stencil_control.stencil_zpass_front),
-            .depth_fail_op = LiverpoolToVK::StencilOp(regs.stencil_control.stencil_zfail_front),
-            .compare_op = LiverpoolToVK::CompareOp(regs.depth_control.stencil_ref_func),
-        };
-        const StencilOps back_ops = regs.depth_control.backface_enable ? StencilOps{
-            .fail_op = LiverpoolToVK::StencilOp(regs.stencil_control.stencil_fail_back),
-            .pass_op = LiverpoolToVK::StencilOp(regs.stencil_control.stencil_zpass_back),
-            .depth_fail_op = LiverpoolToVK::StencilOp(regs.stencil_control.stencil_zfail_back),
-            .compare_op = LiverpoolToVK::CompareOp(regs.depth_control.stencil_bf_func),
-        } : front_ops;
-        dynamic_state.SetStencilOps(front_ops, back_ops);
-
         const bool stencil_clear = regs.depth_render_control.stencil_clear_enable;
         const auto front = regs.stencil_ref_front;
         const auto back =
             regs.depth_control.backface_enable ? regs.stencil_ref_back : regs.stencil_ref_front;
-        // GCN REPLACE_OP writes DB_STENCILREFMASK.STENCILOPVAL, so a face whose stencil ops
-        // include ReplaceOp takes its Vulkan reference from op_val.
+        const u32 front_write_mask = !stencil_clear ? front.stencil_write_mask : 0U;
+        const u32 back_write_mask = !stencil_clear ? back.stencil_write_mask : 0U;
+
+        const auto setup_face = [](AmdGpu::CompareFunc func, const AmdGpu::StencilRefMask& ref,
+                                   u32 write_mask, AmdGpu::StencilFunc fail,
+                                   AmdGpu::StencilFunc zpass,
+                                   AmdGpu::StencilFunc zfail) -> std::pair<StencilOps, u32> {
+            if (const auto face = ResolveStencilFace(func, ref, write_mask, fail, zpass, zfail)) {
+                return {StencilOps{
+                            .fail_op = face->fail_op,
+                            .pass_op = face->pass_op,
+                            .depth_fail_op = face->depth_fail_op,
+                            .compare_op = LiverpoolToVK::CompareOp(func),
+                        },
+                        face->reference};
+            }
+            // GCN REPLACE_OP writes DB_STENCILREFMASK.STENCILOPVAL, so when both values can't be
+            // honored a face whose stencil ops include ReplaceOp takes its reference from op_val.
+            const bool uses_op_val = fail == AmdGpu::StencilFunc::ReplaceOp ||
+                                     zpass == AmdGpu::StencilFunc::ReplaceOp ||
+                                     zfail == AmdGpu::StencilFunc::ReplaceOp;
+            const u32 reference = uses_op_val ? ref.stencil_op_val : ref.stencil_test_val;
+            // tlg: per draw; the first 32 are enough to see which configurations remain.
+            static std::atomic<u32> warned{0};
+            if (warned.fetch_add(1, std::memory_order_relaxed) < 32) {
+                LOG_WARNING(Render_Vulkan,
+                            "Stencil func {} test_val {:#x} mask {:#x} can't be combined with ops "
+                            "{}/{}/{} op_val {:#x} write mask {:#x}; using reference {:#x}",
+                            static_cast<u32>(func), ref.stencil_test_val, ref.stencil_mask,
+                            static_cast<u32>(fail), static_cast<u32>(zpass), static_cast<u32>(zfail),
+                            ref.stencil_op_val, write_mask, reference);
+            }
+            return {StencilOps{
+                        .fail_op = LiverpoolToVK::StencilOp(fail),
+                        .pass_op = LiverpoolToVK::StencilOp(zpass),
+                        .depth_fail_op = LiverpoolToVK::StencilOp(zfail),
+                        .compare_op = LiverpoolToVK::CompareOp(func),
+                    },
+                    reference};
+        };
+
         const auto& sc = regs.stencil_control;
-        const auto uses_op_val = [](AmdGpu::StencilFunc fail, AmdGpu::StencilFunc zpass,
-                                    AmdGpu::StencilFunc zfail) {
-            return fail == AmdGpu::StencilFunc::ReplaceOp ||
-                   zpass == AmdGpu::StencilFunc::ReplaceOp ||
-                   zfail == AmdGpu::StencilFunc::ReplaceOp;
-        };
-        const bool front_op =
-            uses_op_val(sc.stencil_fail_front, sc.stencil_zpass_front, sc.stencil_zfail_front);
-        const bool back_op =
+        const auto [front_ops, front_reference] =
+            setup_face(regs.depth_control.stencil_ref_func, front, front_write_mask,
+                       sc.stencil_fail_front, sc.stencil_zpass_front, sc.stencil_zfail_front);
+        const auto [back_ops, back_reference] =
             regs.depth_control.backface_enable
-                ? uses_op_val(sc.stencil_fail_back, sc.stencil_zpass_back, sc.stencil_zfail_back)
-                : front_op;
-        // tlg: Vulkan has one reference for the test and for ReplaceOp. The test only sees the
-        // compare-mask bits and the write only stores the write-mask bits, so one reference
-        // serves both exactly when the two values agree on the bits in both masks: compare bits
-        // from test_val, the rest from op_val. inFAMOUS hits this ~9500 times a session (effects
-        // masked by the character silhouette went missing with op_val as the test reference).
-        const auto reference = [](bool uses_op, AmdGpu::CompareFunc func,
-                                  const AmdGpu::StencilRefMask& ref, bool& unresolved) -> u32 {
-            if (!uses_op) {
-                return ref.stencil_test_val;
-            }
-            const u32 test = ref.stencil_test_val, op = ref.stencil_op_val;
-            const u32 compare_mask = ref.stencil_mask, write_mask = ref.stencil_write_mask;
-            if (func == AmdGpu::CompareFunc::Always || func == AmdGpu::CompareFunc::Never ||
-                test == op) {
-                return op;
-            }
-            if ((test ^ op) & compare_mask & write_mask) {
-                unresolved = true;
-                return op;
-            }
-            return ((test & compare_mask) | (op & ~compare_mask)) & 0xffu;
-        };
-        bool unresolved = false;
-        const u32 front_ref =
-            reference(front_op, regs.depth_control.stencil_ref_func, front, unresolved);
-        const u32 back_ref = regs.depth_control.backface_enable
-                                 ? reference(back_op, regs.depth_control.stencil_bf_func, back, unresolved)
-                                 : front_ref;
-        if (unresolved) {
-            LOG_WARNING(Render_Vulkan, "Stencil test_val and ReplaceOp op_val differ on bits both "
-                                       "tested and written; the stencil test will use op_val");
-        }
-        dynamic_state.SetStencilReferences(front_ref, back_ref);
-        dynamic_state.SetStencilWriteMasks(!stencil_clear ? front.stencil_write_mask : 0U,
-                                           !stencil_clear ? back.stencil_write_mask : 0U);
+                ? setup_face(regs.depth_control.stencil_bf_func, back, back_write_mask,
+                             sc.stencil_fail_back, sc.stencil_zpass_back, sc.stencil_zfail_back)
+                : std::pair{front_ops, front_reference};
+        dynamic_state.SetStencilOps(front_ops, back_ops);
+        dynamic_state.SetStencilReferences(front_reference, back_reference);
+        dynamic_state.SetStencilWriteMasks(front_write_mask, back_write_mask);
         dynamic_state.SetStencilCompareMasks(front.stencil_mask, back.stencil_mask);
     }
 }

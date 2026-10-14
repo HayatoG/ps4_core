@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <mutex>
 #include <vector>
 
@@ -71,14 +72,35 @@ int requested_tab = -1; // switch on the next frame (L1/R1, Q/E, menu opened)
 // The game's text dialog (SetTextEntry), guarded by imgui_mutex.
 bool text_entry_active = false;
 std::string text_entry_prompt, text_entry_text;
-// The game's save list (sceSaveDataDialog): a choice made with the arrows/D-pad.
-std::atomic<bool> choice_active{false};
-std::string choice_title;
-std::vector<std::string> choice_items;
-int choice_index = 0;
-std::atomic<int> choice_result{-1}; // -1 open, -2 cancelled, else the chosen index
-// Save pictures: decoded by BeginChoice, made textures on the present thread (null = none).
-// Closed lists' textures wait in choice_retired until the backend has destroyed them.
+// The game's save dialogs (sceSaveDataDialog): the list, a message the player answers
+// (overwrite?, no space...), the "Saving..." panel and the "Game saved" toast. The save's text
+// comes from the game; every other word is the port's, in the menu language. Guarded by
+// imgui_mutex; the game's thread polls the atomics.
+using SaveClock = std::chrono::steady_clock;
+std::atomic<bool> choice_active{false};  // the list
+std::atomic<int> choice_result{-1};      // -1 open, -2 cancelled, else the chosen index
+std::atomic<bool> message_active{false};
+std::atomic<int> message_result{-1};     // -1 open, 1 yes/OK, 2 no/cancel
+int save_kind = 1;                       // 1 save, 2 load, 3 delete
+std::vector<SaveRow> save_rows;
+int choice_index = 0, choice_first = 0;  // selected row, first row shown (the list scrolls)
+int message_code = 0, message_buttons = 0, message_focus = 1; // focus: 0 no/cancel, 1 yes/OK
+u64 message_value = 0;
+std::string message_text;
+bool message_has_entry = false;
+SaveRow message_entry;
+bool progress_on = false;
+int progress_kind = 1, progress_percent = -1;
+std::string progress_text;
+SaveClock::time_point progress_since{}, progress_until{}; // until: a panel shown for a moment
+SaveClock::time_point toast_since{}, toast_until{};
+int toast_kind = 0;
+// The mouse (display pixels) and the last frame's rectangles: the rows, the message's buttons.
+ImVec2 save_mouse{-1.0f, -1.0f};
+std::vector<ImRect> save_row_rects;
+ImRect save_button_rects[2];
+// Save pictures: decoded on the game's thread, made textures on the present thread (null =
+// none). Closed dialogs' textures wait in choice_retired until the backend has destroyed them.
 std::vector<TlgPng::Image> choice_pictures;
 std::vector<ImTextureData*> choice_textures, choice_retired;
 std::atomic<bool> choice_retiring{false};
@@ -746,58 +768,478 @@ void TextEntryBox() {
     ImGui::End();
 }
 
-void ChoiceBox() {
-    const ImGuiViewport* viewport = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x * 0.5f,
-                                   viewport->WorkPos.y + viewport->WorkSize.y * 0.5f),
-                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSizeConstraints(ImVec2(viewport->WorkSize.x * 0.36f, 0.0f),
-                                        ImVec2(viewport->WorkSize.x * 0.8f, viewport->WorkSize.y * 0.8f));
-    ImGui::SetNextWindowBgAlpha(0.94f);
-    ImGui::Begin("##choice", nullptr,
-                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
-                     ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
-                     ImGuiWindowFlags_NoFocusOnAppearing);
-    ImGui::TextColored(ImVec4(0.85f, 0.72f, 0.45f, 1.0f), "%s", choice_title.c_str());
-    ImGui::Separator();
-    // Save pictures are 228x128; rows without one keep the text aligned when others have one.
-    const bool pictures = std::any_of(choice_textures.begin(), choice_textures.end(),
-                                      [](ImTextureData* tex) { return tex != nullptr; });
-    const ImVec2 picture_size(228.0f * base_scale, 128.0f * base_scale);
-    for (int i = 0; i < int(choice_items.size()); ++i) {
-        const bool selected = i == choice_index;
-        ImGui::BeginGroup();
-        ImTextureData* tex = i < int(choice_textures.size()) ? choice_textures[i] : nullptr;
-        if (tex) {
-            ImGui::Image(tex->GetTexRef(), picture_size);
-        } else if (pictures) {
-            ImGui::Dummy(picture_size);
+// ---- Save dialogs: drawing. The layout is in design pixels of a 1280x720 screen, times k. ----
+constexpr u32 kSaveAccent = 0x5aa9ff, kSaveText = 0xeef2f8, kSaveMuted = 0xaab5c7, kSaveDim = 0x8b97ab,
+              kSavePanel = 0x141923, kSaveLine = 0x263042, kSaveCard = 0x161c28, kSaveCardOn = 0x1f2a3d,
+              kSaveThumb = 0x1d2433, kSaveBorder = 0x2b3445, kSaveKnob = 0x3a4659, kSaveWarn = 0xf0a43a,
+              kSaveOk = 0x4fd1a5;
+
+ImU32 SaveColor(u32 rgb, float alpha = 1.0f) {
+    return IM_COL32(rgb >> 16, (rgb >> 8) & 255, rgb & 255, int(std::clamp(alpha, 0.0f, 1.0f) * 255.0f));
+}
+
+struct SavePainter {
+    ImDrawList* dl;
+    ImFont* font;
+    float k;
+    ImVec2 at; // the panel's top-left corner, in display pixels
+
+    ImVec2 P(float x, float y) const { return ImVec2(at.x + x * k, at.y + y * k); }
+    float Width(float size, const std::string& text) const {
+        return font->CalcTextSizeA(size * k, FLT_MAX, 0.0f, text.c_str()).x / k;
+    }
+    // The text cut with "..." to fit `width` design pixels.
+    std::string Fit(float size, const std::string& text, float width) const {
+        if (Width(size, text) <= width) return text;
+        std::string cut = text;
+        while (!cut.empty()) {
+            while (!cut.empty() && (u8(cut.back()) & 0xc0) == 0x80) cut.pop_back(); // UTF-8 tail
+            if (!cut.empty()) cut.pop_back();
+            if (Width(size, cut + "...") <= width) return cut + "...";
         }
-        if (pictures) {
-            ImGui::SameLine();
+        return "...";
+    }
+    // Text at (x, y) design pixels; bold is drawn twice, a hair apart (one embedded face).
+    void Text(float x, float y, float size, u32 rgb, const std::string& text, bool bold = false,
+              float alpha = 1.0f, float wrap = 0.0f) const {
+        const ImU32 col = SaveColor(rgb, alpha);
+        dl->AddText(font, size * k, P(x, y), col, text.c_str(), nullptr, wrap * k);
+        if (bold) dl->AddText(font, size * k, P(x + 0.55f, y), col, text.c_str(), nullptr, wrap * k);
+    }
+    void TextRight(float right, float y, float size, u32 rgb, const std::string& text, bool bold = false) const {
+        Text(right - Width(size, text), y, size, rgb, text, bold);
+    }
+    void Box(float x0, float y0, float x1, float y1, u32 fill, float rounding, float alpha = 1.0f) const {
+        dl->AddRectFilled(P(x0, y0), P(x1, y1), SaveColor(fill, alpha), rounding * k);
+    }
+    void Frame(float x0, float y0, float x1, float y1, u32 rgb, float rounding, float thickness,
+               float alpha = 1.0f) const {
+        dl->AddRect(P(x0, y0), P(x1, y1), SaveColor(rgb, alpha), rounding * k, 0, thickness * k);
+    }
+    void Line(float x0, float y0, float x1, float y1, u32 rgb, float thickness, float alpha = 1.0f) const {
+        dl->AddLine(P(x0, y0), P(x1, y1), SaveColor(rgb, alpha), thickness * k);
+    }
+    // A controller button: 0 confirm (bottom face button), 1 back (right one), centred at (x, y):
+    // Cross / Circle, or the letters of TLG_GLYPHS=xbox (A / B) and nintendo (B / A).
+    void Button(float x, float y, int which) const {
+        const ImVec2 c = P(x, y);
+        dl->AddCircleFilled(c, 11.0f * k, SaveColor(kSaveThumb));
+        dl->AddCircle(c, 11.0f * k, SaveColor(kSaveKnob), 0, 1.0f * k);
+        if (const char* letter = PadText(nullptr, which == 0 ? "A" : "B", which == 0 ? "B" : "A")) {
+            const u32 rgb = which == 0 ? kSaveOk : 0xff8a8a;
+            Text(x - Width(13.0f, letter) / 2, y - 8.0f, 13.0f, rgb, letter, true);
+            return;
         }
-        if (selected) {
-            ImGui::TextColored(ImVec4(1.0f, 0.9f, 0.55f, 1.0f), "> %s", choice_items[i].c_str());
+        if (which == 0) {
+            Line(x - 4, y - 4, x + 4, y + 4, 0x8fb6ff, 2.0f);
+            Line(x + 4, y - 4, x - 4, y + 4, 0x8fb6ff, 2.0f);
         } else {
-            ImGui::Text("  %s", choice_items[i].c_str());
-        }
-        ImGui::EndGroup();
-        if (selected) {
-            if (pictures) {
-                const ImVec2 min = ImGui::GetItemRectMin(), max = ImGui::GetItemRectMax();
-                const float pad = 3.0f * base_scale;
-                ImGui::GetWindowDrawList()->AddRect(ImVec2(min.x - pad, min.y - pad),
-                                                    ImVec2(max.x + pad, max.y + pad),
-                                                    IM_COL32(255, 230, 140, 255), 0.0f, 0,
-                                                    2.0f * base_scale);
-            }
-            ImGui::SetScrollHereY();
+            dl->AddCircle(c, 5.0f * k, SaveColor(0xff8a8a), 0, 2.0f * k);
         }
     }
-    ImGui::Separator();
-    ImGui::TextDisabled("%s", TL(PadText("Up/Down or D-pad: choose   Enter or Cross (A): OK   Esc or Circle (B): cancel", "Up/Down or D-pad: choose   Enter or A: OK   Esc or B: cancel", "Up/Down or D-pad: choose   Enter or B: OK   Esc or A: cancel"),
-                                 PadText("Cima/Baixo ou direcional: escolher   Enter ou Xis (A): OK   Esc ou Círculo (B): cancelar", "Cima/Baixo ou direcional: escolher   Enter ou A: OK   Esc ou B: cancelar", "Cima/Baixo ou direcional: escolher   Enter ou B: OK   Esc ou A: cancelar")));
-    ImGui::End();
+    // The panel itself: shadow, fill, border; then the discreet credit under its right corner.
+    void Panel(float w, float h) const {
+        dl->AddRectFilled(P(0, 18), P(w, h + 18), SaveColor(0x000000, 0.35f), 18.0f * k);
+        Box(0, 0, w, h, kSavePanel, 18.0f, 0.97f);
+        Frame(0, 0, w, h, kSaveBorder, 18.0f, 1.0f);
+        const std::string credit = "@hayatog-dev";
+        Text(w - 6.0f - Width(11.0f, credit), h + 10.0f, 11.0f, 0x4a5568, credit);
+    }
+    // A save's picture (16:9) or a placeholder; `is_new` draws the dashed "+" slot.
+    void Picture(float x, float y, float w, float h, ImTextureData* tex, bool is_new) const {
+        if (tex) {
+            dl->AddImageRounded(tex->GetTexRef(), P(x, y), P(x + w, y + h), ImVec2(0, 0), ImVec2(1, 1),
+                                IM_COL32_WHITE, 10.0f * k);
+            Frame(x, y, x + w, y + h, 0x323d52, 10.0f, 1.0f);
+            return;
+        }
+        if (is_new) {
+            for (float t = 0; t < 1.0f; t += 0.1f) { // dashes around the slot
+                Line(x + w * t, y, x + w * (t + 0.05f), y, kSaveKnob, 2.0f);
+                Line(x + w * t, y + h, x + w * (t + 0.05f), y + h, kSaveKnob, 2.0f);
+            }
+            for (float t = 0; t < 1.0f; t += 0.18f) {
+                Line(x, y + h * t, x, y + h * (t + 0.09f), kSaveKnob, 2.0f);
+                Line(x + w, y + h * t, x + w, y + h * (t + 0.09f), kSaveKnob, 2.0f);
+            }
+            Line(x + w / 2, y + h / 2 - 11, x + w / 2, y + h / 2 + 11, kSaveDim, 2.0f);
+            Line(x + w / 2 - 11, y + h / 2, x + w / 2 + 11, y + h / 2, kSaveDim, 2.0f);
+            return;
+        }
+        Box(x, y, x + w, y + h, kSaveThumb, 10.0f);
+        Frame(x, y, x + w, y + h, 0x323d52, 10.0f, 1.0f);
+    }
+};
+
+SavePainter SavePainterFor(float w, float h) {
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    // 720p design scaled to the display, kept inside the screen on narrow windows.
+    const float k = std::min(viewport->WorkSize.y / 720.0f, viewport->WorkSize.x * 0.94f / w);
+    SavePainter p{ImGui::GetForegroundDrawList(), ImGui::GetFont(), k, {}};
+    p.at = ImVec2(viewport->WorkPos.x + (viewport->WorkSize.x - w * k) * 0.5f,
+                  viewport->WorkPos.y + (viewport->WorkSize.y - h * k) * 0.5f);
+    return p;
+}
+
+void SaveBackdrop(float alpha) {
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::GetForegroundDrawList()->AddRectFilled(
+        viewport->WorkPos, ImVec2(viewport->WorkPos.x + viewport->WorkSize.x, viewport->WorkPos.y + viewport->WorkSize.y),
+        SaveColor(0x05070c, alpha));
+}
+
+std::string SaveWhen(s64 mtime) {
+    if (mtime <= 0) return {};
+    const time_t t = time_t(mtime);
+    std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    char out[64];
+    if (UiPortuguese()) {
+        std::snprintf(out, sizeof(out), "%02d/%02d/%04d · %02d:%02d", tm.tm_mday, tm.tm_mon + 1,
+                      tm.tm_year + 1900, tm.tm_hour, tm.tm_min);
+    } else {
+        static const char* months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+        const int hour = tm.tm_hour % 12 ? tm.tm_hour % 12 : 12;
+        std::snprintf(out, sizeof(out), "%s %d, %d · %d:%02d %s", months[tm.tm_mon % 12], tm.tm_mday,
+                      tm.tm_year + 1900, hour, tm.tm_min, tm.tm_hour < 12 ? "AM" : "PM");
+    }
+    return out;
+}
+
+std::string SaveAgo(s64 mtime) {
+    const s64 seconds = s64(std::time(nullptr)) - mtime;
+    if (mtime <= 0 || seconds < 0) return {};
+    const bool pt = UiPortuguese();
+    char out[64];
+    if (seconds < 60) return pt ? "agora mesmo" : "just now";
+    if (seconds < 3600) {
+        const int m = int(seconds / 60);
+        std::snprintf(out, sizeof(out), pt ? (m == 1 ? "há %d minuto" : "há %d minutos")
+                                           : (m == 1 ? "%d minute ago" : "%d minutes ago"), m);
+    } else if (seconds < 86400) {
+        const int h = int(seconds / 3600);
+        std::snprintf(out, sizeof(out), pt ? (h == 1 ? "há %d hora" : "há %d horas")
+                                           : (h == 1 ? "%d hour ago" : "%d hours ago"), h);
+    } else {
+        const int d = int(seconds / 86400);
+        if (d == 1) return pt ? "ontem" : "yesterday";
+        std::snprintf(out, sizeof(out), pt ? "há %d dias" : "%d days ago", d);
+    }
+    return out;
+}
+
+std::string SaveSize(u64 bytes) {
+    if (!bytes) return {};
+    char out[32];
+    if (bytes < 1024 * 1024) {
+        std::snprintf(out, sizeof(out), "%llu KB", (unsigned long long)((bytes + 1023) / 1024));
+    } else {
+        std::snprintf(out, sizeof(out), "%.1f MB", double(bytes) / (1024.0 * 1024.0));
+        if (UiPortuguese()) {
+            for (char* c = out; *c; ++c) if (*c == '.') *c = ',';
+        }
+    }
+    return out;
+}
+
+const char* SaveTitle(int kind) {
+    return kind == 2 ? TL("Load game", "Carregar jogo") : kind == 3 ? TL("Delete save", "Excluir save")
+                                                         : TL("Save game", "Salvar jogo");
+}
+
+ImTextureData* SaveTexture(size_t i) {
+    return i < choice_textures.size() ? choice_textures[i] : nullptr;
+}
+
+// One save as a card: picture, the game's title and text, when it was saved.
+void SaveCard(const SavePainter& p, float x0, float y0, float x1, const SaveRow& row, ImTextureData* tex,
+              bool selected, float picture_w) {
+    const float picture_h = picture_w * 9.0f / 16.0f, h = picture_h + 24.0f;
+    if (selected) {
+        p.Frame(x0 - 3, y0 - 3, x1 + 3, y0 + h + 3, kSaveAccent, 16.0f, 4.0f, 0.12f);
+        p.Box(x0, y0, x1, y0 + h, kSaveCardOn, 14.0f);
+        p.Frame(x0, y0, x1, y0 + h, kSaveAccent, 14.0f, 2.0f);
+    } else {
+        p.Box(x0, y0, x1, y0 + h, kSaveCard, 14.0f);
+    }
+    p.Picture(x0 + 16, y0 + 12, picture_w, picture_h, tex, row.is_new);
+    const float text_x = x0 + 16 + picture_w + 18;
+    std::string when, ago;
+    if (row.is_new) {
+        p.Text(text_x, y0 + h / 2 - 20, 17.0f, kSaveText, TL("New save", "Novo save"), true);
+        p.Text(text_x, y0 + h / 2 + 4, 13.5f, kSaveMuted, TL("Create a new save", "Criar um save novo"));
+        return;
+    }
+    when = SaveWhen(row.mtime);
+    ago = SaveAgo(row.mtime);
+    const std::string size = SaveSize(row.bytes);
+    if (!size.empty()) ago = ago.empty() ? size : ago + " · " + size;
+    const float right = x1 - 16;
+    const float right_w = std::max(p.Width(14.0f, when), p.Width(12.5f, ago));
+    const float text_w = right - text_x - (right_w > 0 ? right_w + 20 : 0);
+    std::string line = row.subtitle;
+    if (!row.detail.empty()) line = line.empty() ? row.detail : line + " · " + row.detail;
+    for (char& c : line) if (c == '\n' || c == '\r') c = ' ';
+    p.Text(text_x, y0 + h / 2 - 20, 17.0f, kSaveText, p.Fit(17.0f, row.title, text_w), true);
+    p.Text(text_x, y0 + h / 2 + 4, 13.5f, kSaveMuted, p.Fit(13.5f, line, text_w));
+    p.TextRight(right, y0 + h / 2 - 18, 14.0f, 0xdfe6f1, when, true);
+    p.TextRight(right, y0 + h / 2 + 5, 12.5f, kSaveDim, ago);
+}
+
+void SaveListBox() {
+    const int count = int(save_rows.size());
+    const int shown = std::min(count, 4);
+    const float w = 880, row_h = 96, gap = 10, header_h = 78, footer_h = 54, pad = 18;
+    const float list_h = shown * row_h + std::max(shown - 1, 0) * gap + pad * 2;
+    const float h = header_h + list_h + footer_h;
+    SaveBackdrop(0.62f);
+    SavePainter p = SavePainterFor(w, h);
+    p.Panel(w, h);
+
+    // Header: a floppy, the title, the game and the number of saves.
+    const float ix = 28, iy = 25;
+    p.Frame(ix, iy, ix + 26, iy + 26, kSaveAccent, 4.0f, 1.8f);
+    p.Frame(ix + 6, iy, ix + 20, iy + 9, kSaveAccent, 1.0f, 1.8f);
+    p.Frame(ix + 6, iy + 15, ix + 20, iy + 26, kSaveAccent, 1.0f, 1.8f);
+    p.Text(70, 18, 24.0f, kSaveText, SaveTitle(save_kind), true);
+    const int saves = count - int(std::count_if(save_rows.begin(), save_rows.end(), [](const SaveRow& r) { return r.is_new; }));
+    char sub[160];
+    const char* game = std::getenv("TLG_APP_NAME");
+    std::snprintf(sub, sizeof(sub), "%s%s%d %s", game && *game ? game : "", game && *game ? " · " : "", saves,
+                  saves == 1 ? "save" : "saves");
+    p.Text(70, 48, 13.0f, kSaveDim, sub);
+    p.Line(0, header_h, w, header_h, kSaveLine, 1.0f);
+
+    // Rows, scrolled so the selected one is shown.
+    if (choice_index < choice_first) choice_first = choice_index;
+    if (choice_index >= choice_first + shown) choice_first = choice_index - shown + 1;
+    choice_first = std::clamp(choice_first, 0, std::max(count - shown, 0));
+    save_row_rects.assign(count, ImRect());
+    for (int i = choice_first; i < choice_first + shown; ++i) {
+        const float y = header_h + pad + (i - choice_first) * (row_h + gap);
+        SaveCard(p, 20, y, w - 20, save_rows[i], SaveTexture(size_t(i)), i == choice_index, 128.0f);
+        save_row_rects[i] = ImRect(p.P(20, y), p.P(w - 20, y + row_h));
+    }
+    if (count > shown) { // scroll bar
+        const float track = list_h - pad * 2, y0 = header_h + pad;
+        const float knob = track * shown / count, top = y0 + track * choice_first / count;
+        p.Box(w - 11, y0, w - 8, y0 + track, kSaveLine, 2.0f);
+        p.Box(w - 11, top, w - 8, top + knob, kSaveDim, 2.0f);
+    }
+
+    // Footer: what the buttons do.
+    const float fy = header_h + list_h;
+    p.Line(0, fy, w, fy, kSaveLine, 1.0f);
+    const char* confirm = save_kind == 2 ? TL("Load", "Carregar") : save_kind == 3 ? TL("Delete", "Excluir")
+                                                                                  : TL("Save here", "Salvar aqui");
+    float x = 40;
+    p.Button(x, fy + footer_h / 2, 0);
+    p.Text(x + 18, fy + footer_h / 2 - 9, 13.5f, 0xb8c2d3, confirm);
+    x += 18 + p.Width(13.5f, confirm) + 34;
+    p.Button(x, fy + footer_h / 2, 1);
+    p.Text(x + 18, fy + footer_h / 2 - 9, 13.5f, 0xb8c2d3, TL("Back", "Voltar"));
+    p.TextRight(w - 28, fy + footer_h / 2 - 8, 12.5f, 0x7f8ba0,
+                TL("Enter / click: choose · Esc / right click: back", "Enter / clique: escolher · Esc / botão direito: voltar"));
+}
+
+// The message's words for a system message type (sceSaveDataDialog), the game's own text or an
+// error code. warn: drawn with the warning sign.
+struct SaveMessageWords {
+    std::string title, body;
+    int buttons; // 0 OK, 1 yes/no, 3 OK/cancel
+    bool warn;
+};
+
+SaveMessageWords SaveMessageFor(int kind, int code, u64 value, const std::string& text) {
+    const bool pt = UiPortuguese();
+    switch (code) {
+    case 1:
+        return {TL("No saved data", "Nenhum save encontrado"),
+                TL("There is no saved data to load.", "Não há nenhum save para carregar."), 0, false};
+    case 2:
+        if (kind == 2) return {TL("Load this save?", "Carregar este save?"),
+                               TL("Progress that was not saved will be lost.", "O progresso não salvo será perdido."), 1, false};
+        if (kind == 3) return {TL("Delete this save?", "Excluir este save?"),
+                               TL("This cannot be undone.", "Não dá para desfazer."), 1, true};
+        return {TL("Save the game?", "Salvar o jogo?"), TL("A new save will be created.", "Um save novo será criado."), 1, false};
+    case 3:
+        return {TL("Overwrite this save?", "Sobrescrever este save?"),
+                TL("The current progress will replace this save. This cannot be undone.",
+                   "O progresso atual vai substituir este save. Não dá para desfazer."), 1, true};
+    case 4:
+    case 8:
+        return {TL("Not enough space", "Sem espaço suficiente"),
+                TL("Free some disk space and try again.", "Libere espaço no disco e tente de novo."), 0, true};
+    case 6:
+        return {TL("This save is damaged", "Este save está corrompido"),
+                TL("It cannot be used.", "Não dá para usar este save."), 0, true};
+    case 10:
+        return {TL("A damaged save was found", "Um save corrompido foi encontrado"),
+                TL("It was deleted.", "Ele foi excluído."), 0, true};
+    case 11:
+        return {TL("A damaged save was found", "Um save corrompido foi encontrado"),
+                TL("A new save was created in its place.", "Um save novo foi criado no lugar."), 0, true};
+    case 13:
+        return {TL("A damaged save was found", "Um save corrompido foi encontrado"),
+                TL("It was restored.", "Ele foi restaurado."), 0, true};
+    case 14:
+        return {TL("The saves are too large", "Os saves estão grandes demais"),
+                TL("Delete some saves and try again.", "Exclua alguns saves e tente de novo."), 0, true};
+    case 100:
+        return {SaveTitle(kind), text, 0, false};
+    case 101: {
+        char body[96];
+        std::snprintf(body, sizeof(body), pt ? "Código do erro: 0x%08X" : "Error code: 0x%08X", unsigned(value));
+        return {TL("Save data error", "Erro nos dados salvos"), body, 0, true};
+    }
+    default:
+        return {SaveTitle(kind), text, 0, false};
+    }
+}
+
+void SaveMessageBox() {
+    const SaveMessageWords words = SaveMessageFor(save_kind, message_code, message_value, message_text);
+    const int buttons = message_buttons >= 0 ? message_buttons : words.buttons;
+    const float w = 560, pad = 28, inner = w - pad * 2;
+    // Height: title, the save's card, the wrapped text, the buttons.
+    ImFont* font = ImGui::GetFont();
+    const float k0 = std::min(ImGui::GetMainViewport()->WorkSize.y / 720.0f,
+                              ImGui::GetMainViewport()->WorkSize.x * 0.94f / w);
+    const float body_h = words.body.empty() ? 0.0f
+        : font->CalcTextSizeA(14.5f * k0, FLT_MAX, inner * k0, words.body.c_str()).y / k0;
+    const float card_h = message_has_entry ? 87.0f : 0.0f;
+    float h = pad + 30 + 20 + (card_h ? card_h + 20 : 0) + (body_h ? body_h + 20 : 0) + 46 + pad;
+    SaveBackdrop(0.72f);
+    SavePainter p = SavePainterFor(w, h);
+    p.Panel(w, h);
+
+    float y = pad;
+    if (words.warn) { // triangle
+        const ImVec2 a = p.P(pad + 13, y + 2), b = p.P(pad + 26, y + 26), c = p.P(pad, y + 26);
+        p.dl->AddTriangle(a, b, c, SaveColor(kSaveWarn), 2.0f * p.k);
+        p.Line(pad + 13, y + 11, pad + 13, y + 18, kSaveWarn, 2.0f);
+        p.dl->AddCircleFilled(p.P(pad + 13, y + 22), 1.4f * p.k, SaveColor(kSaveWarn));
+    } else {
+        p.dl->AddCircle(p.P(pad + 13, y + 14), 12.0f * p.k, SaveColor(kSaveAccent), 0, 2.0f * p.k);
+        p.Text(pad + 8.5f, y + 4, 16.0f, kSaveAccent, "?", true);
+    }
+    p.Text(pad + 40, y + 1, 22.0f, kSaveText, p.Fit(22.0f, words.title, inner - 40), true);
+    y += 30 + 20;
+    if (message_has_entry) {
+        p.Box(pad, y, w - pad, y + card_h, kSaveCard, 14.0f);
+        p.Frame(pad, y, w - pad, y + card_h, kSaveBorder, 14.0f, 1.0f);
+        p.Picture(pad + 14, y + 12, 112, 63, SaveTexture(0), message_entry.is_new);
+        const float tx = pad + 14 + 112 + 16, tw = w - pad - 14 - tx;
+        std::string line = message_entry.subtitle;
+        if (!message_entry.detail.empty()) line = line.empty() ? message_entry.detail : line + " · " + message_entry.detail;
+        for (char& c : line) if (c == '\n' || c == '\r') c = ' ';
+        std::string when = SaveWhen(message_entry.mtime);
+        const std::string ago = SaveAgo(message_entry.mtime);
+        if (!when.empty() && !ago.empty()) when += " (" + ago + ")";
+        p.Text(tx, y + 16, 16.0f, kSaveText,
+               p.Fit(16.0f, message_entry.is_new ? std::string(TL("New save", "Novo save")) : message_entry.title, tw), true);
+        p.Text(tx, y + 39, 13.0f, kSaveMuted, p.Fit(13.0f, line, tw));
+        p.Text(tx, y + 59, 12.5f, kSaveDim, p.Fit(12.5f, when, tw));
+        y += card_h + 20;
+    }
+    if (body_h) {
+        p.Text(pad, y, 14.5f, 0xc3ccdb, words.body, false, 1.0f, inner);
+        y += body_h + 20;
+    }
+
+    // Buttons, right-aligned: [no/cancel] [yes/OK]; the focused one is filled.
+    const char* yes = buttons == 1 ? TL("Yes", "Sim") : "OK";
+    const char* no = buttons == 1 ? TL("No", "Não") : TL("Cancel", "Cancelar");
+    const bool two = buttons == 1 || buttons == 3;
+    if (!two) message_focus = 1;
+    float right = w - pad;
+    save_button_rects[0] = save_button_rects[1] = ImRect();
+    for (int b = 1; b >= (two ? 0 : 1); --b) {
+        const char* label = b == 1 ? yes : no;
+        const float bw = 22 + 20 + 10 + p.Width(15.0f, label) + 22, x0 = right - bw;
+        const bool focused = b == message_focus;
+        p.Box(x0, y, right, y + 46, focused ? kSaveAccent : kSaveCard, 12.0f);
+        if (!focused) p.Frame(x0, y, right, y + 46, kSaveKnob, 12.0f, 1.0f);
+        p.Button(x0 + 32, y + 23, b == 1 ? 0 : 1);
+        p.Text(x0 + 52, y + 13, 15.0f, focused ? 0x0b0e14 : 0xdfe6f1, label, true);
+        save_button_rects[b] = ImRect(p.P(x0, y), p.P(right, y + 46));
+        right = x0 - 12;
+    }
+}
+
+void SaveProgressBox(SaveClock::time_point now) {
+    const float w = 520, h = 140;
+    SaveBackdrop(0.45f);
+    SavePainter p = SavePainterFor(w, h);
+    p.Panel(w, h);
+    // A spinning arc.
+    const float t = std::chrono::duration<float>(now - progress_since).count();
+    const ImVec2 c = p.P(28 + 13, 26 + 13);
+    p.dl->PathArcTo(c, 11.0f * p.k, t * 6.0f, t * 6.0f + 4.4f, 24);
+    p.dl->PathStroke(SaveColor(kSaveAccent), 0, 2.4f * p.k);
+    const char* title = progress_kind == 2 ? TL("Loading...", "Carregando...")
+                        : progress_kind == 3 ? TL("Deleting...", "Excluindo...")
+                                             : TL("Saving...", "Salvando...");
+    p.Text(66, 20, 21.0f, kSaveText, title, true);
+    p.Text(66, 47, 13.0f, kSaveDim, TL("Do not close the game.", "Não feche o jogo."));
+    const float bx0 = 28, bx1 = w - 28, by = 84;
+    p.Box(bx0, by, bx1, by + 10, kSaveThumb, 5.0f);
+    if (progress_percent >= 0) {
+        const float f = std::clamp(progress_percent, 0, 100) / 100.0f;
+        if (f > 0) p.Box(bx0, by, bx0 + (bx1 - bx0) * f, by + 10, kSaveAccent, 5.0f);
+        char pct[16];
+        std::snprintf(pct, sizeof(pct), "%d%%", std::clamp(progress_percent, 0, 100));
+        p.TextRight(bx1, by + 20, 13.0f, 0xdfe6f1, pct, true);
+    } else { // no figure: a segment sweeps the bar
+        const float span = (bx1 - bx0) * 0.3f, phase = std::fmod(t * 0.8f, 1.0f);
+        const float s0 = bx0 + (bx1 - bx0 + span) * phase - span;
+        p.Box(std::max(s0, bx0), by, std::min(s0 + span, bx1), by + 10, kSaveAccent, 5.0f);
+    }
+    if (!progress_text.empty()) {
+        std::string text = progress_text;
+        for (char& ch : text) if (ch == '\n' || ch == '\r') ch = ' ';
+        p.Text(bx0, by + 20, 13.0f, kSaveMuted, p.Fit(13.0f, text, bx1 - bx0 - 60));
+    }
+}
+
+void SaveToastBox(SaveClock::time_point now) {
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const char* text = toast_kind == 2 ? TL("Save loaded", "Save carregado")
+                       : toast_kind == 3 ? TL("Save deleted", "Save excluído")
+                                         : TL("Game saved", "Jogo salvo");
+    const float in = std::chrono::duration<float>(now - toast_since).count();
+    const float out = std::chrono::duration<float>(toast_until - now).count();
+    const float alpha = std::clamp(std::min(in / 0.15f, out / 0.4f), 0.0f, 1.0f);
+    const float k = viewport->WorkSize.y / 720.0f;
+    SavePainter p{ImGui::GetForegroundDrawList(), ImGui::GetFont(), k, {}};
+    const float w = 18 + 22 + 12 + p.Width(14.0f, text) + 20, h = 46;
+    p.at = ImVec2(viewport->WorkPos.x + viewport->WorkSize.x - (32 + w) * k,
+                  viewport->WorkPos.y + viewport->WorkSize.y - (28 + h) * k);
+    p.Box(0, 0, w, h, kSavePanel, 14.0f, 0.92f * alpha);
+    p.Frame(0, 0, w, h, kSaveBorder, 14.0f, 1.0f, alpha);
+    p.Line(18, 24, 24, 30, kSaveOk, 2.4f, alpha); // a check mark
+    p.Line(24, 30, 36, 17, kSaveOk, 2.4f, alpha);
+    p.Text(52, 14, 14.0f, kSaveText, text, true, alpha);
+}
+
+// Present thread, imgui_mutex held, after NewFrame: whichever save dialog is up.
+void SaveDialogs() {
+    const auto now = SaveClock::now();
+    if (choice_active) {
+        SaveListBox();
+    } else if (message_active) {
+        SaveMessageBox();
+    } else if (progress_on || now < progress_until) {
+        SaveProgressBox(now);
+    }
+    if (now < toast_until && !choice_active && !message_active) {
+        SaveToastBox(now);
+    }
 }
 
 void LoadingScreen() {
@@ -1001,31 +1443,87 @@ void UpdateChoiceTextures() {
     choice_retiring = !choice_retired.empty();
 }
 
-// The save list takes the keys and buttons that move and confirm; the rest stays with the game
-// (held neutral by CapturesInput).
-bool HandleChoiceEvent(const SDL_Event& event) {
-    int move = 0, finish = 0; // finish: 1 accept, 2 cancel
-    if (event.type == SDL_EVENT_KEY_DOWN) {
+void FinishSaveDialog() {
+    RetireChoiceTextures();
+    ImGui::GetIO().MouseDrawCursor = menu_open;
+}
+
+// The save list and messages take the keys, buttons and mouse that answer them; the rest stays
+// with the game (held neutral by CapturesInput).
+bool HandleSaveEvent(const SDL_Event& event) {
+    int move = 0, finish = 0; // finish: 1 accept, 2 back
+    bool moved = false, click = false;
+    switch (event.type) {
+    case SDL_EVENT_KEY_DOWN: {
         const SDL_Keycode key = event.key.key;
-        move = key == SDLK_UP || key == SDLK_W ? -1 : key == SDLK_DOWN || key == SDLK_S ? 1 : 0;
+        move = key == SDLK_UP || key == SDLK_W || key == SDLK_LEFT || key == SDLK_A ? -1
+               : key == SDLK_DOWN || key == SDLK_S || key == SDLK_RIGHT || key == SDLK_D ? 1
+                                                                                      : 0;
         finish = key == SDLK_RETURN || key == SDLK_KP_ENTER || key == SDLK_SPACE ? 1
                  : key == SDLK_ESCAPE || key == SDLK_BACKSPACE                   ? 2
                                                                                  : 0;
-    } else if (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
-        const u8 button = event.gbutton.button;
-        move = button == SDL_GAMEPAD_BUTTON_DPAD_UP ? -1 : button == SDL_GAMEPAD_BUTTON_DPAD_DOWN ? 1 : 0;
-        finish = button == SDL_GAMEPAD_BUTTON_SOUTH ? 1 : button == SDL_GAMEPAD_BUTTON_EAST ? 2 : 0;
-    } else {
-        return event.type == SDL_EVENT_KEY_UP || event.type == SDL_EVENT_GAMEPAD_BUTTON_UP;
+        break;
     }
-    const int count = int(choice_items.size());
+    case SDL_EVENT_GAMEPAD_BUTTON_DOWN: {
+        const u8 button = event.gbutton.button;
+        move = button == SDL_GAMEPAD_BUTTON_DPAD_UP || button == SDL_GAMEPAD_BUTTON_DPAD_LEFT ? -1
+               : button == SDL_GAMEPAD_BUTTON_DPAD_DOWN || button == SDL_GAMEPAD_BUTTON_DPAD_RIGHT ? 1
+                                                                                                  : 0;
+        finish = button == SDL_GAMEPAD_BUTTON_SOUTH ? 1 : button == SDL_GAMEPAD_BUTTON_EAST ? 2 : 0;
+        break;
+    }
+    case SDL_EVENT_MOUSE_MOTION: {
+        const float density = PixelDensity(event.motion.windowID);
+        save_mouse = ImVec2(event.motion.x * density, event.motion.y * density);
+        ImGui::GetIO().AddMousePosEvent(save_mouse.x, save_mouse.y);
+        moved = true;
+        break;
+    }
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+        click = event.button.button == SDL_BUTTON_LEFT;
+        finish = event.button.button == SDL_BUTTON_RIGHT ? 2 : 0;
+        break;
+    case SDL_EVENT_MOUSE_WHEEL:
+        move = event.wheel.y > 0 ? -1 : event.wheel.y < 0 ? 1 : 0;
+        break;
+    case SDL_EVENT_KEY_UP:
+    case SDL_EVENT_GAMEPAD_BUTTON_UP:
+    case SDL_EVENT_MOUSE_BUTTON_UP:
+        return true;
+    default:
+        return false;
+    }
+    if (message_active) {
+        const bool two = (message_buttons >= 0 ? message_buttons
+                          : SaveMessageFor(save_kind, message_code, message_value, message_text).buttons) % 2 == 1;
+        if (two && move) message_focus = move < 0 ? 0 : 1;
+        for (int b = 0; b < 2 && (moved || click); ++b) {
+            if (save_button_rects[b].GetWidth() > 0 && save_button_rects[b].Contains(save_mouse)) {
+                message_focus = b;
+                finish = click ? 1 : finish;
+            }
+        }
+        if (finish) {
+            message_result = !two || (finish == 1 && message_focus == 1) ? 1 : 2;
+            message_active = false;
+            FinishSaveDialog();
+        }
+        return true;
+    }
+    const int count = int(save_rows.size());
     if (move && count) {
         choice_index = (choice_index + move + count) % count;
+    }
+    for (int i = 0; i < int(save_row_rects.size()) && (moved || click); ++i) {
+        if (save_row_rects[i].GetWidth() > 0 && save_row_rects[i].Contains(save_mouse)) {
+            choice_index = i;
+            finish = click ? 1 : finish;
+        }
     }
     if (finish) {
         choice_result = finish == 1 && count ? choice_index : -2;
         choice_active = false;
-        RetireChoiceTextures();
+        FinishSaveDialog();
     }
     return true;
 }
@@ -1035,8 +1533,8 @@ bool HandleEvent(const SDL_Event& event) {
     if (!initialized) {
         return false;
     }
-    if (choice_active && !menu_open) {
-        return HandleChoiceEvent(event);
+    if ((choice_active || message_active) && !menu_open) {
+        return HandleSaveEvent(event);
     }
     ImGuiIO& io = ImGui::GetIO();
     const bool is_open = menu_open;
@@ -1185,31 +1683,112 @@ static bool NoticeActive() {
 
 bool Visible() {
     const auto& s = TlgSettings::Get();
+    const auto now = std::chrono::steady_clock::now();
     return initialized && (loading || background_total || menu_open || text_entry_active || choice_active ||
+                           message_active || progress_on || now < progress_until || now < toast_until ||
                            NoticeActive() ||
                            choice_retiring || s.show_fps ||
                            (s.actor_watch_supported && s.enemy_health_bar));
 }
 
 bool CapturesInput() {
-    return menu_open || text_entry_active || choice_active;
+    return menu_open || text_entry_active || choice_active || message_active;
 }
 
-void BeginChoice(const std::string& title, const std::vector<std::string>& items,
-                 std::vector<TlgPng::Image> pictures, int focus) {
+void BeginSaveList(int kind, std::vector<SaveRow> rows, std::vector<TlgPng::Image> pictures, int focus) {
     std::scoped_lock lock{imgui_mutex};
     RetireChoiceTextures();
     choice_pictures = std::move(pictures);
-    choice_pictures.resize(items.size());
-    choice_title = title;
-    choice_items = items;
-    choice_index = focus >= 0 && focus < int(items.size()) ? focus : 0;
+    choice_pictures.resize(rows.size());
+    save_kind = kind;
+    save_rows = std::move(rows);
+    save_row_rects.clear();
+    choice_index = focus >= 0 && focus < int(save_rows.size()) ? focus : 0;
+    choice_first = 0;
     choice_result = -1;
+    message_active = false;
+    progress_on = false;
     choice_active = true;
+    ImGui::GetIO().MouseDrawCursor = true;
 }
 
-int PollChoice() {
+int PollSaveList() {
     return choice_result;
+}
+
+void BeginSaveMessage(int kind, int code, u64 value, const std::string& text, int buttons,
+                      const SaveRow* entry, TlgPng::Image picture) {
+    std::scoped_lock lock{imgui_mutex};
+    RetireChoiceTextures();
+    message_has_entry = entry != nullptr;
+    if (entry) {
+        message_entry = *entry;
+        choice_pictures.clear();
+        choice_pictures.push_back(std::move(picture));
+    }
+    save_kind = kind;
+    message_code = code;
+    message_value = value;
+    message_text = text;
+    message_buttons = buttons;
+    // Deleting starts on "No"; everything else on the answer the player came for.
+    message_focus = kind == 3 ? 0 : 1;
+    save_button_rects[0] = save_button_rects[1] = ImRect();
+    message_result = -1;
+    choice_active = false;
+    progress_on = false;
+    message_active = true;
+    ImGui::GetIO().MouseDrawCursor = true;
+}
+
+int PollSaveMessage() {
+    return message_result;
+}
+
+void CloseSaveDialog() {
+    std::scoped_lock lock{imgui_mutex};
+    if (choice_active.exchange(false)) {
+        choice_result = -2;
+    }
+    if (message_active.exchange(false)) {
+        message_result = 2;
+    }
+    FinishSaveDialog();
+}
+
+void SaveProgress(int kind, int active, int percent, const char* text) {
+    std::scoped_lock lock{imgui_mutex};
+    const auto now = SaveClock::now();
+    if (!active) {
+        progress_on = false;
+        return;
+    }
+    if (!progress_on && now >= progress_until) {
+        progress_since = now;
+    }
+    progress_kind = kind;
+    progress_percent = percent;
+    if (text) {
+        progress_text = text;
+    }
+    if (active == 2) {
+        progress_until = now + std::chrono::milliseconds(1200);
+    } else {
+        progress_on = true;
+    }
+}
+
+void SaveToast(int kind) {
+    std::scoped_lock lock{imgui_mutex};
+    const auto now = SaveClock::now();
+    // A dialog's "saved" and the save's own unmount come together: one toast.
+    if (now < toast_until + std::chrono::seconds(3)) {
+        toast_until = std::max(toast_until, now + std::chrono::milliseconds(2600));
+        return;
+    }
+    toast_kind = kind;
+    toast_since = now;
+    toast_until = now + std::chrono::milliseconds(2600);
 }
 
 void SetTextEntry(bool active, const std::string& prompt, const std::string& text) {
@@ -1265,8 +1844,8 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     if (text_entry_active) {
         TextEntryBox();
     }
-    if (choice_active && !menu_open) {
-        ChoiceBox();
+    if (!menu_open) {
+        SaveDialogs();
     }
     if (NoticeActive() && !menu_open) {
         NoticeBox();

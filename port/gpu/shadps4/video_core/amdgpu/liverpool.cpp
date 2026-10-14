@@ -26,6 +26,7 @@
 #include "tlg_write_log.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
+#include "video_core/renderer_vulkan/vk_frame_record.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 namespace AmdGpu {
@@ -262,6 +263,11 @@ void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const auto eop = *reinterpret_cast<const PM4CmdEventWriteEop*>(data);
     rasterizer.ProcessDownloadImages();
     rasterizer.EagerCopyAtFence();
+    // tlg: the label is written after the eager copies were taken: a copy of its page lacks it
+    // (The Last of Us Remastered read a stale frame marker and halted in WaitOnContextDone).
+    if (eop.data_sel.Value() != DataSelect::None) {
+        rasterizer.GetBufferCache().MarkFenceWrite(reinterpret_cast<VAddr>(eop.Address<u32>()), 8);
+    }
     // Guest memory copies on the copy threads precede the fence the guest sees.
     // TLG_ASYNC_FENCES=1 writes it once they are done instead of waiting for them; measured
     // slower (79 vs 83 FPS): the guest waits on these fences, and later fences stall it more
@@ -342,6 +348,7 @@ void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
     rasterizer.WaitHostCopies();
     rasterizer.WaitDeferredSignals();
     rasterizer.ProcessDownloadImages();
+    rasterizer.GetBufferCache().MarkFenceWrite(reinterpret_cast<VAddr>(event_eos.Address<u32*>()), 4);
     event_eos.SignalFence([](void* address, u64 value, u32 num_bytes) {
         auto* memory = Core::Memory::Instance();
         TlgWriteLog::Note(reinterpret_cast<u64>(address), &value, num_bytes, TlgWriteLog::Fence);
@@ -764,6 +771,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
                 // They may write guest memory: not before fences deferred earlier.
                 rasterizer->WaitDeferredSignals();
+            }
+            // tlg: TLG_FRAME_RECORD_TRIGGER (vk_frame_record.h).
+            if (Vulkan::FrameRecord::Active()) [[unlikely]] {
+                Vulkan::FrameRecord::Packet(-1, header, &regs);
             }
             switch (opcode) {
             case PM4ItOpcode::Nop: {
@@ -1416,6 +1427,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         const PM4ItOpcode opcode = header->type3.opcode;
 
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
+        if (Vulkan::FrameRecord::Active()) [[unlikely]] {
+            Vulkan::FrameRecord::Packet(static_cast<int>(vqid), header, nullptr);
+        }
         switch (opcode) {
         case PM4ItOpcode::Nop: {
             const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -1612,6 +1626,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (rasterizer) {
                 rasterizer->ProcessDownloadImages();
                 rasterizer->EagerCopyAtFence();
+                rasterizer->GetBufferCache().MarkFenceWrite(release_mem->Address<VAddr>(), 8);
             }
             release_mem->SignalFence(
                 [pipe_id = queue.pipe_id] {

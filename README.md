@@ -88,13 +88,14 @@ O **`CORE_MANIFEST`** é a lista exata do que é núcleo (globs, exclusões `!` 
 
 Hoje o núcleo lê só `TLG_` (herdado do primeiro port). Plano em duas etapas:
 
-1. **Agora, um prefixo por jogo:** **`TLG_`** (The Last Guardian), **`GR2_`** (Gravity Rush 2), **`ISS_`** (inFAMOUS Second Son). O port declara `PORT_ENV_PREFIX="ISS_"` no seu `port/packaging/port.env`; o `build.sh` passa `-DPORT_ENV_PREFIX="ISS_"` ao compilar o `tlg-probe` (no Windows, `-DPORT_ENV_PREFIX=ISS_` ao CMake), e o `alias_port_environment()` do `probe.c` copia cada `ISS_X` para `TLG_X` no início do `main` (se `TLG_X` não estiver definido). Sem `PORT_ENV_PREFIX` (TLG, build só do núcleo) não há alias. Jogador, launcher e scripts usam o prefixo do jogo; o núcleo continua lendo `TLG_X`.
+1. **Agora, um prefixo por jogo:** **`TLG_`** (The Last Guardian), **`GR2_`** (Gravity Rush 2), **`ISS_`** (inFAMOUS Second Son). O port declara `PORT_ENV_PREFIX="ISS_"` no seu `port/packaging/port.env`; o `build.sh` passa `-DPORT_ENV_PREFIX="ISS_"` ao compilar o `tlg-probe` (no Windows, `-DPORT_ENV_PREFIX=ISS_` ao CMake), e o `alias_port_environment()` do `probe.c` copia cada `ISS_X` para `TLG_X` no início do `main`; o nome do jogo ganha de um `TLG_X` também definido (os runners põem padrões em `TLG_*`). O `port/run.py` segue a mesma regra para `<PREFIXO>ISA_REWRITE`. Sem `PORT_ENV_PREFIX` (TLG, build só do núcleo) não há alias. Jogador, launcher e scripts usam o prefixo do jogo; o núcleo continua lendo `TLG_X`.
 2. **Depois, um prefixo comum `PSCORE_`** para o que é do núcleo, quando todo port consumir o `ps4_core`: o carregador procura `<PREFIXO>_X`, `PSCORE_X` e por fim `TLG_X`, avisando uma vez no log quando usar o nome antigo (vem de `runtime_game.env_prefix`). Nomes internos (`tlggpu`, `tlg-probe`, `TLG_SHADER_CACHE_KEY`) não mudam agora.
 
 ### Escolhas por jogo que ainda vivem no launcher
 
 - **TSC:** o padrão é o `rdtsc` do host com a frequência medida; `TLG_TSC=process` usa o relógio do processo (1 GHz, do upstream gow3_pc, para hosts com TSC diferente entre núcleos). Jogo que executa `rdtsc` direto no código (inFAMOUS: 391 sítios) **tem** de usar o do host, senão roda 3–4x rápido. Ideia: detectar no `prepare.py` contando os `rdtsc` do eboot ([KNOWN_ISSUES](docs/KNOWN_ISSUES.md) #15).
 - **Readback antecipado + write merge** (`TLG_EAGER_READBACK=1`, `TLG_WRITE_MERGE=1`): desligados no núcleo, ligados por padrão só no inFAMOUS. No fence a GPU já copia os buffers que o jogo lê de volta; escritas da CPU sem falta marcam essas cópias como velhas, para uma cópia antiga não sobrescrever bytes novos do jogo (#16).
+- **Readback adiado** (`TLG_DEFERRED_READBACK=1`, só com readback preciso): a thread do jogo espera só as suas cópias. Desligado no núcleo, ligado por padrão no launcher do inFAMOUS. Ligados no núcleo para todos, mas testados só no inFAMOUS: pipelines de compute fora da thread da GPU (`TLG_COMPUTE_ASYNC_BUILD=0` desliga) e envio a cada ~1024 draws (`TLG_SUBMIT_DRAWS=0` desliga) (#17).
 
 ## Build
 
@@ -124,13 +125,15 @@ tools/core_sync.py --pull --ref origin/main ~/decomp/tlg_pc   # traz o que o por
 
 Estados: `port-newer` (a versão daqui está no histórico do port: o port andou), `port-only`, `diverged` (os dois mudaram: mesclar à mão), `core-newer` (a versão do port está no histórico daqui ou no commit fixado de um port do `CORE_SOURCE`: o port está atrás), `core-only`, `submodule`. O `--pull` copia `port-newer` e `port-only` (com `--force`, também `diverged`) só para o working tree: revise com `git diff` e faça o commit à mão, atualizando o `CORE_SOURCE`.
 
-### Estado em 14/10/2026 (`--status-all`, depois do sync com o inFAMOUS `fd78ad5`)
+### Estado em 14/10/2026 (`--status-all`, depois da branch `sync/2026-10-14`)
 
 | Port | `origin/main` | Diferentes | Leva do port | Port atrasado |
 |---|---|---|---|---|
-| tlg_pc | `639d6ce` | 102 | 0 | 73 `core-newer` + 29 `core-only` |
-| gr2_pc | `4f5958f` | 124 | 0 | 81 `core-newer` + 43 `core-only` |
-| infamous_pc | `fd78ad5` (PR #6) | 41 | 0 | 25 `core-newer` + 16 `core-only` (SMAA/CAS, mouse, presenter, `PORT_ENV_PREFIX`) |
+| tlg_pc | `c8f249b` (PR #18) | 118 | 0 | 85 `core-newer` + 33 `core-only` |
+| gr2_pc | `40d0391` (PR #15) | 137 | 0 | 90 `core-newer` + 47 `core-only` |
+| infamous_pc | `2b82d72` (PR #15) | 49 | 0 | 33 `core-newer` + 16 `core-only` (SMAA/CAS, mouse, presenter, `PORT_ENV_PREFIX`, join do AvPlayer, correções do TLOU) |
+
+Fora das `main`: as branches `fix/avplayer-stop-join` e `fix/isa-rewrite-sse4a` do GR2 já estão aqui; o NGS2 embutido do TLG (`feat/ngs2-hle`) está na branch `feat/ngs2-hle` do `ps4_core`, em cima desta: `port/src/runtime_ngs2.c` responde ao `libSceNgs2` quando `TLG_NGS2` não é `native` (sem o `libSceNgs2.sprx` do firmware), `TLG_NGS2_TRACE` rastreia o módulo nativo (ver `docs/NGS2_LEVANTAMENTO.md`).
 
 Nenhum port tem trabalho de núcleo que falte aqui. Para levar o núcleo a um port: copiar os arquivos `core-newer`/`core-only` numa branch do port, compilar e testar o jogo (com a trava), e abrir o PR.
 
@@ -174,9 +177,9 @@ Today each port carries a copy kept in step with `tools/core_sync.py`. Plan: (1)
 
 1. **Core defaults** (core code). 2. **Game profile** (`port.env` identity + `PORT_ENV_PREFIX`, `profile.ini` defaults: readback mode, VRAM budget, `block1d`, skip-adjacency, FPS patches, motion/touchpad, mouse map, upscaler). 3. **Game code** (`runtime_<slug>*.c`, `game_<slug>.c`, patches). 4. **Player choices** (launcher and Insert menu, saved per game). **Precedence: core < game profile < player**; environment variables override everything, for testing only. One generic loader in the core (`core_config.c` + C++ bridge), knowing no game: compiled defaults → game `profile.ini` → player ini → environment; `core_config_get/int/bool("gpu.readbacks")`, env name `<PREFIX>_READBACKS` then `TLG_READBACKS` during the transition.
 
-**Env prefix plan:** now per game — `TLG_` (The Last Guardian), `GR2_` (Gravity Rush 2), `ISS_` (inFAMOUS Second Son): the port sets `PORT_ENV_PREFIX="ISS_"` in `port/packaging/port.env`, `build.sh` compiles `tlg-probe` with `-DPORT_ENV_PREFIX="ISS_"` (CMake option on Windows), and `probe.c` `alias_port_environment()` copies each `ISS_X` to `TLG_X` at start unless `TLG_X` is set; no define = no alias. Later a common `PSCORE_` prefix for core settings once every port consumes ps4_core (lookup `<PREFIX>_X`, `PSCORE_X`, then `TLG_X`, old name logged once). Internal names (`tlggpu`, `tlg-probe`, `TLG_SHADER_CACHE_KEY`) stay.
+**Env prefix plan:** now per game — `TLG_` (The Last Guardian), `GR2_` (Gravity Rush 2), `ISS_` (inFAMOUS Second Son): the port sets `PORT_ENV_PREFIX="ISS_"` in `port/packaging/port.env`, `build.sh` compiles `tlg-probe` with `-DPORT_ENV_PREFIX="ISS_"` (CMake option on Windows), and `probe.c` `alias_port_environment()` copies each `ISS_X` to `TLG_X` at start, the game's name winning over a `TLG_X` also set (runners set `TLG_*` defaults); `port/run.py` does the same for `<PREFIX>ISA_REWRITE`; no define = no alias. Later a common `PSCORE_` prefix for core settings once every port consumes ps4_core (lookup `<PREFIX>_X`, `PSCORE_X`, then `TLG_X`, old name logged once). Internal names (`tlggpu`, `tlg-probe`, `TLG_SHADER_CACHE_KEY`) stay.
 
-**Per-game choices still in the launchers:** TSC — host rdtsc with measured frequency by default, `TLG_TSC=process` for the process clock; games that execute rdtsc directly (inFAMOUS, 391 sites) must use the host rdtsc (idea: auto-detect by counting rdtsc in the eboot at prepare time; KNOWN_ISSUES #15). Eager readback + write merge (`TLG_EAGER_READBACK`, `TLG_WRITE_MERGE`) are off in the core and on by default only in inFAMOUS; CPU writes merged without a fault mark the eager copies stale so an old copy never overwrites the game's new bytes (#16).
+**Per-game choices still in the launchers:** TSC — host rdtsc with measured frequency by default, `TLG_TSC=process` for the process clock; games that execute rdtsc directly (inFAMOUS, 391 sites) must use the host rdtsc (idea: auto-detect by counting rdtsc in the eboot at prepare time; KNOWN_ISSUES #15). Eager readback + write merge (`TLG_EAGER_READBACK`, `TLG_WRITE_MERGE`) are off in the core and on by default only in inFAMOUS; CPU writes merged without a fault mark the eager copies stale so an old copy never overwrites the game's new bytes (#16). Deferred readback (`TLG_DEFERRED_READBACK=1`, precise mode only) is off in the core and on in the inFAMOUS launcher; compute pipelines off the GPU thread (`TLG_COMPUTE_ASYNC_BUILD=0` off) and submit every ~1024 draws (`TLG_SUBMIT_DRAWS=0` off) are on in the core but tested only in inFAMOUS (#17).
 
 ## Build notes
 
@@ -191,7 +194,7 @@ No core-only build yet (runtime.c links the per-game resolvers; build globs `src
 
 ## `tools/core_sync.py`
 
-`--status-all [--fetch]` (table of the three ports vs `origin/main`), `--ref`, `--diff`, `--pull` (copies `port-newer` and `port-only`, plus `diverged` with `--force`, into the working tree for review). States: `port-newer`, `port-only`, `diverged`, `core-newer` (port behind; checked against this history and the pinned commits in `CORE_SOURCE`), `core-only`, `submodule`. Status on 2026-10-14 after the infamous_pc `fd78ad5` sync: no port has core work missing here; tlg_pc `639d6ce` 102 behind (73 core-newer, 29 core-only), gr2_pc `4f5958f` 124 behind (81 + 43), infamous_pc `fd78ad5` 41 behind (25 + 16: SMAA/CAS, mouse, presenter, `PORT_ENV_PREFIX`; inFAMOUS must add `PORT_ENV_PREFIX="ISS_"` to its `port.env` when it takes this core).
+`--status-all [--fetch]` (table of the three ports vs `origin/main`), `--ref`, `--diff`, `--pull` (copies `port-newer` and `port-only`, plus `diverged` with `--force`, into the working tree for review). States: `port-newer`, `port-only`, `diverged`, `core-newer` (port behind; checked against this history and the pinned commits in `CORE_SOURCE`), `core-only`, `submodule`. Status on 2026-10-14 after the `sync/2026-10-14` branch (infamous_pc `2b82d72`, gr2_pc branches, `feat/tlou-imports` fixes): no port's `main` has core work missing here; tlg_pc `c8f249b` 118 behind (85 core-newer, 33 core-only), gr2_pc `40d0391` 137 behind (90 + 47), infamous_pc `2b82d72` 49 behind (33 + 16: SMAA/CAS, mouse, presenter, `PORT_ENV_PREFIX`, AvPlayer join, TLOU fixes; inFAMOUS must add `PORT_ENV_PREFIX="ISS_"` to its `port.env` when it takes this core). Still outside: tlg_pc `feat/ngs2-hle` (ps4_core branch `feat/ngs2-hle`).
 
 ## Tools
 
