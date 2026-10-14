@@ -23,14 +23,16 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
-/* sceKernelGetDirectMemorySize on retail PS4: 5056 MiB. TLG_DMEM_MB raises it (the resolution
- * patches above 1080p need about 4 GiB more; run.sh sets it). */
+/* sceKernelGetDirectMemorySize on retail PS4: 5056 MiB. TLG_DMEM_MB changes it: higher for the
+ * resolution patches above 1080p (about 4 GiB more; run.sh sets it), lower for games that check
+ * the exact size of their SDK's retail console (The Last of Us Remastered: 4608 MiB on a base
+ * PS4; any other value is treated as a devkit and allocates a debug arena that does not fit). */
 static uint64_t pool_size_bytes(void) {
     static uint64_t size;
     if (!size) {
         const char *env = getenv("TLG_DMEM_MB");
         uint64_t mb = env ? strtoull(env, NULL, 10) : 0;
-        if (mb < 5056 || mb > 16384) mb = 5056;
+        if (mb < 4096 || mb > 16384) mb = 5056;
         size = mb * 1024 * 1024;
     }
     return size;

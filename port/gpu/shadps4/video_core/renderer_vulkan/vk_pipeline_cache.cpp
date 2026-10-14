@@ -45,6 +45,10 @@ struct AsyncShaderCompilation {
     AsyncJob<std::shared_ptr<AsyncShaderCompilation>> job;
     Shader::Info info;
     Shader::RuntimeInfo runtime{};
+    // tlg: translation changes both (SRT flattening sets the flat buffer size, clip distances
+    // add an input); a capture retried on the GPU thread starts again from these.
+    Shader::Info info_initial;
+    Shader::RuntimeInfo runtime_initial{};
     std::vector<u32> code, user_data, geometry_code, binary;
     std::unique_ptr<Shader::Pools> pools;
     CompilerPool<Shader::Pools>* pool_cache{};
@@ -487,6 +491,8 @@ bool PipelineCache::QueueShader(Program& program, HwStage stage, SwStage l_stage
         build->geometry_code.assign(runtime_info.hw.gs.vs_copy.begin(), runtime_info.hw.gs.vs_copy.end());
         build->runtime.hw.gs.vs_copy = build->geometry_code;
     }
+    build->info_initial = build->info;
+    build->runtime_initial = build->runtime;
     build->binding = binding;
     build->permutation = permutation;
     build->initial = initial;
@@ -507,6 +513,11 @@ bool PipelineCache::QueueShader(Program& program, HwStage stage, SwStage l_stage
         // The key keeps the runtime info as the lookup builds it: translation adjusts it
         // (InjectClipDistanceAttributes adds a fragment input), and a key made after that never
         // matches again, so every draw queued a new permutation (inFAMOUS: 32768 of one shader).
+        // A capture that faulted on the worker runs again here: start from the untouched Info
+        // (The Last of Us Remastered: GenerateSrtProgram asserted on the already-flattened size).
+        build->ir.reset();
+        build->info = build->info_initial;
+        build->runtime = build->runtime_initial;
         const Shader::RuntimeInfo lookup_runtime = build->runtime;
         build->ir.emplace(Shader::TranslateProgram(build->code, *build->pools, build->info,
                                                    build->runtime, profile));
