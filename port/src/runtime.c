@@ -1,6 +1,7 @@
 /* Narrow, explicit PS4 libc contracts. No automatic success stubs. */
 #define _CRT_RAND_S
 #include "runtime.h"
+#include "runtime_game.h"
 #include "gpu/tlggpu.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -80,7 +81,7 @@ void runtime_report(void) {
     runtime_memory_report();
     runtime_ajm_report();
     runtime_audio_report();
-    runtime_gr2_audio3d_report();
+    if (runtime_game.report) runtime_game.report(); /* the game's own modules */
     runtime_pad_report();
     runtime_savedata_report();
     runtime_file_report();
@@ -244,6 +245,10 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
     if (memory) return memory;
     uintptr_t kernel = runtime_kernel_resolve(name);
     if (kernel) return kernel;
+    uintptr_t eventflag = runtime_eventflag_resolve(name);
+    if (eventflag) return eventflag;
+    uintptr_t system = runtime_system_resolve(name);
+    if (system) return system;
     uintptr_t services = runtime_services_resolve(name);
     if (services) return services;
     uintptr_t ajm = runtime_ajm_resolve(name);
@@ -260,21 +265,11 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
     if (save) return save;
     uintptr_t file = runtime_file_resolve(name);
     if (file) return file;
-    /* Before runtime_tlg: its Audio3d entries are placeholders kept for TLG-only builds. */
-    uintptr_t gr2_audio3d = runtime_gr2_audio3d_resolve(name);
-    if (gr2_audio3d) return gr2_audio3d;
-    uintptr_t tlg = runtime_tlg_resolve(name);
-    if (tlg) return tlg;
-    uintptr_t gr2 = runtime_gr2_resolve(name);
-    if (gr2) return gr2;
-    uintptr_t gr2_np = runtime_gr2_np_resolve(name);
-    if (gr2_np) return gr2_np;
-    uintptr_t gr2_font = runtime_gr2_font_resolve(name);
-    if (gr2_font) return gr2_font;
-    uintptr_t gr2_json = runtime_gr2_json_resolve(name);
-    if (gr2_json) return gr2_json;
-    uintptr_t infamous = runtime_infamous_resolve(name);
-    if (infamous) return infamous;
+    /* The game's own modules, in the order its table lists them (runtime_game.h). */
+    for (const RuntimeGameResolver *game=runtime_game.resolvers; game && *game; ++game) {
+        uintptr_t found=(*game)(name);
+        if (found) return found;
+    }
     return tlggpu_resolve(name);
 }
 static const struct { const char *nid, *symbol; } import_names[]={

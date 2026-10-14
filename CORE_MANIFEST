@@ -7,11 +7,17 @@
 # Conferido em 13/10/2026 contra tlg_pc, gr2_pc e infamous_pc origin/main: fora do manifesto ficam só
 # arquivos do jogo (runtime_<slug>*.c, <slug>_patches.py, launchers, ícones, port.env, .rc, README).
 
-# Runtime nativo / native runtime (inclui runtime_game.h, rascunho / includes the runtime_game.h draft)
+# Runtime nativo / native runtime (inclui runtime_game.h e game_none.c / includes the hook table header and game_none.c)
+# port/games/ (modelos game_<slug>.c, profile_<slug>.ini, patches de migração) é só do ps4_core: não entra no port
+# port/games/ (templates and migration patches) belongs to ps4_core only: copy by hand, never synced
 port/src/*
 !port/src/runtime_tlg.c
 !port/src/runtime_gr2*.c
 !port/src/runtime_infamous*.c
+!port/src/runtime_tlou*.c
+# Tabela de hooks de cada jogo (game_none.c é do núcleo) / per-game hook tables (game_none.c is core);
+# um slug começando com "n" precisa da sua linha / a slug starting with "n" needs its own line
+!port/src/game_[!n]*.c
 # Patches de FPS e afins de cada jogo / per-game patch tables
 !port/scripts/tlg_*
 !port/scripts/gr2_*

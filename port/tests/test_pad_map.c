@@ -78,5 +78,16 @@ int main(void) {
     ButtonMap gp=pad_map;
     assert(apply_button_map(&gp,"cross=a|b",false)==1);
     assert(pressed_by(&gp,SDL_GAMEPAD_BUTTON_SOUTH)==BTN_CROSS && pressed_by(&gp,SDL_GAMEPAD_BUTTON_EAST)==(BTN_CROSS|BTN_CIRCLE));
+    /* Game mouse defaults (profile mouse_buttons): replace the TLG buttons, keep the rest. */
+    ButtonMap game=key_map;
+    assert(pressed_by(&game,MOUSE_LEFT)==BTN_TRIANGLE && pressed_by(&game,MOUSE_RIGHT)==BTN_R1);
+    assert(apply_mouse_defaults(&game,"Mouse Left=square, right = l2 ,middle=none,bogus=cross,x1=nothing")==3);
+    assert(pressed_by(&game,MOUSE_LEFT)==BTN_SQUARE && pressed_by(&game,MOUSE_RIGHT)==BTN_L2);
+    assert(pressed_by(&game,MOUSE_MIDDLE)==0 && pressed_by(&game,MOUSE_X1)==0);
+    assert(pressed_by(&game,SDL_SCANCODE_Q)==BTN_TRIANGLE && pressed_by(&game,SDL_SCANCODE_E)==BTN_SQUARE);
+    /* The player's key map still wins over the game defaults. */
+    assert(apply_button_map(&game,"square=Mouse X2",true)==1);
+    assert(pressed_by(&game,MOUSE_LEFT)==0 && pressed_by(&game,MOUSE_X2)==BTN_SQUARE);
+    assert(apply_mouse_defaults(&game,NULL)==0 && apply_mouse_defaults(&game,"")==0);
     puts("PASS: pad and key maps");
 }

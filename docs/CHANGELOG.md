@@ -2,6 +2,21 @@
 
 [English below](#english). Hashes da `main` do port onde a mudança nasceu (`iss` = infamous_pc, `gr2` = gr2_pc, `tlg` = tlg_pc). O `ps4_core` só junta: os commits daqui dizem de qual snapshot cada arquivo veio (ver também `CORE_SOURCE`).
 
+## 14/10/2026: hooks do jogo por tabela, funções comuns no núcleo, perfil do jogo (branch `feat/game-hooks`)
+
+Itens 3.1–3.3 do `PROXIMOS_PASSOS.md`. Detalhes: [GAME_HOOKS.md](GAME_HOOKS.md). Ainda **não** está na `main`.
+
+**Runtime e loader**
+- **Tabela `RuntimeGame`** (`port/src/runtime_game.h`, agora ligada): o `runtime.c` não chama mais `runtime_tlg/gr2*/infamous_resolve` nem `runtime_gr2_audio3d_report`; percorre `runtime_game.resolvers[]` depois dos módulos do núcleo e chama `runtime_game.report`. O `probe.c` usa `env_prefix` (quando o build não tem `-DPORT_ENV_PREFIX`), `title_ids` (aviso), `init` e `patch_image`. `src/game_none.c` = build só do núcleo. O `build.sh` e o CMake do Windows escolhem `src/game_<slug>.c` (`PORT_GAME`, `PORT_SLUG` do `port.env`, o único `game_*.c`, ou `game_none.c`).
+- **Modelos para os três ports** em `port/games/`: `game_{tlg,gr2,infamous}.c` (mesma ordem de resolução de antes; conferido offline, todo import dos três `boot-linked.bin` cai na mesma função), `profile_{tlg,gr2,infamous}.ini` e `migration/<port>.patch`.
+- **Funções comuns no núcleo:** `runtime_eventflag.c` (event flags) e `runtime_system.c` (Neo mode, memória flexível, getdents, PRT aperture, unwind/segment info, fuso horário, heap trace, versão do SDK, `pthread_equal`, `sincosf`, LoadExec, mix do alto-falante do pad, DiscMap, PlayGo dialog, ErrorDialog), copiadas do `runtime_tlg.c` e do `runtime_gr2.c`.
+- **Perfil do jogo** (`port/src/runtime_profile.c`): `profile.ini` lido no começo do `main`; núcleo < perfil < launcher/jogador < ambiente. Chaves `tsc`, `tsc_auto_threshold`, `readbacks`, `eager_readback`, `write_merge`, `gc_budget_mb`, `block1d`, `skip_adjacency`, `pipeline_binaries`, `mouse_buttons`, `motion_button`, `stick_deadzone`; `[env]` e `[settings]` (padrões do `tlg.ini`, lidos pelo `tlg_settings.cpp` antes do ini do jogador). Os pacotes levam o `profile.ini`.
+- **`TLG_TSC=auto`** (ou `tsc = auto`): conta `rdtsc` (`0F 31`) no código do eboot preparado ao carregar, descarta os `0F 31` seguidos de ModRM registrador-registrador, escolhe `host` com ≥ 64 sítios e escreve a decisão no log.
+- **Botões do mouse por jogo:** `TLG_MOUSE_BUTTONS` / `mouse_buttons` (`runtime_pad.c` `apply_mouse_defaults`), aplicados antes do `key_map` do jogador.
+
+**Testes**
+- `profile-test` (precedência, `[env]`, comentários, contagem de `rdtsc`, decisão do TSC), `eventflag-test` (event flags e os contratos de `runtime_system.c`), `pad-map-test` com `mouse_buttons`. `build.sh --test` passa no núcleo sozinho.
+
 ## 14/10/2026: sync com o `infamous_pc` `fd78ad5` (PRs #5 e #6)
 
 Do inFAMOUS desde `f76850a`: readback antecipado, ajustes do write merge, prefixo `ISS_` e o gráfico de sessão. O resto do PR #6 é o mesmo sync do upstream gow3_pc que já estava aqui (mesclas em 3 vias com base `iss f76850a`; o lado do núcleo — SMAA/CAS, mouse e teclado, presenter, `TLG_SKIP_ADJACENCY`, upstream — ficou inteiro).
@@ -83,6 +98,8 @@ Do [FelipePrado0/gow3_pc](https://github.com/FelipePrado0/gow3_pc) `9a6d17c..2a0
 <a id="english"></a>
 
 ## English
+
+**2026-10-14: game hooks through a table, shared functions in the core, game profile (branch `feat/game-hooks`, not on main yet).** `runtime.c` walks `runtime_game.resolvers[]` (`port/src/runtime_game.h`) instead of naming games; `probe.c` uses `env_prefix`, `title_ids`, `init`, `patch_image`; `game_none.c` gives a core-only build; `build.sh`/CMake pick `src/game_<slug>.c` (`PORT_GAME`, `PORT_SLUG`, the only one, or none). Templates for the three ports in `port/games/` (tables with the old resolver order — verified offline against every import of the three `boot-linked.bin` —, profiles, migration patches). Event flags (`runtime_eventflag.c`) and the shared kernel/system contracts incl. ErrorDialog (`runtime_system.c`) moved into the core. Game profile loader `runtime_profile.c` (core < profile.ini < launcher/player < env; keys tsc, readbacks, eager_readback, write_merge, gc_budget_mb, block1d, skip_adjacency, pipeline_binaries, mouse_buttons, motion_button, stick_deadzone, `[env]`, `[settings]`); `TLG_TSC=auto` counts rdtsc in the eboot and logs the choice; per-game mouse buttons (`TLG_MOUSE_BUTTONS`). New tests: profile-test, eventflag-test, mouse defaults in pad-map-test; core-only `build.sh --test` passes.
 
 **2026-10-14: sync with infamous_pc `fd78ad5` (PRs #5, #6).** Eager GPU readback (`TLG_EAGER_READBACK=1`, off in the core, on by default in inFAMOUS): at fence packets the GPU copies the buffers the game reads back, and the next read fault is served from that copy without waiting (`c5dd761`); `TLG_READBACK_STATS=1`. Stale-copy fix (`f4c30a1`): CPU writes merged without a fault (`TLG_WRITE_MERGE`) and their upload mark the eager copies of those pages stale (a stale copy used to overwrite the game's new bytes: objects vanished); no eager copy is served after an image readback of the range. Per-game env prefix made generic: `alias_port_environment()` copies `<PREFIX>X` to `TLG_X`, prefix from the port (`PORT_ENV_PREFIX="ISS_"` in `port/packaging/port.env`, passed by `build.sh` as `-DPORT_ENV_PREFIX`; none = no alias) — infamous_pc must add that line to its `port.env`. TSC default back to the host rdtsc (`TLG_TSC=process` opts in; inFAMOUS executes rdtsc itself). `session_chart.py` uncapped mode. Test stubs: `tlggpu_overlay_notice` (pad tests), `runtime_report` (GPU tests). Verified in an infamous_pc `fd78ad5` worktree: `build.sh` and `build.sh --test` pass; `camera-motion-test`/`postfx-test` segfault in `Vulkan::CreateInstance`, same as on inFAMOUS main (pre-existing). The rest of PR #6 is the upstream sync already here; all core-side work (SMAA/CAS, mouse, presenter, `TLG_SKIP_ADJACENCY`) kept.
 

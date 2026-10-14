@@ -54,6 +54,20 @@ uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *n
 uintptr_t runtime_kernel_resolve(const char *name);
 uintptr_t runtime_file_resolve(const char *name);
 uintptr_t runtime_services_resolve(const char *name);
+/* Event flags and the small system queries every game needs (moved out of runtime_tlg.c and
+ * runtime_gr2.c). */
+uintptr_t runtime_eventflag_resolve(const char *name);
+uintptr_t runtime_system_resolve(const char *name);
+/* Game profile (layer 2, runtime_profile.c): call once at the start of main, after the env
+ * prefix alias. Fills unset TLG_* variables from the profile's keys. */
+void runtime_profile_load(void);
+/* Path of the loaded profile, or NULL (also in TLG_PROFILE_LOADED for the GPU settings). */
+const char *runtime_profile_path(void);
+/* TLG_TSC=auto: counts rdtsc (0F 31) in the given code and sets TLG_TSC to host or process. */
+size_t runtime_count_rdtsc(const unsigned char *code, size_t size, size_t *raw);
+void runtime_profile_tsc_decide(size_t sites, size_t raw, size_t text_bytes);
+/* Transition only: the resolvers of the current game files, so that a port's game_<slug>.c and
+ * its runtime_<slug>*.c keep compiling. The core never calls them (runtime_game.h). */
 uintptr_t runtime_tlg_resolve(const char *name);
 uintptr_t runtime_gr2_resolve(const char *name);
 uintptr_t runtime_gr2_np_resolve(const char *name);

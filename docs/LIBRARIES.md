@@ -13,21 +13,15 @@ Who answers each system import of the game, in `runtime_resolve` order: core run
 
 | Game | System imports | Core runtime | Game files | of which another game's file | GPU layer | Missing |
 |---|---|---|---|---|---|---|
-| TLG | 391 | 228 | 38 | 0 | 125 | 0 |
-| GR2 | 678 | 283 | 284 | 24 | 111 | 0 |
-| ISS | 398 | 260 | 34 | 19 | 104 | 0 |
+| TLG | 391 | 254 | 12 | 0 | 125 | 0 |
+| GR2 | 678 | 313 | 254 | 0 | 111 | 0 |
+| ISS | 398 | 276 | 18 | 3 | 104 | 0 |
 
 "Another game's file": the import is answered by a `runtime_<other slug>*.c` the port carries (e.g. inFAMOUS using GR2's files). Those functions are shared in practice and are the first candidates to move into the core.
 
-<details><summary>GR2: 24 from another game's file</summary>
+<details><summary>ISS: 3 from another game's file</summary>
 
-`sceKernelInternalMemoryGetModuleSegmentInfo (runtime_tlg.c)`, `sceKernelConvertUtcToLocaltime (runtime_tlg.c)`, `sceKernelConvertLocaltimeToUtc (runtime_tlg.c)`, `pthread_equal (runtime_tlg.c)`, `sceKernelClearEventFlag (runtime_tlg.c)`, `sceKernelDeleteEventFlag (runtime_tlg.c)`, `sceKernelPollEventFlag (runtime_tlg.c)`, `sceKernelCreateEventFlag (runtime_tlg.c)`, `sceKernelSetEventFlag (runtime_tlg.c)`, `sceKernelWaitEventFlag (runtime_tlg.c)`, `sceLibcHeapGetTraceInfo (runtime_tlg.c)`, `sceKernelCancelEventFlag (runtime_tlg.c)`, `sceKernelGetModuleInfoForUnwind (runtime_tlg.c)`, `sceKernelGetCompiledSdkVersion (runtime_tlg.c)`, `sceKernelIsNeoMode (runtime_tlg.c)`, `scePlayGoDialogUpdateStatus (runtime_tlg.c)`, `sceKernelAvailableFlexibleMemorySize (runtime_tlg.c)`, `scePlayGoDialogInitialize (runtime_tlg.c)`, `sceDiscMap_7C980FFB0AA27E7A (runtime_tlg.c)`, `sceKernelGetdents (runtime_tlg.c)`, `scePlayGoDialogOpen (runtime_tlg.c)`, `scePlayGoDialogTerminate (runtime_tlg.c)`, `sincosf (runtime_tlg.c)`, `sceAudioOutSetMixLevelPadSpk (runtime_tlg.c)`
-
-</details>
-
-<details><summary>ISS: 19 from another game's file</summary>
-
-`sceKernelInternalMemoryGetModuleSegmentInfo (runtime_tlg.c)`, `sceKernelConvertUtcToLocaltime (runtime_tlg.c)`, `sceKernelConvertLocaltimeToUtc (runtime_tlg.c)`, `sceKernelDeleteEventFlag (runtime_tlg.c)`, `sceErrorDialogTerminate (runtime_gr2.c)`, `sceKernelCreateEventFlag (runtime_tlg.c)`, `sceErrorDialogInitialize (runtime_gr2.c)`, `sceKernelSetEventFlag (runtime_tlg.c)`, `sceKernelWaitEventFlag (runtime_tlg.c)`, `sceKernelGetPrtAperture (runtime_tlg.c)`, `sceErrorDialogOpen (runtime_gr2.c)`, `sceLibcHeapGetTraceInfo (runtime_tlg.c)`, `sceKernelGetModuleInfoForUnwind (runtime_tlg.c)`, `sceErrorDialogUpdateStatus (runtime_gr2.c)`, `sceKernelIsNeoMode (runtime_tlg.c)`, `sceHttpGetAllResponseHeaders (runtime_gr2_np.c)`, `sceDiscMap_7C980FFB0AA27E7A (runtime_tlg.c)`, `sceHttpSetSendTimeOut (runtime_gr2_np.c)`, `sceHttpSetRecvTimeOut (runtime_gr2_np.c)`
+`sceHttpGetAllResponseHeaders (runtime_gr2_np.c)`, `sceHttpSetSendTimeOut (runtime_gr2_np.c)`, `sceHttpSetRecvTimeOut (runtime_gr2_np.c)`
 
 </details>
 
@@ -35,8 +29,8 @@ Who answers each system import of the game, in `runtime_resolve` order: core run
 
 | Library | Files | Functions | Real | Stub | TLG | GR2 | ISS | Notes |
 |---|---|---|---|---|---|---|---|---|
+| `libkernel` | `equeue.cpp`, `runtime.c`, `runtime_eventflag.c`, `runtime_file.c`, `runtime_kernel.c`, `runtime_memory.c`, `runtime_mutex.c`, `runtime_rwlock.c`, `runtime_sema.c`, `runtime_system.c`, `runtime_thread.c`, `runtime_time.c` | 244 | 220 | 22 | 174 | 173 | 149 | Threads, mutexes/conds/rwlocks/semaphores, event flags, TLS, direct and flexible memory (host-owned low map), files through the /app0 and /savedata mounts, time. libScePosix imports resolve here (runtime.c canonical_name). The GPU side adds equeues, memory-pool and GPU-memory calls (shadPS4 kernel/). |
 | `libSceGnmDriver` | `gnmdriver.cpp` | 238 | 61 | 177 | 110 | 81 | 85 | All in the GPU layer (shadPS4 gnmdriver): command buffers are translated to Vulkan by the shadPS4 fork. |
-| `libkernel` | `equeue.cpp`, `runtime.c`, `runtime_file.c`, `runtime_kernel.c`, `runtime_memory.c`, `runtime_mutex.c`, `runtime_rwlock.c`, `runtime_sema.c`, `runtime_thread.c`, `runtime_time.c` | 227 | 206 | 19 | 158 | 157 | 139 | Threads, mutexes/conds/rwlocks/semaphores, event flags, TLS, direct and flexible memory (host-owned low map), files through the /app0 and /savedata mounts, time. libScePosix imports resolve here (runtime.c canonical_name). The GPU side adds equeues, memory-pool and GPU-memory calls (shadPS4 kernel/). |
 | `libSceNet` | `runtime_services.c` | 35 | 6 | 29 | 23 | 26 | 30 | Offline: pools/epolls/resolvers are created, every socket call fails with ENETUNREACH. |
 | `libSceVideoOut` | `video_out.cpp` | 30 | 29 | 1 | 10 | 6 | 13 | GPU layer (shadPS4 videoout + presenter): flip queue, buffers, vblank events; presented through SDL3/Vulkan with the upscaler and post-processing. |
 | `libSceNpMatching2` | `runtime_services.c` | 27 | 0 | 27 | · | · | · |  |
@@ -53,16 +47,18 @@ Who answers each system import of the game, in `runtime_resolve` order: core run
 | `libSceVoice` | `runtime_services.c` | 11 | 3 | 8 | · | · | · |  |
 | `libSceNpTrophy` | `runtime_services.c` | 10 | 9 | 1 | 5 | · | 7 | Offline (game-side tables in the ports for now). |
 | `libScePlayGo` | `runtime_services.c` | 10 | 9 | 1 | 5 | 6 | 7 |  |
+| `libSceAudioOut` | `runtime_audio.c`, `runtime_system.c` | 9 | 8 | 1 | 7 | 7 | 6 | SDL3 audio streams per port; 3D audio for GR2 lives in runtime_gr2_audio3d.c. |
 | `libSceSaveDataDialog` | `runtime_services.c` | 9 | 8 | 1 | · | 8 | 5 |  |
-| `libSceAudioOut` | `runtime_audio.c` | 8 | 8 | 0 | 6 | 6 | 6 | SDL3 audio streams per port; 3D audio for GR2 lives in runtime_gr2_audio3d.c. |
 | `libSceGnmDriverResourceRegistration` | `gnmdriver.cpp` | 8 | 0 | 8 | · | · | · |  |
 | `libSceMsgDialog` | `runtime_services.c` | 8 | 8 | 0 | · | 6 | 3 |  |
+| `libSceSystemService` | `runtime_services.c`, `runtime_system.c` | 8 | 5 | 3 | 4 | 4 | 5 | Params (language from the launcher, button assign...), status, events, splash screen. |
 | `libSceNpSignaling` | `runtime_services.c` | 7 | 0 | 7 | · | · | · |  |
 | `libSceNpUtility` | `runtime_services.c` | 7 | 1 | 6 | · | · | · |  |
-| `libSceSystemService` | `runtime_services.c` | 7 | 4 | 3 | 3 | 4 | 5 | Params (language from the launcher, button assign...), status, events, splash screen. |
 | `libSceNetCtl` | `runtime_services.c` | 6 | 3 | 3 | 2 | · | 4 | Always disconnected. |
+| `libScePlayGoDialog` | `runtime_system.c` | 6 | 2 | 4 | 5 | 5 | · |  |
 | `libSceUserService` | `runtime_services.c` | 6 | 5 | 1 | 2 | 6 | 5 | One local user (id 1, name from the launcher). |
 | `libSceVideodec` | `runtime_videodec.c` | 6 | 6 | 0 | · | · | 6 | H.264 through FFmpeg (libavcodec). |
+| `libSceErrorDialog` | `runtime_system.c` | 5 | 1 | 4 | · | 5 | 4 |  |
 | `libSceImeDialog` | `runtime_services.c` | 5 | 5 | 0 | · | · | · |  |
 | `libSceNpProfileDialog` | `runtime_services.c` | 5 | 5 | 0 | · | · | · |  |
 | `libSceMouse` | `runtime_services.c` | 4 | 1 | 3 | · | · | · |  |
@@ -70,17 +66,18 @@ Who answers each system import of the game, in `runtime_resolve` order: core run
 | `libSceNpCommerce` | `runtime_services.c` | 4 | 4 | 0 | · | · | · |  |
 | `libSceAppContent` | `runtime_content.c` | 3 | 3 | 0 | 2 | 3 | 1 | Boot params and an empty add-on list. |
 | `libSceAudioIn` | `runtime_services.c` | 3 | 0 | 3 | · | · | · |  |
+| `libSceDiscMap` | `runtime_services.c`, `runtime_system.c` | 3 | 0 | 3 | 2 | 2 | 2 |  |
 | `libSceSysmodule` | `runtime_content.c` | 3 | 3 | 0 | 2 | 2 | 2 | Load/unload report success; the modules are the core itself. |
-| `libSceDiscMap` | `runtime_services.c` | 2 | 0 | 2 | 1 | 1 | 1 |  |
 | `libSceGnmDebugReset` | `gnmdriver.cpp` | 2 | 0 | 2 | · | · | · |  |
 | `libSceGnmDriverCompat` | `gnmdriver.cpp` | 2 | 2 | 0 | · | · | · |  |
 | `libSceGnmWaitFreeSubmit` | `gnmdriver.cpp` | 2 | 0 | 2 | · | · | · |  |
+| `libSceLibcInternal` | `runtime.c`, `runtime_system.c` | 2 | 1 | 0 | 2 | 2 | 1 |  |
 | `libSceNpCommon` | `runtime_services.c` | 2 | 2 | 0 | · | 1 | · |  |
 | `libSceSsl` | `runtime_services.c` | 2 | 0 | 2 | · | 2 | 2 | Init/term only. |
 | `libSceCommonDialog` | `runtime_services.c` | 1 | 0 | 1 | 1 | 1 | 1 |  |
 | `libSceGnmDebugModuleReset` | `gnmdriver.cpp` | 1 | 0 | 1 | · | · | · |  |
 | `libSceGnmGetGpuCoreClockFrequency` | `gnmdriver.cpp` | 1 | 1 | 0 | · | · | · |  |
-| `libSceLibcInternal` | `runtime.c` | 1 | 0 | 0 | 1 | 1 | 1 |  |
+| `libSceLibcInternalExt` | `runtime_system.c` | 1 | 1 | 0 | 1 | 1 | 1 |  |
 
 ### Nomes fora do `import_names.inc` / Names missing from `import_names.inc`
 
@@ -136,7 +133,7 @@ Kind: **real** = implemented; *stub* = offline/fixed result; data = a variable; 
 
 </details>
 
-<details><summary><code>libSceAudioOut</code> — 8</summary>
+<details><summary><code>libSceAudioOut</code> — 9</summary>
 
 | Function | NID | Kind | Implemented in | Games |
 |---|---|---|---|---|
@@ -147,6 +144,7 @@ Kind: **real** = implemented; *stub* = offline/fixed result; data = a variable; 
 | `sceAudioOutOpen` | `ekNvsT22rsY` | **real** | `port/src/runtime_audio.c` (`audio_open`) | TLG GR2 ISS |
 | `sceAudioOutOutput` | `QOQtbeDqsT4` | **real** | `port/src/runtime_audio.c` (`audio_output`) | TLG GR2 ISS |
 | `sceAudioOutOutputs` | `w3PdaSTSwGE` | **real** | `port/src/runtime_audio.c` (`audio_outputs`) | TLG GR2 ISS |
+| `sceAudioOutSetMixLevelPadSpk` | `wVwPU50pS1c` | *stub* | `port/src/runtime_system.c` (`pad_speaker_mix`) | TLG GR2 |
 | `sceAudioOutSetVolume` | `b+uAV89IlxE` | **real** | `port/src/runtime_audio.c` (`audio_volume`) | ISS |
 
 </details>
@@ -192,12 +190,25 @@ Kind: **real** = implemented; *stub* = offline/fixed result; data = a variable; 
 
 </details>
 
-<details><summary><code>libSceDiscMap</code> — 2</summary>
+<details><summary><code>libSceDiscMap</code> — 3</summary>
 
 | Function | NID | Kind | Implemented in | Games |
 |---|---|---|---|---|
 | `sceDiscMapIsRequestOnHDD` | `lbQKqsERhtE` | *stub* | `port/src/runtime_services.c` (`discmap_on_hdd`) | TLG GR2 ISS |
+| `sceDiscMap_7C980FFB0AA27E7A` | `fJgP+wqifno` | *stub* | `port/src/runtime_system.c` (`discmap_7c98`) | TLG GR2 ISS |
 | `sceDiscMap_8A828CAEE7EDD5E9` | `ioKMruft1ek` | *stub* | `port/src/runtime_services.c` (`discmap_8a82`) |  |
+
+</details>
+
+<details><summary><code>libSceErrorDialog</code> — 5</summary>
+
+| Function | NID | Kind | Implemented in | Games |
+|---|---|---|---|---|
+| `sceErrorDialogGetStatus` | `t2FvHRXzgqk` | *stub* | `port/src/runtime_system.c` (`error_dialog_status_get`) | GR2 |
+| `sceErrorDialogInitialize` | `I88KChlynSs` | *stub* | `port/src/runtime_system.c` (`error_dialog_init`) | GR2 ISS |
+| `sceErrorDialogOpen` | `M2ZF-ClLhgY` | **real** | `port/src/runtime_system.c` (`error_dialog_open`) | GR2 ISS |
+| `sceErrorDialogTerminate` | `9XAxK2PMwk8` | *stub* | `port/src/runtime_system.c` (`error_dialog_term`) | GR2 ISS |
+| `sceErrorDialogUpdateStatus` | `WWiGuh9XfgQ` | *stub* | `port/src/runtime_system.c` (`error_dialog_status_get`) | GR2 ISS |
 
 </details>
 
@@ -547,11 +558,20 @@ Kind: **real** = implemented; *stub* = offline/fixed result; data = a variable; 
 
 </details>
 
-<details><summary><code>libSceLibcInternal</code> — 1</summary>
+<details><summary><code>libSceLibcInternal</code> — 2</summary>
 
 | Function | NID | Kind | Implemented in | Games |
 |---|---|---|---|---|
 | `Need_sceLibcInternal` | `ZT4ODD2Ts9o` | data | `port/src/runtime.c` (`need_libc_internal`) | TLG GR2 ISS |
+| `sincosf` | `pztV4AF18iI` | **real** | `port/src/runtime_system.c` (`guest_sincosf`) | TLG GR2 |
+
+</details>
+
+<details><summary><code>libSceLibcInternalExt</code> — 1</summary>
+
+| Function | NID | Kind | Implemented in | Games |
+|---|---|---|---|---|
+| `sceLibcHeapGetTraceInfo` | `NWtTN10cJzE` | **real** | `port/src/runtime_system.c` (`libc_heap_trace_info`) | TLG GR2 ISS |
 
 </details>
 
@@ -867,6 +887,19 @@ Kind: **real** = implemented; *stub* = offline/fixed result; data = a variable; 
 
 </details>
 
+<details><summary><code>libScePlayGoDialog</code> — 6</summary>
+
+| Function | NID | Kind | Implemented in | Games |
+|---|---|---|---|---|
+| `scePlayGoDialogClose` | `fbigNQiZpm0` | *stub* | `port/src/runtime_system.c` (`playgo_dialog_close`) | GR2 |
+| `scePlayGoDialogGetResult` | `wx9TDplJKB4` | **real** | `port/src/runtime_system.c` (`playgo_dialog_result`) | TLG |
+| `scePlayGoDialogInitialize` | `fECamTJKpsM` | *stub* | `port/src/runtime_system.c` (`playgo_dialog_init`) | TLG GR2 |
+| `scePlayGoDialogOpen` | `kHd72ukqbxw` | **real** | `port/src/runtime_system.c` (`playgo_dialog_open`) | TLG GR2 |
+| `scePlayGoDialogTerminate` | `okgIGdr5Iz0` | *stub* | `port/src/runtime_system.c` (`playgo_dialog_term`) | TLG GR2 |
+| `scePlayGoDialogUpdateStatus` | `Yb60K7BST48` | *stub* | `port/src/runtime_system.c` (`playgo_dialog_status`) | TLG GR2 |
+
+</details>
+
 <details><summary><code>libSceRtc</code> — 21</summary>
 
 | Function | NID | Kind | Implemented in | Games |
@@ -955,7 +988,7 @@ Kind: **real** = implemented; *stub* = offline/fixed result; data = a variable; 
 
 </details>
 
-<details><summary><code>libSceSystemService</code> — 7</summary>
+<details><summary><code>libSceSystemService</code> — 8</summary>
 
 | Function | NID | Kind | Implemented in | Games |
 |---|---|---|---|---|
@@ -964,6 +997,7 @@ Kind: **real** = implemented; *stub* = offline/fixed result; data = a variable; 
 | `sceSystemServiceGetStatus` | `rPo6tV8D9bM` | **real** | `port/src/runtime_services.c` (`system_status`) | TLG GR2 ISS |
 | `sceSystemServiceHideSplashScreen` | `Vo5V8KAwCmk` | *stub* | `port/src/runtime_services.c` (`hide_splash`) | TLG GR2 ISS |
 | `sceSystemServiceLaunchWebBrowser` | `-+3hY+y8bNo` | **real** | `port/src/runtime_services.c` (`launch_browser`) |  |
+| `sceSystemServiceLoadExec` | `JoBqSQt1yyA` | **real** | `port/src/runtime_system.c` (`load_exec`) | TLG |
 | `sceSystemServiceParamGetInt` | `fZo48un7LK4` | **real** | `port/src/runtime_services.c` (`system_param`) | TLG GR2 ISS |
 | `sceSystemServiceReceiveEvent` | `656LMQSrg6U` | *stub* | `port/src/runtime_services.c` (`system_event`) | GR2 ISS |
 
@@ -1071,7 +1105,7 @@ Kind: **real** = implemented; *stub* = offline/fixed result; data = a variable; 
 
 </details>
 
-<details><summary><code>libkernel</code> — 227</summary>
+<details><summary><code>libkernel</code> — 244</summary>
 
 | Function | NID | Kind | Implemented in | Games |
 |---|---|---|---|---|
@@ -1130,6 +1164,7 @@ Kind: **real** = implemented; *stub* = offline/fixed result; data = a variable; 
 | `pthread_cond_wait` | `Op8TBGY5KHg` | **real** | `port/src/runtime_mutex.c` (`posix_cond_wait`) |  |
 | `pthread_create` | `OxhIB8LB-PQ` | **real** | `port/src/runtime_thread.c` (`posix_create`) |  |
 | `pthread_create_name_np` | `Jmi+9w9u0E4` | **real** | `port/src/runtime_thread.c` (`posix_create_name`) | TLG GR2 ISS |
+| `pthread_equal` | `7Xl257M4VNI` | *stub* | `port/src/runtime_system.c` (`posix_pthread_equal`) | TLG GR2 |
 | `pthread_exit` | `FJrT5LuUBAU` | **real** | `port/src/runtime_thread.c` (`thread_exit`) |  |
 | `pthread_getspecific` | `0-KXaS70xy4` | **real** | `port/src/runtime_kernel.c` (`key_get`) |  |
 | `pthread_join` | `h9CcP3J0oVM` | **real** | `port/src/runtime_thread.c` (`posix_join`) | TLG GR2 ISS |
@@ -1152,30 +1187,43 @@ Kind: **real** = implemented; *stub* = offline/fixed result; data = a variable; 
 | `rmdir` | `c7ZnT7V1B98` | **real** | `port/src/runtime_file.c` (`posix_rmdir`) | TLG |
 | `sceKernelAllocateDirectMemory` | `rTXw65xmLIA` | **real** | `port/src/runtime_memory.c` (`direct_allocate`) | TLG GR2 ISS |
 | `sceKernelAllocateDirectMemory` | `rTXw65xmLIA` | **real** | `port/src/runtime_memory.c` (`direct_allocate`) | TLG GR2 ISS |
+| `sceKernelAvailableFlexibleMemorySize` | `aNz11fnnzi4` | **real** | `port/src/runtime_system.c` (`available_flexible_memory`) | TLG GR2 |
 | `sceKernelBatchMap` | `2SKEx6bSq-4` | **real** | `port/src/runtime_memory.c` (`batch_map`) |  |
 | `sceKernelBatchMap2` | `kBJzF8x4SyE` | **real** | `port/src/runtime_memory.c` (`batch_map2`) |  |
+| `sceKernelCancelEventFlag` | `PZku4ZrXJqg` | **real** | `port/src/runtime_eventflag.c` (`ef_cancel`) | GR2 |
 | `sceKernelCheckReachability` | `uWyW3v98sU4` | **real** | `port/src/runtime_file.c` (`sce_check_reachability`) |  |
+| `sceKernelClearEventFlag` | `7uhBFWRAS60` | **real** | `port/src/runtime_eventflag.c` (`ef_clear`) | TLG GR2 |
 | `sceKernelClockGettime` | `QBi7HCK03hw` | **real** | `port/src/runtime_kernel.c` (`kernel_clock_gettime`) | TLG GR2 ISS |
 | `sceKernelClose` | `UK2Tl2DWUns` | **real** | `port/src/runtime_file.c` (`sce_close`) | TLG GR2 ISS |
+| `sceKernelConvertLocaltimeToUtc` | `0NTHN1NKONI` | **real** | `port/src/runtime_system.c` (`local_to_utc`) | TLG GR2 ISS |
+| `sceKernelConvertUtcToLocaltime` | `-o5uEDpN+oY` | **real** | `port/src/runtime_system.c` (`utc_to_local`) | TLG GR2 ISS |
+| `sceKernelCreateEventFlag` | `BpFoboUJoZU` | **real** | `port/src/runtime_eventflag.c` (`ef_create`) | TLG GR2 ISS |
 | `sceKernelCreateSema` | `188x57JYp0g` | **real** | `port/src/runtime_sema.c` (`sem_create`) | TLG GR2 ISS |
 | `sceKernelDebugRaiseException` | `OMDRKKAZ8I4` | **real** | `port/src/runtime_kernel.c` (`raise_exception`) | TLG GR2 ISS |
 | `sceKernelDebugRaiseExceptionOnReleaseMode` | `zE-wXIZjLoM` | **real** | `port/src/runtime_kernel.c` (`raise_exception`) | TLG GR2 ISS |
+| `sceKernelDeleteEventFlag` | `8mql9OcQnd4` | **real** | `port/src/runtime_eventflag.c` (`ef_delete`) | TLG GR2 ISS |
 | `sceKernelDeleteSema` | `R1Jvn8bSCW8` | **real** | `port/src/runtime_sema.c` (`sem_delete`) | TLG GR2 ISS |
 | `sceKernelFstat` | `kBwCPsYX-m4` | **real** | `port/src/runtime_file.c` (`sce_fstat`) | TLG GR2 ISS |
 | `sceKernelFsync` | `fTx66l5iWIA` | **real** | `port/src/runtime_file.c` (`sce_fsync`) | TLG GR2 ISS |
 | `sceKernelFtruncate` | `VW3TVZiM4-E` | **real** | `port/src/runtime_file.c` (`sce_ftruncate`) | TLG GR2 ISS |
+| `sceKernelGetCompiledSdkVersion` | `WB66evu8bsU` | **real** | `port/src/runtime_system.c` (`compiled_sdk_version`) | TLG GR2 |
 | `sceKernelGetDirectMemorySize` | `pO96TwzOm5E` | *stub* | `port/src/runtime_memory.c` (`direct_size`) | TLG GR2 ISS |
 | `sceKernelGetDirectMemorySize` | `pO96TwzOm5E` | *stub* | `port/src/runtime_memory.c` (`direct_size`) | TLG GR2 ISS |
 | `sceKernelGetDirectMemoryType` | `BC+OG5m9+bw` | **real** | `port/src/runtime_memory.c` (`direct_memory_type`) |  |
+| `sceKernelGetModuleInfoForUnwind` | `RpQJJVKTiFM` | *stub* | `port/src/runtime_system.c` (`module_info_for_unwind`) | TLG GR2 ISS |
 | `sceKernelGetModuleInfoFromAddr` | `f7KBOafysXo` | **real** | `port/src/runtime_kernel.c` (`module_info_from_addr`) | TLG GR2 ISS |
 | `sceKernelGetProcParam` | `959qrazPIrg` | *stub* | `port/src/runtime.c` (`guest_procparam`) | TLG GR2 ISS |
 | `sceKernelGetProcessTime` | `4J2sUJmuHZQ` | **real** | `port/src/runtime_kernel.c` (`process_time`) | TLG GR2 ISS |
 | `sceKernelGetProcessTimeCounter` | `fgxnMeTNUtY` | **real** | `port/src/runtime_kernel.c` (`process_time_counter`) | TLG GR2 |
 | `sceKernelGetProcessTimeCounterFrequency` | `BNowx2l588E` | *stub* | `port/src/runtime_kernel.c` (`process_time_frequency`) | TLG GR2 |
+| `sceKernelGetPrtAperture` | `L0v2Go5jOuM` | **real** | `port/src/runtime_system.c` (`prt_aperture`) | TLG ISS |
 | `sceKernelGetTscFrequency` | `1j3S3n-tTW4` | **real** | `port/src/runtime_kernel.c` (`tsc_frequency`) | TLG GR2 ISS |
+| `sceKernelGetdents` | `j2AIqSqJP0w` | **real** | `port/src/runtime_system.c` (`getdents`) | TLG GR2 |
 | `sceKernelGetdirentries` | `taRWhTJFTgE` | **real** | `port/src/runtime_file.c` (`sce_getdents`) | TLG GR2 ISS |
 | `sceKernelGettimeofday` | `ejekcaNQNq0` | **real** | `port/src/runtime_kernel.c` (`kernel_gettimeofday`) | TLG GR2 ISS |
 | `sceKernelGettimezone` | `kOcnerypnQA` | **real** | `port/src/runtime_kernel.c` (`kernel_gettimezone`) |  |
+| `sceKernelInternalMemoryGetModuleSegmentInfo` | `-YTW+qXc3CQ` | **real** | `port/src/runtime_system.c` (`module_segment_info`) | TLG GR2 ISS |
+| `sceKernelIsNeoMode` | `WslcK1FQcGI` | *stub* | `port/src/runtime_system.c` (`is_neo_mode`) | TLG GR2 ISS |
 | `sceKernelLseek` | `oib76F-12fk` | **real** | `port/src/runtime_file.c` (`sce_lseek`) | TLG GR2 ISS |
 | `sceKernelMapDirectMemory` | `L-Q3LEjIbgA` | **real** | `port/src/runtime_memory.c` (`direct_map`) | TLG GR2 ISS |
 | `sceKernelMapDirectMemory` | `L-Q3LEjIbgA` | **real** | `port/src/runtime_memory.c` (`direct_map`) | TLG GR2 ISS |
@@ -1189,6 +1237,7 @@ Kind: **real** = implemented; *stub* = offline/fixed result; data = a variable; 
 | `sceKernelMunmap` | `cQke9UuBQOk` | **real** | `port/src/runtime_memory.c` (`direct_unmap`) | TLG GR2 ISS |
 | `sceKernelNanosleep` | `QvsZxomvUHs` | **real** | `port/src/runtime_kernel.c` (`kernel_nanosleep`) |  |
 | `sceKernelOpen` | `1G3lF1Gg1k8` | **real** | `port/src/runtime_file.c` (`sce_open`) | TLG GR2 ISS |
+| `sceKernelPollEventFlag` | `9lvj5DjHZiA` | **real** | `port/src/runtime_eventflag.c` (`ef_poll`) | TLG GR2 |
 | `sceKernelPollSema` | `12wOHk8ywb0` | **real** | `port/src/runtime_sema.c` (`sem_poll`) | TLG GR2 |
 | `sceKernelPread` | `+r3rMFwItV4` | **real** | `port/src/runtime_file.c` (`sce_pread`) | TLG GR2 ISS |
 | `sceKernelPrintBacktraceWithModuleInfo` | `Wl2o5hOVZdw` | **real** | `port/src/runtime_kernel.c` (`print_backtrace`) | TLG GR2 ISS |
@@ -1202,6 +1251,7 @@ Kind: **real** = implemented; *stub* = offline/fixed result; data = a variable; 
 | `sceKernelRename` | `52NcYU9+lEo` | **real** | `port/src/runtime_file.c` (`sce_rename`) | TLG GR2 ISS |
 | `sceKernelReserveVirtualRange` | `7oxv3PPCumo` | **real** | `port/src/runtime_memory.c` (`reserve_range`) |  |
 | `sceKernelRmdir` | `naInUjYt3so` | **real** | `port/src/runtime_file.c` (`sce_rmdir`) | TLG GR2 ISS |
+| `sceKernelSetEventFlag` | `IOnSvHzqu6A` | **real** | `port/src/runtime_eventflag.c` (`ef_set`) | TLG GR2 ISS |
 | `sceKernelSignalSema` | `4czppHBiriw` | **real** | `port/src/runtime_sema.c` (`sem_signal`) | TLG GR2 ISS |
 | `sceKernelStat` | `eV9wAD2riIA` | **real** | `port/src/runtime_file.c` (`sce_stat`) | TLG GR2 ISS |
 | `sceKernelStopUnloadModule` | `QKd0qM58Qes` | **real** | `port/src/runtime_kernel.c` (`stop_unload_module`) | GR2 |
@@ -1209,6 +1259,7 @@ Kind: **real** = implemented; *stub* = offline/fixed result; data = a variable; 
 | `sceKernelUnlink` | `AUXVxWeJU-A` | **real** | `port/src/runtime_file.c` (`sce_unlink`) | TLG GR2 ISS |
 | `sceKernelUsleep` | `1jfXLRVzisc` | **real** | `port/src/runtime_kernel.c` (`kernel_usleep`) | TLG GR2 ISS |
 | `sceKernelVirtualQuery` | `rVjRvHJ0X6c` | **real** | `port/src/runtime_memory.c` (`virtual_query`) |  |
+| `sceKernelWaitEventFlag` | `JTvBflhYazQ` | **real** | `port/src/runtime_eventflag.c` (`ef_wait`) | TLG GR2 ISS |
 | `sceKernelWaitSema` | `Zxa0VhQVTsk` | **real** | `port/src/runtime_sema.c` (`sem_wait`) | TLG GR2 ISS |
 | `sceKernelWrite` | `4wSze92BhLI` | **real** | `port/src/runtime_file.c` (`sce_write`) | TLG GR2 ISS |
 | `scePthreadAttrDestroy` | `62KCwEMmzcM` | **real** | `port/src/runtime_thread.c` (`attr_destroy`) | TLG GR2 ISS |

@@ -11,6 +11,27 @@ if [[ -z ${PORT_ENV_PREFIX+x} && -f packaging/port.env ]]; then
 fi
 env_prefix=()
 if [[ -n ${PORT_ENV_PREFIX:-} ]]; then env_prefix=("-DPORT_ENV_PREFIX=\"$PORT_ENV_PREFIX\""); fi
+# The game's hook table (src/runtime_game.h): PORT_GAME=<slug>, else PORT_SLUG from
+# packaging/port.env when src/game_<slug>.c exists, else the only src/game_*.c besides
+# game_none.c, else src/game_none.c (core-only build: no game hooks).
+port_game=${PORT_GAME:-}
+if [[ -z $port_game && -f packaging/port.env ]]; then
+    slug=$(sed -n 's/^PORT_SLUG="\([A-Za-z0-9_]*\)".*/\1/p' packaging/port.env)
+    if [[ -n $slug && -f src/game_$slug.c ]]; then port_game=$slug; fi
+fi
+if [[ -z $port_game ]]; then
+    candidates=()
+    for source in src/game_*.c; do
+        if [[ -e $source && $source != src/game_none.c ]]; then candidates+=("$source"); fi
+    done
+    if (( ${#candidates[@]} > 1 )); then
+        echo "Several game tables (${candidates[*]}): set PORT_GAME=<slug> or PORT_SLUG in packaging/port.env." >&2; exit 1
+    fi
+    if (( ${#candidates[@]} == 1 )); then port_game=$(basename "${candidates[0]}" .c); port_game=${port_game#game_}; fi
+fi
+port_game=${port_game:-none}
+if [[ ! -f src/game_$port_game.c ]]; then echo "No src/game_$port_game.c (PORT_GAME)." >&2; exit 1; fi
+echo "Game hooks: src/game_$port_game.c"
 case $(uname -s) in
 MINGW*|MSYS*)
     # shellcheck source=msys2-env.sh
@@ -29,7 +50,7 @@ MINGW*|MSYS*)
     done
     cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DTLG_PGO=off \
         -DTLG_LTO="${TLG_LTO:-OFF}" -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
-        -DPORT_ENV_PREFIX="${PORT_ENV_PREFIX:-}" >/dev/null
+        -DPORT_ENV_PREFIX="${PORT_ENV_PREFIX:-}" -DPORT_GAME="$port_game" >/dev/null
     echo "GPU library and loader: LTO ${TLG_LTO:-OFF}"
     if ! ninja -C out/gpu tlg-probe tlg-gpu-capabilities tlg-play > out/gpu-build.log 2>&1; then
         grep -v '^\[' out/gpu-build.log | tail -40 >&2
@@ -91,7 +112,7 @@ if ! ninja -C out/gpu tlggpu > out/gpu-build.log 2>&1; then
 fi
 # $ORIGIN/gpu: packaged copies keep the library next to the binary without patching it.
 gpu=(-Lout/gpu -ltlggpu -Wl,-rpath,'$ORIGIN/gpu' -Wl,-rpath,"$PWD/out/gpu" -rdynamic)
-runtime=(src/runtime*.c)
+runtime=(src/runtime*.c "src/game_$port_game.c")
 # Third-party decoders: compiled once, without this project's -Werror policy.
 atrac9=(third_party/LibAtrac9/C/src/*.c)
 if [[ ! -f out/libatrac9.a || -n $(find third_party/LibAtrac9/C/src -newer out/libatrac9.a -name '*.c') ]]; then
@@ -126,6 +147,10 @@ if [[ ${1:-} == --test ]]; then
     out/videodec-test tests/data/tiny.h264
     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I. -Isrc tests/test_services.c -o out/services-test
     out/services-test
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I. -Isrc tests/test_profile.c src/runtime_profile.c src/game_none.c -o out/profile-test
+    out/profile-test
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I. -Isrc tests/test_eventflag.c src/runtime_eventflag.c src/runtime_system.c -lm -o out/eventflag-test
+    out/eventflag-test
     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -mbmi -mlzcnt -mmovbe -I. -Isrc tests/test_isa_emulate.c out/isa_emulate.o -o out/isa-emulate-test
     out/isa-emulate-test
     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -c src/isa_rewrite.c -I. -Isrc -o out/isa_rewrite.o

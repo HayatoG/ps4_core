@@ -6,6 +6,7 @@
 #include <string.h>
 #include <inttypes.h>
 #include "runtime.h"
+#include "runtime_game.h"
 #include "cpu_check.h"
 #include "isa_rewrite.h"
 #include "orb_hook.h"
@@ -40,6 +41,7 @@ static size_t page_size;
 typedef struct { uint64_t base, size, init, tls_address, tls_memsz, tls_filesz, tls_module; } LinkedModule;
 static LinkedModule modules[16];
 static uint64_t module_count;
+static char game_title_id[16]; /* param.sfo TITLE_ID (--app0), for runtime_game */
 static int entered_game;
 static int gpu_enabled;
 static unsigned cpu_missing_sets; /* CPU_SET_* the host lacks; the guest code needs them rewritten */
@@ -729,18 +731,22 @@ static int cpu_supported(char *missing, size_t size) {
 }
 
 /* Per-game environment prefix. The core still reads TLG_* (one shared prefix, PSCORE_, once every
- * port uses ps4_core), so a port that builds with -DPORT_ENV_PREFIX="ISS_" (inFAMOUS; "GR2_" for
- * Gravity Rush 2) gets each ISS_X copied to TLG_X at start, unless TLG_X is set too. Without the
- * define (The Last Guardian, a core-only build) or with "TLG_" there is nothing to alias. */
-#ifdef PORT_ENV_PREFIX
+ * port uses ps4_core), so each <prefix>X (ISS_X for inFAMOUS) is copied to TLG_X at start, unless
+ * TLG_X is set too. The prefix is -DPORT_ENV_PREFIX (packaging/port.env) when the build has one,
+ * otherwise runtime_game.env_prefix (src/game_<slug>.c). None, or "TLG_": nothing to alias. */
 #ifdef _WIN32
 #define environ _environ
 #else
 extern char **environ;
 #endif
 static void alias_port_environment(void) {
-    const size_t prefix = strlen(PORT_ENV_PREFIX);
-    if (!prefix || !strcmp(PORT_ENV_PREFIX, "TLG_")) return;
+#ifdef PORT_ENV_PREFIX
+    const char *port_prefix = PORT_ENV_PREFIX[0] ? PORT_ENV_PREFIX : runtime_game.env_prefix;
+#else
+    const char *port_prefix = runtime_game.env_prefix;
+#endif
+    const size_t prefix = port_prefix ? strlen(port_prefix) : 0;
+    if (!prefix || !strcmp(port_prefix, "TLG_")) return;
     size_t count = 0;
     while (environ && environ[count]) ++count;
     char **copy = calloc(count + 1, sizeof(*copy)); /* setenv may reallocate environ */
@@ -748,7 +754,7 @@ static void alias_port_environment(void) {
     for (size_t i = 0; i < count; ++i) copy[i] = strdup(environ[i]);
     for (size_t i = 0; i < count; ++i) {
         char *entry = copy[i], *equals = entry ? strchr(entry, '=') : NULL;
-        if (!equals || strncmp(entry, PORT_ENV_PREFIX, prefix) || equals == entry + prefix) continue;
+        if (!equals || strncmp(entry, port_prefix, prefix) || equals == entry + prefix) continue;
         char name[256];
         const size_t length = (size_t)(equals - entry - prefix);
         if (length + 5 > sizeof(name)) continue;
@@ -765,13 +771,33 @@ static void alias_port_environment(void) {
     for (size_t i = 0; i < count; ++i) free(copy[i]);
     free(copy);
 }
-#else
-static void alias_port_environment(void) {}
-#endif
+
+/* TLG_TSC=auto (profile tsc=auto): count rdtsc in the eboot's executable segments, i.e. the ones
+ * outside the linked modules (libc, Fios2...; all of them for an unlinked boot.bin). */
+static void decide_tsc(const unsigned char *base, const Segment *segments, uint64_t ns) {
+    const char *mode = getenv("TLG_TSC");
+    if (!mode || strcmp(mode, "auto")) return;
+    size_t sites = 0, raw = 0, bytes = 0;
+    for (int pass = 0; pass < 2 && !bytes; ++pass) {
+        for (uint64_t i = 0; i < ns; ++i) {
+            if (!(segments[i].flags & 1)) continue;
+            int in_module = 0;
+            for (uint64_t m = 0; pass == 0 && m < module_count; ++m)
+                if (segments[i].address >= modules[m].base && segments[i].address - modules[m].base < modules[m].size) in_module = 1;
+            if (in_module) continue;
+            size_t segment_raw = 0;
+            sites += runtime_count_rdtsc(base + segments[i].address, segments[i].size, &segment_raw);
+            raw += segment_raw;
+            bytes += segments[i].size;
+        }
+    }
+    runtime_profile_tsc_decide(sites, raw, bytes);
+}
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     alias_port_environment();
+    runtime_profile_load(); /* core defaults < profile.ini < launcher/player < environment */
 #ifndef _WIN32
     /* Keep host heap objects handed to the guest (thread handles, TLS) in the
        non-PIE brk heap, i.e. below 1 TiB: the guest packs pointers into 40 bits. */
@@ -868,6 +894,11 @@ int main(int argc, char **argv) {
         snprintf(sfo,sizeof(sfo),"%s/sce_sys/param.sfo",app0);
         if (sfo_value(sfo,"INSTALL_DIR_SAVEDATA",id,sizeof(id),NULL) || sfo_value(sfo,"TITLE_ID",id,sizeof(id),NULL))
             runtime_savedata_configure(id);
+        if (sfo_value(sfo,"TITLE_ID",game_title_id,sizeof(game_title_id),NULL) && runtime_game.title_ids) {
+            int known=0;
+            for (const char *const *t=runtime_game.title_ids; *t; ++t) if (!strcmp(*t,game_title_id)) known=1;
+            if (!known) printf("Runtime: %s is not a title of this port (%s); running it anyway\n",game_title_id,runtime_game.name ? runtime_game.name : "?");
+        }
     }
     tlggpu_register_kernel();
 #ifdef _WIN32
@@ -907,6 +938,7 @@ int main(int argc, char **argv) {
     uint64_t capabilities = memcmp(magic, "G3PROBE1", 8) ? read64(f) : 0;
     if (capabilities & ~UINT64_C(1)) fail("unknown runtime capabilities");
     runtime_start(strict_imports ? 0 : capabilities);
+    if (runtime_game.init) runtime_game.init();
     if (!size || size > 512*1024*1024 || entry >= size || !ns || ns > 64 || nr > 1000000 || import_count > 100000)
         fail("boot file limits exceeded");
     int multi=!memcmp(magic,"G3PROBE5",8);
@@ -1004,6 +1036,7 @@ int main(int argc, char **argv) {
     unsigned char *stubs = image + round_page(size);
     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
     fclose(f);
+    decide_tsc(image, segments, ns);
     if (isa_table && isa_table_matches(isa_table, image, size)) {
         printf("STOP: this CPU lacks %s and no rewrite table matches the image\n", missing);
         return 20;
@@ -1083,6 +1116,10 @@ int main(int argc, char **argv) {
     if (gpu_enabled) install_cheats(app0, segments, ns, size);
     if (gpu_enabled) install_actor_watch(app0, segments, ns, size);
     if (gpu_enabled) install_stat_multipliers(app0, segments, ns, size);
+    if (runtime_game.patch_image) {
+        const RuntimeGameImage game_image={game_title_id,app0,image,size};
+        printf("Runtime: %d code patches (%s)\n",runtime_game.patch_image(&game_image),runtime_game.slug ? runtime_game.slug : "game");
+    }
 #ifdef _WIN32
     printf("Guest TCB loads redirected to the TEB TLS slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));
 #endif

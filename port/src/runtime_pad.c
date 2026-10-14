@@ -12,7 +12,8 @@
  * Mouse (while the window has it, see tlggpu_mouse_take; Esc releases it, a click takes it back):
  *   motion turns the camera (right stick, src/mouse_stick.h), left button Triangle (grab and
  *   hold on), right button R1 (call Trico), middle button Square. X1/X2 and the wheel are free
- *   for TLG_KEY_MAP ("Mouse X1", "Wheel Up", ...). */
+ *   for TLG_KEY_MAP ("Mouse X1", "Wheel Up", ...). These mouse buttons are The Last Guardian's;
+ *   another game sets its own in profile.ini (mouse_buttons, see apply_mouse_defaults). */
 #define _GNU_SOURCE
 #include "runtime.h"
 #include "gpu/tlggpu.h"
@@ -279,10 +280,45 @@ static int apply_button_map(ButtonMap *map, const char *spec, bool keyboard) {
     return used;
 }
 
+/* Default mouse buttons of the game (profile.ini mouse_buttons, TLG_MOUSE_BUTTONS): comma-separated
+ * <mouse source>=<ps4 button>|none, e.g. "Mouse Left=square,Mouse Right=l2,Mouse Middle=none"
+ * ("Mouse " may be left out: "left=square"). Each listed source drops its built-in default
+ * (the TLG layout above) and presses the given button; unlisted sources keep theirs. Applied
+ * before the player's key map, which still wins. Returns how many entries were used. */
+static int apply_mouse_defaults(ButtonMap *map, const char *spec) {
+    if (!spec || !*spec) return 0;
+    char copy[512];
+    snprintf(copy,sizeof(copy),"%s",spec);
+    int used=0;
+    for (char *entry=copy, *next; entry; entry=next) {
+        if ((next=strchr(entry,','))) *next++=0;
+        char *eq=strchr(entry,'=');
+        if (!eq) { if (*trim(entry)) printf("Runtime: mouse buttons: ignored '%s' (expected source=button)\n",trim(entry)); continue; }
+        *eq=0;
+        char *name=trim(entry), *button=trim(eq+1);
+        int source=-1;
+        for (size_t i=0;i<sizeof(mouse_names)/sizeof(*mouse_names);++i)
+            if (!SDL_strcasecmp(name,mouse_names[i].name) || (!SDL_strncasecmp(mouse_names[i].name,"Mouse ",6) && !SDL_strcasecmp(name,mouse_names[i].name+6)))
+                source=mouse_names[i].source;
+        uint32_t ps=0;
+        for (size_t i=0;i<sizeof(ps_names)/sizeof(*ps_names);++i) if (!SDL_strcasecmp(button,ps_names[i].name)) ps=ps_names[i].ps;
+        const bool none=!SDL_strcasecmp(button,"none");
+        if (source<0 || (!ps && !none)) { printf("Runtime: mouse buttons: ignored '%s=%s'\n",name,button); continue; }
+        size_t kept=0;
+        for (size_t i=0;i<map->count;++i) if (map->entries[i].source!=source) map->entries[kept++]=map->entries[i];
+        map->count=kept;
+        if (!none && map->count<sizeof(map->entries)/sizeof(*map->entries)) map->entries[map->count++]=(ButtonSource){source,ps};
+        ++used;
+    }
+    return used;
+}
+
 static void load_button_maps(void) {
     static bool loaded;
     if (loaded) return;
     loaded=true;
+    const int mouse=apply_mouse_defaults(&key_map,getenv("TLG_MOUSE_BUTTONS"));
+    if (mouse) printf("Runtime: mouse buttons: %d game defaults (TLG_MOUSE_BUTTONS / profile)\n",mouse);
     const int pad=apply_button_map(&pad_map,getenv("TLG_PAD_MAP"),false);
     /* TLG_KEY_MAP wins over tlg.ini's key_map (the launcher's Controls). */
     const char *env=getenv("TLG_KEY_MAP");

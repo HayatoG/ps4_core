@@ -186,6 +186,48 @@ Values& Get() {
 }
 
 namespace {
+// The game profile's [settings] section (port/profile.ini, loaded by src/runtime_profile.c, which
+// exports its path as TLG_PROFILE_LOADED): the game's defaults for these keys, read before the
+// player's tlg.ini so the player's choices win. Lines as in tlg.ini; ' #' / ' ;' comments.
+void ReadProfileSettings(Values& v) {
+    const char* path = std::getenv("TLG_PROFILE_LOADED");
+    FILE* file = path && path[0] ? std::fopen(path, "r") : nullptr;
+    if (!file) {
+        return;
+    }
+    char line[1024];
+    bool in_settings = false;
+    int count = 0;
+    while (std::fgets(line, sizeof(line), file)) {
+        std::string text{line};
+        for (std::size_t c = 0; c < text.size(); ++c) { // '#'/';' at the start or after a blank
+            if ((text[c] == '#' || text[c] == ';') && (c == 0 || text[c - 1] == ' ' || text[c - 1] == '\t')) {
+                text.erase(c);
+                break;
+            }
+        }
+        text.erase(text.find_last_not_of(" \t\r\n") + 1);
+        text.erase(0, text.find_first_not_of(" \t"));
+        if (!text.empty() && text[0] == '[') {
+            in_settings = text.rfind("[settings]", 0) == 0;
+            continue;
+        }
+        const auto eq = text.find('=');
+        if (!in_settings || eq == std::string::npos) {
+            continue;
+        }
+        std::string key = text.substr(0, eq), value = text.substr(eq + 1);
+        key.erase(key.find_last_not_of(" \t") + 1);
+        value.erase(0, value.find_first_not_of(" \t"));
+        Set(v, key, value);
+        ++count;
+    }
+    std::fclose(file);
+    if (count) {
+        std::printf("Settings: %d game defaults from %s [settings]\n", count, path);
+    }
+}
+
 bool ReadFile(Values& v) {
     FILE* file = std::fopen(Path(), "r");
     if (!file) {
@@ -215,6 +257,7 @@ void ReloadIfRequested() {
 
 void Load() {
     auto& v = Get();
+    ReadProfileSettings(v);
     if (ReadFile(v)) {
         std::printf("Settings: %s\n", Path());
     }
