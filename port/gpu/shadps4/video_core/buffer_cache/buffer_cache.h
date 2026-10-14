@@ -153,6 +153,10 @@ public:
     bool TryEagerRead(VAddr addr, u64 size);
     void NoteReadback(VAddr addr, u64 size);
     void EagerCopyAtFence();
+    /// tlg: a fence packet writes [addr, addr+size) after EagerCopyAtFence: older copies lack it.
+    void MarkFenceWrite(VAddr addr, u64 size) {
+        MarkEagerStale(addr, size);
+    }
 
 private:
     /// Uploads the merged guest writes inside [device_addr, device_addr + size) of `arena`.

@@ -262,6 +262,11 @@ void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const auto eop = *reinterpret_cast<const PM4CmdEventWriteEop*>(data);
     rasterizer.ProcessDownloadImages();
     rasterizer.EagerCopyAtFence();
+    // tlg: the label is written after the eager copies were taken: a copy of its page lacks it
+    // (The Last of Us Remastered read a stale frame marker and halted in WaitOnContextDone).
+    if (eop.data_sel.Value() != DataSelect::None) {
+        rasterizer.GetBufferCache().MarkFenceWrite(reinterpret_cast<VAddr>(eop.Address<u32>()), 8);
+    }
     // Guest memory copies on the copy threads precede the fence the guest sees.
     // TLG_ASYNC_FENCES=1 writes it once they are done instead of waiting for them; measured
     // slower (79 vs 83 FPS): the guest waits on these fences, and later fences stall it more
@@ -342,6 +347,7 @@ void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
     rasterizer.WaitHostCopies();
     rasterizer.WaitDeferredSignals();
     rasterizer.ProcessDownloadImages();
+    rasterizer.GetBufferCache().MarkFenceWrite(reinterpret_cast<VAddr>(event_eos.Address<u32*>()), 4);
     event_eos.SignalFence([](void* address, u64 value, u32 num_bytes) {
         auto* memory = Core::Memory::Instance();
         TlgWriteLog::Note(reinterpret_cast<u64>(address), &value, num_bytes, TlgWriteLog::Fence);
@@ -1612,6 +1618,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (rasterizer) {
                 rasterizer->ProcessDownloadImages();
                 rasterizer->EagerCopyAtFence();
+                rasterizer->GetBufferCache().MarkFenceWrite(release_mem->Address<VAddr>(), 8);
             }
             release_mem->SignalFence(
                 [pipe_id = queue.pipe_id] {
