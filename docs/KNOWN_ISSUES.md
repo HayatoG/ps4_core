@@ -21,6 +21,7 @@ Só o que é do **núcleo** (runtime, loader, GPU). Problemas de um jogo só fic
 | 11 | **Prefixo `TLG_` em todos os ports.** | todo o núcleo | plano: `<PREFIXO>_X` com `TLG_X` aceito na transição (`runtime_game.env_prefix`, carregador `core_config.c`) |
 | 12 | **Restos do God of War III.** `probe.c` instala cheats e multiplicadores do `CUSA01623 v01.02` (`cheat/damage/actor/orb_hook.h`); `run.sh`/`run.py`/`patches.py` com `CUSA01623` por padrão; `tools/tlg_frame_map.py`. | `probe.c`, scripts | virar `patch_image` de um `game_gow3.c` (ou sair) quando a tabela existir |
 | 13 | **Build só do núcleo.** `build.sh` e o `CMakeLists.txt` do Windows pegam `src/runtime*.c` por glob; empacotamento precisa de `port.env`, ícone e `.rc`. O `tlg_pc` ainda não tem `port/packaging/port.env`. | `build.sh`, `gpu/CMakeLists.txt`, `packaging/` | depois do #7: `game_none.c` e uma pasta de fontes do jogo |
+| 14 | **Sync com o upstream gow3_pc sem teste nos casos que ele resolve.** A reescrita ISA (CPU sem MOVBE/BMI1/LZCNT) e o multisampling desligado por driver (AMD/Intel no Windows) vieram do GoW3; aqui só rodamos em CPU completa e NVIDIA, onde nada muda. Nos outros jogos o padrão sem MSAA pode mudar a imagem nesses drivers. | `isa_rewrite.*`, `tlg_msaa*.h` | testar com `TLG_ISA_REWRITE=1` (força a reescrita) e `TLG_NO_MSAA=1` em cada jogo; um testador com RX 6000 ou Arc no Windows |
 
 ## Corrigido hoje (13/10/2026)
 
@@ -68,5 +69,6 @@ Core-only problems (runtime, loader, GPU); game-only problems stay in the port's
 11. `TLG_` env prefix everywhere: per-game prefixes planned.
 12. God of War III leftovers in `probe.c` and run scripts.
 13. No core-only build yet; `tlg_pc` has no `port/packaging/port.env`.
+14. Upstream gow3_pc sync (ISA rewrite, no-MSAA per driver) is untested where it matters (CPUs without MOVBE/BMI1/LZCNT, AMD/Intel Windows drivers); try `TLG_ISA_REWRITE=1` and `TLG_NO_MSAA=1` per game.
 
 **Fixed today:** see the table above (loader `fs:[0]` any register and native-libc binding order, shader permutation key before translation, read-fault fast path, stencil reference merge, BC 1D handling, wave64 ballots/ReadFirstLane, shader cache key, partial transitions, precise readbacks default, write merge, pad motion/dead zone/touchpad, mouse and keyboard, SMAA/CAS post-processing, recorder crash, AvPlayer stop, shader capture on protected pages, per-game window identity, diagnostics).

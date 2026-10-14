@@ -24,3 +24,17 @@
 # GR2 (PR #9 mesclado): nada novo, só atrás / nothing new, only behind (lower_wave64, runtime.c/h,
 # import_names.inc, packaging, probe.c come from infamous).
 ~/decomp/gr2_pc origin/main a0fd165b8a6112c2eab1fe449e5de83ec31df63a
+
+# Upstream (FelipePrado0/gow3_pc), branch upstream/gow3-sync: só a parte de núcleo de 9a6d17c..2a0eac6
+# (os ports copiaram 9a6d17c em 12/10/2026). Ver docs/CHANGELOG.md, 13/10/2026 "upstream".
+# Upstream core part only, 9a6d17c..2a0eac6 (the ports were copied from 9a6d17c on 2026-10-12):
+# + 9855e52 build fixes; 2dea61f TSC = process clock; 252a279 hidden cursor
+# + 60d03f3 edc9b18 191854e 8adcb78 wave stats/AMD ISA dumps; 268a2fd 51861f3 full barriers
+# + 623e109 a09e8e1 8af8a8f c8922a8 0601854 99ec867 1884be4 8144011 82f825f 01a9224 a445c6e 80dec4c ee2fc0f 38637d9 ISA rewrite
+# + dd25c58 55e6603 081df6f 0c03388 frame capture; 00e4710 10a7864 6b51083 55eaa5d multisampling per driver
+# + 9155cdc (--gamepad, --mount, TLG_GLYPHS only); 5dc44e4 6d580ba e2cd838 db01ed7 9a1c8f7 f4e4ffe scripts
+# Fora / not taken: GoW3 patches/cheats/signatures (b10c460, 9cfebd7), launcher (gow3_launcher_win.py,
+#   incl. 9677e4a settings persistence, 7704bf7/37d8e5b MSAA option), Steam shortcut and art, glyphs.py,
+#   game_update.py (5f88770: our ports use scripts/make_game_view.py), Linux AppImage (1da8050 ...), docs.
+# Pin informativo (o core_sync.py só segue caminhos locais; clone em ~/decomp/upstream/gow3_pc) / informational pin:
+https://github.com/FelipePrado0/gow3_pc main 2a0eac6522d6e2e5b0fbfe25f49abd3dbe1a644b
