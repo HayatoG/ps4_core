@@ -44,10 +44,26 @@ def parse_cpu_features(output):
     return []
 
 
+def port_env_prefix(env):
+    """The game's environment prefix (PORT_ENV_PREFIX in the environment or packaging/port.env,
+    e.g. "ISS_" or "GR2_"); '' when the port has none (The Last Guardian, a core-only build)."""
+    if 'PORT_ENV_PREFIX' in env:
+        return env['PORT_ENV_PREFIX']
+    try:
+        for line in (PORT / 'packaging' / 'port.env').read_text(encoding='utf-8').splitlines():
+            if line.startswith('PORT_ENV_PREFIX='):
+                return line.split('=', 1)[1].split('#', 1)[0].strip().strip('"\'')
+    except OSError:
+        pass
+    return ''
+
+
 def isa_rewrite_wanted(missing, env):
-    """TLG_ISA_REWRITE=0 disables the ISA rewrite table; 1 or a list of sets ("sse4a", "movbe,bmi1")
-    forces it (tlg-probe rewrites those sets); otherwise the CPU decides."""
-    policy = env.get('ISS_ISA_REWRITE') or env.get('TLG_ISA_REWRITE', '')
+    """<PREFIX>ISA_REWRITE (ISS_, GR2_...) or TLG_ISA_REWRITE=0 disables the ISA rewrite table; 1 or
+    a list of sets ("sse4a", "movbe,bmi1") forces it (tlg-probe rewrites those sets); otherwise the
+    CPU decides. The game's name wins, as in tlg-probe's alias_port_environment."""
+    prefix = port_env_prefix(env)
+    policy = (env.get(prefix + 'ISA_REWRITE') if prefix else '') or env.get('TLG_ISA_REWRITE', '')
     if policy:
         return policy != '0'
     return bool(missing)
@@ -116,7 +132,7 @@ def main():
         clang64 = Path(env.get('MSYS2_ROOT', r'C:\msys64')) / 'clang64' / 'bin'
         if clang64.is_dir():
             env['PATH'] = f'{clang64}{os.pathsep}{env.get("PATH", "")}'
-    # Instruction sets this CPU lacks (MOVBE, BMI1, LZCNT): the ISA rewrite covers them; exit 20
+    # Instruction sets this CPU lacks (MOVBE, BMI1, LZCNT, SSE4A): the ISA rewrite covers them; exit 20
     # is a set nothing covers.
     features = subprocess.run([str(probe), '--cpu-features'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                               text=True, creationflags=no_console())

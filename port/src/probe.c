@@ -738,8 +738,10 @@ static int cpu_supported(char *missing, size_t size) {
 
 /* Per-game environment prefix. The core still reads TLG_* (one shared prefix, PSCORE_, once every
  * port uses ps4_core), so a port that builds with -DPORT_ENV_PREFIX="ISS_" (inFAMOUS; "GR2_" for
- * Gravity Rush 2) gets each ISS_X copied to TLG_X at start, unless TLG_X is set too. Without the
- * define (The Last Guardian, a core-only build) or with "TLG_" there is nothing to alias. */
+ * Gravity Rush 2) gets each ISS_X copied to TLG_X at start. The game's name wins over a TLG_X that
+ * is also set (gr2 5c5d84d): runners and scripts set TLG_* defaults that a player's ISS_X/GR2_X must
+ * replace. Without the define (The Last Guardian, a core-only build) or with "TLG_" there is nothing
+ * to alias. */
 #ifdef PORT_ENV_PREFIX
 #ifdef _WIN32
 #define environ _environ
@@ -763,11 +765,10 @@ static void alias_port_environment(void) {
         memcpy(name, "TLG_", 4);
         memcpy(name + 4, entry + prefix, length);
         name[4 + length] = 0;
-        if (getenv(name)) continue;
 #ifdef _WIN32
         _putenv_s(name, equals + 1);
 #else
-        setenv(name, equals + 1, 0);
+        setenv(name, equals + 1, 1);
 #endif
     }
     for (size_t i = 0; i < count; ++i) free(copy[i]);

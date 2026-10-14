@@ -1,7 +1,7 @@
 # Arquivos do jogo e do console (copyright da Sony e dos estúdios): NUNCA versionar
-# Game and console files: NEVER commit
-/dump/
-/game/
+# Game and console files: NEVER commit (no trailing slash: also the symlinks of a worktree boot test)
+/dump
+/game
 *.psarc
 *.bin
 *.prx
@@ -15,7 +15,7 @@ eboot*
 # Saídas de build e dados locais / build outputs and local data
 port/out/
 port/pgo/
-port/user/
+port/user
 port/dist/
 __pycache__/
 *.pyc
