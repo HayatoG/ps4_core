@@ -1067,6 +1067,7 @@ int main(int argc, char **argv) {
                 uint64_t address=bindings[relocs[i].value];
                 if (binding_kinds[relocs[i].value]!=relocs[i].kind || !mapped(segments,ns,address,relocs[i].addend+1)) fail("native export kind/range mismatch");
                 value=(uintptr_t)image+address+relocs[i].addend;
+                if (relocs[i].kind==1 && !relocs[i].addend) value=runtime_ngs2_trace_bind(names[relocs[i].value],value);
             }
         }
         memcpy(image + relocs[i].target, &value, 8);

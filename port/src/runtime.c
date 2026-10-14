@@ -263,6 +263,8 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
     /* Before runtime_tlg: its Audio3d entries are placeholders kept for TLG-only builds. */
     uintptr_t gr2_audio3d = runtime_gr2_audio3d_resolve(name);
     if (gr2_audio3d) return gr2_audio3d;
+    uintptr_t ngs2 = runtime_ngs2_resolve(name);
+    if (ngs2) return ngs2;
     uintptr_t tlg = runtime_tlg_resolve(name);
     if (tlg) return tlg;
     uintptr_t gr2 = runtime_gr2_resolve(name);

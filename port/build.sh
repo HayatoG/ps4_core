@@ -136,4 +136,6 @@ if [[ ${1:-} == --test ]]; then
     out/isa-sse4a-test
     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -UNDEBUG -I. -Isrc tests/test_cpu_check.c -o out/cpu-check-test
     out/cpu-check-test
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I. -Isrc tests/test_ngs2.c src/runtime_ngs2.c out/libatrac9.a -lm -o out/ngs2-test
+    out/ngs2-test
 fi

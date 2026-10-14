@@ -133,7 +133,7 @@ Estados: `port-newer` (a versão daqui está no histórico do port: o port andou
 | gr2_pc | `40d0391` (PR #15) | 137 | 0 | 90 `core-newer` + 47 `core-only` |
 | infamous_pc | `2b82d72` (PR #15) | 49 | 0 | 33 `core-newer` + 16 `core-only` (SMAA/CAS, mouse, presenter, `PORT_ENV_PREFIX`, join do AvPlayer, correções do TLOU) |
 
-Fora das `main`: as branches `fix/avplayer-stop-join` e `fix/isa-rewrite-sse4a` do GR2 já estão aqui; o NGS2 embutido do TLG (`feat/ngs2-hle`) está na branch `feat/ngs2-hle` do `ps4_core`, em cima desta.
+Fora das `main`: as branches `fix/avplayer-stop-join` e `fix/isa-rewrite-sse4a` do GR2 já estão aqui; o NGS2 embutido do TLG (`feat/ngs2-hle`) está na branch `feat/ngs2-hle` do `ps4_core`, em cima desta: `port/src/runtime_ngs2.c` responde ao `libSceNgs2` quando `TLG_NGS2` não é `native` (sem o `libSceNgs2.sprx` do firmware), `TLG_NGS2_TRACE` rastreia o módulo nativo (ver `docs/NGS2_LEVANTAMENTO.md`).
 
 Nenhum port tem trabalho de núcleo que falte aqui. Para levar o núcleo a um port: copiar os arquivos `core-newer`/`core-only` numa branch do port, compilar e testar o jogo (com a trava), e abrir o PR.
 
