@@ -90,7 +90,7 @@ typedef void (*GpuRange)(uintptr_t address, uint64_t size);
 static GpuRange hook_map, hook_unmap, hook_invalidate;
 enum { HOOK_MAP, HOOK_UNMAP, HOOK_INVALIDATE };
 typedef struct { int kind; uintptr_t address; uint64_t size; } PendingHook;
-static PendingHook pending[64]; static size_t pending_count;
+static PendingHook pending[1024]; static size_t pending_count;
 static size_t allocations, maps, flexible_maps, protects, queries;
 static uint64_t live_bytes, flexible_bytes;
 
@@ -270,6 +270,12 @@ static void host_discard(uint64_t phys, uint64_t size) {
 static void queue_hook(int kind, uintptr_t address, uint64_t size) {
     GpuRange hook = kind==HOOK_MAP ? hook_map : kind==HOOK_UNMAP ? hook_unmap : hook_invalidate;
     if (!hook) return;
+    /* One call over many mappings (The Last of Us Remastered unmaps hundreds of 1 MiB maps at
+     * once) queues one hook per mapping: adjacent ranges of the same kind become one. */
+    if (pending_count) {
+        PendingHook *last=&pending[pending_count-1];
+        if (last->kind==kind && last->address+last->size==address) { last->size+=size; return; }
+    }
     if (pending_count==sizeof(pending)/sizeof(*pending)) { fputs("STOP: GPU hook queue overflow\n",stderr); exit(21); }
     pending[pending_count++]=(PendingHook){kind,address,size};
 }
