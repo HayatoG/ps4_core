@@ -253,6 +253,10 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
     if (fiber) return fiber;
     uintptr_t offline = runtime_offline_resolve(name);
     if (offline) return offline;
+    uintptr_t misc = runtime_misc_resolve(name);
+    if (misc) return misc;
+    uintptr_t net = runtime_net_offline_resolve(name);
+    if (net) return net;
     uintptr_t services = runtime_services_resolve(name);
     if (services) return services;
     uintptr_t ajm = runtime_ajm_resolve(name);

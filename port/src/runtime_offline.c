@@ -119,7 +119,50 @@ static ABI int32_t rtc_parse(void *tick, const char *text) {
     (void)tick; return RTC_INVALID_VALUE;
 }
 
+/* ---- First needed by inFAMOUS Second Son (runtime_infamous.c), generic ---- */
+#define SYSTEM_SERVICE_INVALID ((int32_t)0x80a10003)
+/* sceSystemServiceParamGetString(id, buffer, size): only the user name parameter exists. */
+static ABI int32_t param_string(int32_t id, char *buffer, uint64_t size) {
+    if (!buffer || !size) return SYSTEM_SERVICE_INVALID;
+    snprintf(buffer, size, "%s", "Player");
+    printf("Runtime: sceSystemServiceParamGetString(%d) -> Player\n", id);
+    return 0;
+}
+static ABI int32_t np_register_a(void *callback, void *arg) { (void)callback; (void)arg; static int32_t next=0x100; return ++next; }
+static ABI int32_t netctl_init(void) { ONCE("sceNetCtlInit"); return 0; }
+/* scePlayGoGetEta(handle, chunks, count, out_eta): everything is installed. */
+static ABI int32_t playgo_eta(int32_t handle, const uint16_t *chunks, uint32_t count, uint64_t *eta) {
+    (void)handle; (void)chunks; (void)count;
+    if (eta) *eta=0;
+    return 0;
+}
+/* scePlayGoGetToDoList(handle, list, count, out_entries): no pending chunk. */
+static ABI int32_t playgo_todo(int32_t handle, void *list, uint32_t count, uint32_t *entries) {
+    (void)handle; (void)list; (void)count;
+    if (entries) *entries=0;
+    return 0;
+}
+static ABI int32_t playgo_set_language_mask(int32_t handle, uint64_t mask) {
+    printf("Runtime: scePlayGoSetLanguageMask(%#llx)\n", (unsigned long long)mask);
+    (void)handle;
+    return 0;
+}
+/* sceAppContentGetAddcontInfo(label, entitlement, info): no add-on is installed. */
+static ABI int32_t addcont_info(uint32_t label, const void *entitlement, void *info) {
+    (void)label; (void)entitlement; (void)info;
+    return APP_CONTENT_NOT_FOUND;
+}
+
 static const RuntimeExport exports[] = {
+    {"sceSystemServiceParamGetString", param_string},
+    {"sceHttpSetChunkedTransferEnabled", ok}, {"sceHttpsLoadCert", ok},
+    {"sceNetCtlInit", netctl_init}, {"sceNetCtlTerm", ok},
+    {"scePlayGoGetEta", playgo_eta}, {"scePlayGoGetToDoList", playgo_todo},
+    {"scePlayGoSetLanguageMask", playgo_set_language_mask},
+    {"sceNpCheckNpAvailabilityA", signed_out}, {"sceNpGetAccountCountryA", signed_out},
+    {"sceNpGetAccountIdA", signed_out}, {"sceNpGetGamePresenceStatusA", signed_out},
+    {"sceNpRegisterGamePresenceCallbackA", np_register_a}, {"sceNpRegisterStateCallbackA", np_register_a},
+    {"sceAppContentGetAddcontInfo", addcont_info},
     {"sceKernelUtimes", kernel_utimes}, {"sceKernelSync", ok},
     {"sceKernelSetVirtualRangeName", kernel_set_range_name},
     {"sceKernelGetModuleList", kernel_module_list}, {"sceKernelGetModuleInfo", kernel_module_info},
