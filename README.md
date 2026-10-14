@@ -104,6 +104,7 @@ Hoje o núcleo lê só `TLG_` (herdado do primeiro port). Plano em duas etapas:
 - A biblioteca da GPU (`cmake -S port/gpu`) não depende dos arquivos do jogo no Linux.
 - Dependências: Vulkan, SDL3, FFmpeg (libavcodec/libavutil/libswscale), FreeType (o `build.sh` usa `../../tools/freetype-devel` se o sistema não tiver), Zydis; Windows em MSYS2 CLANG64 (`msys2-env.sh`).
 - **Cache de shaders:** `~/.local/share/shadPS4/cache/<TITLE_ID>-<chave>`; a chave (`TLG_SHADER_CACHE_KEY`) é o SHA-1 dos fontes do tradutor, calculado pelo CMake. Mesma versão do núcleo = mesma chave em todos os jogos; mudar o tradutor aqui gera chave nova e o cache velho é apagado sozinho. Um port não deve mexer no tradutor localmente.
+- **Limpar o cache de shaders:** `port/launcher/shader_cache.py` acha e apaga só o cache do jogo (`<TITLE_ID>`, `<TITLE_ID>-<chave>`, `<TITLE_ID>.zip` em `TLG_GPU_USER_DIR`, `user/`, `user/user/` no Windows e `~/.local/share/shadPS4` no Linux), nunca saves, configurações ou logs. O launcher de cada port tem um botão para isso; na linha de comando, `run.py --clear-shader-cache`.
 
 ## Regras
 
@@ -183,7 +184,7 @@ Today each port carries a copy kept in step with `tools/core_sync.py`. Plan: (1)
 
 ## Build notes
 
-No core-only build yet (runtime.c links the per-game resolvers; build globs `src/runtime*.c`; packaging needs a game profile) — solved by the `RuntimeGame` table + `game_none.c` (KNOWN_ISSUES #7, #13). To test a core change, bring it into a port and build there under the lock. The GPU library (`cmake -S port/gpu`) does not need game files on Linux. Dependencies: Vulkan, SDL3, FFmpeg, FreeType, Zydis; Windows via MSYS2 CLANG64. Shader cache `~/.local/share/shadPS4/cache/<TITLE_ID>-<key>`, key = SHA-1 of the recompiler sources: same core, same key in every game; a recompiler change invalidates old caches automatically.
+No core-only build yet (runtime.c links the per-game resolvers; build globs `src/runtime*.c`; packaging needs a game profile) — solved by the `RuntimeGame` table + `game_none.c` (KNOWN_ISSUES #7, #13). To test a core change, bring it into a port and build there under the lock. The GPU library (`cmake -S port/gpu`) does not need game files on Linux. Dependencies: Vulkan, SDL3, FFmpeg, FreeType, Zydis; Windows via MSYS2 CLANG64. Shader cache `~/.local/share/shadPS4/cache/<TITLE_ID>-<key>`, key = SHA-1 of the recompiler sources: same core, same key in every game; a recompiler change invalidates old caches automatically. `launcher/shader_cache.py` clears one game's cache (launcher button; `run.py --clear-shader-cache`).
 
 ## Rules
 

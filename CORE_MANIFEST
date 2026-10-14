@@ -43,6 +43,7 @@ port/gpu/*
 port/tests/*
 port/tools/*
 port/launcher/tlg_vulkan.py
+port/launcher/shader_cache.py
 
 # Empacotamento genérico / generic packaging (per-game: port.env, icon, README-player, *.rc)
 port/packaging/*

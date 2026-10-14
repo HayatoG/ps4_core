@@ -4,6 +4,7 @@
 
 Same environment variables as run.sh (TLG_GAME_DIR, TLG_DATA_DIR, TLG_PATCHES, TLG_MODS_*,
 TLG_USER_DIR, ...). Extra arguments go to tlg-probe.
+`--clear-shader-cache` only deletes the game's compiled shaders (launcher/shader_cache.py).
 The in-game "Apply and restart" runs this script again through TLG_RESTART_COMMAND;
 `--after PID` waits for the previous game process to end first (its GPU device and memory).
 """
@@ -98,8 +99,28 @@ def find_executable(name):
     return None
 
 
+def clear_shader_cache():
+    """--clear-shader-cache: deletes the game's compiled shaders (rebuilt on the next start)."""
+    sys.path.insert(0, str(PORT / 'launcher'))
+    import shader_cache
+    env = os.environ
+    os.chdir(PORT)
+    data = Path(env.get('TLG_DATA_DIR', PORT))
+    game = Path(env.get('TLG_GAME_DIR', PORT.parent / 'CUSA01623'))
+    serial = shader_cache.title_id(game)
+    if not serial:
+        fail(f'No sce_sys/param.sfo in {game} (set TLG_GAME_DIR).')
+    freed, failures = shader_cache.clear([serial], Path(env.get('TLG_USER_DIR', data / 'user')))
+    print(f'Shader cache of {serial}: {shader_cache.human_size(freed)} freed', flush=True)
+    for path, error in failures:
+        print(f'Not deleted (in use? close the game): {path}: {error}', file=sys.stderr)
+    return 1 if failures else 0
+
+
 def main():
     args = sys.argv[1:]
+    if args[:1] == ['--clear-shader-cache']:
+        sys.exit(clear_shader_cache())
     if len(args) >= 2 and args[0] == '--after':
         wait_for(int(args[1]))
         args = args[2:]
