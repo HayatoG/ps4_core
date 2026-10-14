@@ -45,10 +45,11 @@ def parse_cpu_features(output):
 
 
 def isa_rewrite_wanted(missing, env):
-    """TLG_ISA_REWRITE=1 forces the ISA rewrite table, 0 disables it; otherwise the CPU decides."""
-    policy = env.get('TLG_ISA_REWRITE')
-    if policy in ('0', '1'):
-        return policy == '1'
+    """TLG_ISA_REWRITE=0 disables the ISA rewrite table; 1 or a list of sets ("sse4a", "movbe,bmi1")
+    forces it (tlg-probe rewrites those sets); otherwise the CPU decides."""
+    policy = env.get('ISS_ISA_REWRITE') or env.get('TLG_ISA_REWRITE', '')
+    if policy:
+        return policy != '0'
     return bool(missing)
 
 

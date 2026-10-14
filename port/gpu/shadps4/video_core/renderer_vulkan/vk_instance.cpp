@@ -423,6 +423,21 @@ bool Instance::CreateDevice() {
     }
     image_view_min_lod = add_extension(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    // tlg: from shadPS4-Infamous-FixBuild e35e04dc. Lets the driver move device memory out to
+    // system memory instead of failing an allocation when the card is full.
+    const bool memory_priority = add_extension(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
+    const bool pageable_extension =
+        memory_priority && add_extension(VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME);
+    if (pageable_extension) {
+        const auto pageable_chain = physical_device.getFeatures2<
+            vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceMemoryPriorityFeaturesEXT,
+            vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT>();
+        pageable_device_local_memory =
+            pageable_chain.get<vk::PhysicalDeviceMemoryPriorityFeaturesEXT>().memoryPriority &&
+            pageable_chain.get<vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT>()
+                .pageableDeviceLocalMemory;
+        LOG_INFO(Render_Vulkan, "- pageableDeviceLocalMemory: {}", pageable_device_local_memory);
+    }
     // tlg: FSR 4 v07 INT8 (vk_temporal_upscaler): quad derivatives in compute shaders.
     compute_shader_derivatives = add_extension(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
     // tlg: FSR 4.1.1 passes (dot2 of halves accumulated in float, as vkd3d-proton translates them).
@@ -562,6 +577,8 @@ bool Instance::CreateDevice() {
         },
         vk::PhysicalDeviceVulkan13Features{
             .robustImageAccess = vk13_features.robustImageAccess,
+            // tlg: compute pipelines met in game ask the driver for a cached one first.
+            .pipelineCreationCacheControl = vk13_features.pipelineCreationCacheControl,
             .shaderDemoteToHelperInvocation = vk13_features.shaderDemoteToHelperInvocation,
             .subgroupSizeControl = vk13_features.subgroupSizeControl,
             .synchronization2 = vk13_features.synchronization2,
@@ -646,6 +663,12 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceShaderClockFeaturesKHR{
             .shaderSubgroupClock = shader_clock_features.shaderSubgroupClock,
         },
+        vk::PhysicalDeviceMemoryPriorityFeaturesEXT{
+            .memoryPriority = true,
+        },
+        vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT{
+            .pageableDeviceLocalMemory = true,
+        },
         vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR{
             .computeDerivativeGroupQuads =
                 compute_shader_derivatives_features.computeDerivativeGroupQuads,
@@ -714,6 +737,10 @@ bool Instance::CreateDevice() {
     }
     if (!shader_clock) {
         device_chain.unlink<vk::PhysicalDeviceShaderClockFeaturesKHR>();
+    }
+    if (!pageable_device_local_memory) {
+        device_chain.unlink<vk::PhysicalDeviceMemoryPriorityFeaturesEXT>();
+        device_chain.unlink<vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT>();
     }
     if (!compute_shader_derivatives) {
         device_chain.unlink<vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR>();

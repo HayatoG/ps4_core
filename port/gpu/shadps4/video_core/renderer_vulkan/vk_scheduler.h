@@ -772,6 +772,12 @@ public:
         }
     }
 
+    /// tlg: true when commands passed to Record() normally go to the Vulkan recording thread
+    /// (it may still record some directly, after a CommandBuffer() call).
+    [[nodiscard]] bool RecordsOnThread() const noexcept {
+        return recording_threaded && !TlgToggle::Disabled(TlgToggle::ThreadedRecording);
+    }
+
     /// True when Record() defers commands (and RecordData() copies into chunks).
     [[nodiscard]] bool IsRecordingDeferred() const noexcept {
         return recording_threaded && !direct_mode &&
@@ -858,6 +864,16 @@ public:
         return is_rendering && render_state == state;
     }
 
+    /// tlg: counts a draw or dispatch recorded since the last submission.
+    void CountWork() noexcept {
+        work_since_submit.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    /// tlg: draws and dispatches recorded since the last submission.
+    [[nodiscard]] u32 WorkSinceSubmit() const noexcept {
+        return work_since_submit.load(std::memory_order_relaxed);
+    }
+
     /// Whether BeginRendering(state) would start a new render pass.
     [[nodiscard]] bool WillBeginRendering(const RenderState& state) const {
         return !(is_rendering && render_state == state);
@@ -931,6 +947,7 @@ private:
     std::queue<PendingOp> pending_ops;
     std::recursive_mutex pending_ops_mutex;
     u32 pending_polls = 0; // tlg
+    bool popping_pending_ops = false; ///< tlg: guarded by pending_ops_mutex (recursive)
     std::atomic<u32> num_pending_ops{0}; ///< tlg: pending_ops.size(), checked without the lock
     std::queue<PendingOp> priority_pending_ops;
     std::mutex priority_pending_ops_mutex;
@@ -957,6 +974,7 @@ private:
     bool recorder_busy = false;
     std::atomic<size_t> queued_chunks{0}; ///< recorder_queue.size() for lock-free polling
     bool recorder_sleeping = false; ///< waiting on recorder_cv (guarded by recorder_mutex)
+    std::atomic<u32> work_since_submit{0}; ///< tlg: CountWork(), reset by each submission
     bool direct_mode = false; ///< the command buffer is recorded on the caller's thread
     u64 host_copies_issued = 0;
     std::atomic<u64> host_copies_done{0};

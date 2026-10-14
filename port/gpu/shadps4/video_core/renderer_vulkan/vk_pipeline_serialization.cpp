@@ -274,6 +274,15 @@ vk::ResultValue<vk::UniquePipeline> CreateCachedGraphicsPipeline(
     const auto create = [&](vk::PipelineCache used_cache, const auto& used_info, bool restored) {
         const auto started = std::chrono::steady_clock::now();
         auto result = device.createGraphicsPipelineUnique(used_cache, used_info);
+        // tlg: a failure the driver may recover from is tried again (a binary that failed to
+        // restore is compiled instead).
+        for (u32 attempt = 1;
+             !restored && result.result != vk::Result::eSuccess &&
+             RetryPipelineCreation(result.result, attempt, "graphics",
+                                   fmt::format("{:#x}", std::hash<GraphicsPipelineKey>{}(key)));
+             ++attempt) {
+            result = device.createGraphicsPipelineUnique(used_cache, used_info);
+        }
         const auto ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now() - started)
                                 .count());

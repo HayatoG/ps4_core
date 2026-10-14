@@ -255,7 +255,7 @@ static LONG WINAPI trap_handler(EXCEPTION_POINTERS *info) {
     for (int i = 0; i < 16; i++) regs.gpr[i] = *gpr[i];
     regs.rflags = c->EFlags;
     uintptr_t rip;
-    if (!isa_rewrite_trap(trap_table, (uintptr_t)info->ExceptionRecord->ExceptionAddress, &regs, &rip))
+    if (!isa_rewrite_trap(trap_table, (uintptr_t)info->ExceptionRecord->ExceptionAddress, &regs, &c->FltSave.XmmRegisters[0], &rip))
         return EXCEPTION_CONTINUE_SEARCH;
     for (int i = 0; i < 16; i++) *gpr[i] = regs.gpr[i];
     c->EFlags = (DWORD)regs.rflags;
@@ -276,7 +276,7 @@ static void trap_handler(int sig, siginfo_t *info, void *context) {
     for (int i = 0; i < 16; i++) regs.gpr[i] = (uint64_t)g[index[i]];
     regs.rflags = (uint64_t)g[REG_EFL];
     uintptr_t rip;
-    if (!isa_rewrite_trap(trap_table, (uintptr_t)g[REG_RIP] - 1, &regs, &rip)) abort();
+    if (!isa_rewrite_trap(trap_table, (uintptr_t)g[REG_RIP] - 1, &regs, (unsigned char *)uc->uc_mcontext.fpregs + 160, &rip)) abort();
     for (int i = 0; i < 16; i++) g[index[i]] = (greg_t)regs.gpr[i];
     g[REG_EFL] = (greg_t)regs.rflags;
     g[REG_RIP] = (greg_t)rip;
@@ -313,9 +313,9 @@ static void test_trap_unknown_address(void) {
     regs.rflags = 0x202;
     before = regs;
     uintptr_t rip = 0x1234;
-    assert(isa_rewrite_trap(t, (uintptr_t)image + 0x3ff, &regs, &rip) == 0);
+    assert(isa_rewrite_trap(t, (uintptr_t)image + 0x3ff, &regs, NULL, &rip) == 0);
     assert(memcmp(&regs, &before, sizeof regs) == 0 && rip == 0x1234);
-    assert(isa_rewrite_trap(NULL, (uintptr_t)image + S4, &regs, &rip) == 0);
+    assert(isa_rewrite_trap(NULL, (uintptr_t)image + S4, &regs, NULL, &rip) == 0);
 }
 
 static void test_site_of_stub(void) {

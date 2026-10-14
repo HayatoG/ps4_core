@@ -89,6 +89,16 @@ constexpr static std::array DescriptorHeapSizes = {
     vk::DescriptorPoolSize{vk::DescriptorType::eSampler, 1024},
 };
 
+/// Logs shaders whose float atomic min/max run as integer atomics (no driver support): lets a
+/// log tell whether a game depends on that emulation (fork shadPS4-Infamous-FixBuild 32851afe).
+static void LogEmulatedFloatAtomics(const Shader::Info& info, const Shader::Profile& profile) {
+    if ((info.uses_buffer_atomic_float_min_max && !profile.supports_buffer_fp32_atomic_min_max) ||
+        (info.uses_image_atomic_float_min_max && !profile.supports_image_fp32_atomic_min_max)) {
+        LOG_INFO(Render_Vulkan, "{} shader {:#x} does float atomic min/max with integer atomics",
+                 info.hw_stage, info.pgm_hash);
+    }
+}
+
 static u32 MapOutputs(std::span<Shader::OutputMap, 3> outputs, const AmdGpu::VsOutputControl& ctl) {
     u32 num_outputs = 0;
 
@@ -550,6 +560,7 @@ bool PipelineCache::QueueShader(Program& program, HwStage stage, SwStage l_stage
         auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, build->runtime, *build->ir,
                                                     build->binding);
         DumpShader(build->code, build->info.pgm_hash, build->info.hw_stage, build->permutation, "bin");
+        LogEmulatedFloatAtomics(build->info, profile);
         DumpShader(spv, build->info.pgm_hash, build->info.hw_stage, build->permutation, "spv");
         auto patch = GetShaderPatch(build->info.pgm_hash, build->info.hw_stage,
                                     build->permutation, "spv");
@@ -814,6 +825,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
+    SeedWorkerCaches();
     PublishShaders();
     PublishGraphics();
     PumpWarmUp();
@@ -827,9 +839,15 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         CompileTimer timer;
 
         ComputePipeline::SerializationSupport sdata{};
+        // tlg: built on the compiler threads when the driver hasn't cached it (the dispatch
+        // binds it once built, vk_compute_pipeline.cpp). Not while collecting shaders: their
+        // pipelines are erased on a reload, with a build perhaps still running.
+        const ComputeBuilder builder{compiler.get(), worker_pipeline_caches};
+        const bool async = compiler && !EmulatorSettings.IsShaderCollect();
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
                                                        *pipeline_cache, compute_key, *sel.infos[0],
-                                                       sel.modules[0], sdata, false);
+                                                       sel.modules[0], sdata, false,
+                                                       async ? &builder : nullptr);
         RegisterPipelineData(compute_key, sdata);
         ++num_new_pipelines;
 
@@ -837,6 +855,8 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
             auto& m = sel.modules[0];
             module_related_pipelines[m].emplace_back(compute_key);
         }
+    } else if (it->second) {
+        it.value()->SwapInOptimized();
     }
     return it->second.get();
 }
@@ -1172,6 +1192,7 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
 
     const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
+    LogEmulatedFloatAtomics(info, profile);
     DumpShader(spv, info.pgm_hash, info.hw_stage, perm_idx, "spv");
 
     vk::ShaderModule module;

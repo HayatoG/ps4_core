@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <cstdlib>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include "common/assert.h"
 #include "common/bit_field.h"
@@ -337,7 +340,47 @@ enum class InterruptSelect : u32 {
     IrqUndocumented = 3,
 };
 
+// tlg: TLG_GPU_TIMESTAMP=fixed (ISS_GPU_TIMESTAMP): GPU timestamps advance a fixed step per
+// write (TLG_GPU_TIMESTAMP_STEP_US, default 20 us) instead of reading the host clock when the
+// packet is parsed. Our timestamps mark when the command processor reached the packet, not when
+// the GPU finished the work before it, so a game that budgets effects by measured GPU time sees
+// noise. Diagnostic for inFAMOUS distant smoke flickering (emitters dropped every other frame).
+struct GpuTimestampOverride {
+    bool fixed{};
+    u64 step_ns{20000};
+    u64 base_clock_ns{}; // host clock and TSC when the first timestamp was asked for
+    u64 base_tsc{};
+    std::atomic<u64> next_ns{};
+
+    GpuTimestampOverride() {
+        const char* env = std::getenv("TLG_GPU_TIMESTAMP");
+        fixed = env && std::strcmp(env, "fixed") == 0;
+        if (const char* step = std::getenv("TLG_GPU_TIMESTAMP_STEP_US")) {
+            if (const u64 us = std::strtoull(step, nullptr, 10)) {
+                step_ns = us * 1000;
+            }
+        }
+        base_clock_ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                             std::chrono::high_resolution_clock::now()
+                                                 .time_since_epoch())
+                                             .count());
+        base_tsc = Libraries::Kernel::sceKernelReadTsc();
+    }
+};
+inline GpuTimestampOverride& GpuTimestampMode() {
+    static GpuTimestampOverride mode;
+    return mode;
+}
+// Nanoseconds since the first timestamp, advanced one step per call.
+inline u64 FixedGpuTimestampNs() {
+    return GpuTimestampMode().next_ns.fetch_add(GpuTimestampMode().step_ns,
+                                               std::memory_order_relaxed);
+}
+
 static u64 GetGpuClock64() {
+    if (GpuTimestampMode().fixed) {
+        return GpuTimestampMode().base_clock_ns + FixedGpuTimestampNs();
+    }
     auto now = std::chrono::high_resolution_clock::now();
     auto duration = now.time_since_epoch();
     auto ticks = std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();
@@ -348,6 +391,10 @@ static u64 GetGpuPerfCounter() {
     const auto cpu_freq = Libraries::Kernel::sceKernelGetTscFrequency();
     const auto gpu_freq = Libraries::GnmDriver::sceGnmGetGpuCoreClockFrequency();
 
+    if (GpuTimestampMode().fixed) {
+        return Common::MultiplyAndDivide64(GpuTimestampMode().base_tsc, gpu_freq, cpu_freq) +
+               Common::MultiplyAndDivide64(FixedGpuTimestampNs(), gpu_freq, 1000000000);
+    }
     const auto cpu_cycles = Libraries::Kernel::sceKernelReadTsc();
     const auto gpu_cycles = Common::MultiplyAndDivide64(cpu_cycles, gpu_freq, cpu_freq);
 

@@ -1,4 +1,4 @@
-/* Loader side of the ISA rewrite (#33, #66): reads a G3ISA1 table (scripts/isa_rewrite.py), builds
+/* Loader side of the ISA rewrite (#33, #66; SSE4A on Intel): reads a G3ISA1 table (scripts/isa_rewrite.py), builds
  * one machine-code stub per site in an area next to the image and patches each site with a jmp
  * into its stub (or an int3). The stub saves the guest's registers, calls isa_emulate and jumps
  * back. Runs at load time, before the image is protected; libc is fine here. */
@@ -33,14 +33,16 @@ unsigned isa_site_set(const IsaSite *s);                 /* CPU_SET_* of the kin
 IsaReport isa_rewrite_apply(IsaTable *t, unsigned char *image, unsigned char *stubs, unsigned sets);
 
 /* int3 at `address` (the CC byte): 1 when it is a rewritten INT3 site; regs updated, *next_rip = site + its length (4).
- * 0 otherwise, with regs and *next_rip untouched. */
-int isa_rewrite_trap(IsaTable *t, uintptr_t address, IsaRegs *regs, uintptr_t *next_rip);
+ * 0 otherwise, with regs and *next_rip untouched. xmm: the trapped thread's XMM0-15, 16 bytes each
+ * (signal frame or CONTEXT), updated for an SSE4A site; NULL leaves SSE4A sites unhandled. */
+int isa_rewrite_trap(IsaTable *t, uintptr_t address, IsaRegs *regs, void *xmm, uintptr_t *next_rip);
 /* Site index whose stub holds rip, or -1. */
 int isa_rewrite_site_of_stub(const IsaTable *t, uintptr_t rip);
 /* "ISA: most executed sites:" then up to 10 lines "  0x<offset> <mnemonic> <hits>" (hits > 0 only),
  * descending hits, ties by ascending offset. */
 void isa_rewrite_report(const IsaTable *t, FILE *out);
-/* "movbe", "lzcnt", "tzcnt", "andn", "bextr", "blsi", "blsmsk", "blsr", "vcvtph2ps", "vcvtps2ph"; "?" otherwise. */
+/* "movbe", "lzcnt", "tzcnt", "andn", "bextr", "blsi", "blsmsk", "blsr", "vcvtph2ps", "vcvtps2ph", "extrq",
+ * "insertq", "movntss", "movntsd"; "?" otherwise. */
 const char *isa_kind_name(uint8_t kind);
 
 #endif

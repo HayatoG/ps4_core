@@ -67,6 +67,29 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
         std::max<u64>(std::min(device_local_memory - min_vacancy_critical, min_spacing_critical),
                       DEFAULT_CRITICAL_GC_MEMORY));
     trigger_gc_memory = static_cast<u64>((device_local_memory - mem_threshold) / 2);
+    // tlg (shadPS4-Infamous-FixBuild 0c3fada0): buffer memory becomes resident in large ranges
+    // (16 MB granules, gigabytes when a save loads) that the collector, running once per
+    // submission and only freeing old images, can't make room for in time. On small discrete
+    // cards keep a gigabyte free for it. Integrated GPUs follow the driver's current budget
+    // instead (GarbageCollectImages).
+    if (!instance.IsIntegrated() && device_local_memory <= SMALL_CARD_MEMORY) {
+        headroom_gc_memory = static_cast<u64>(
+            std::max<s64>(device_local_memory - RESIDENCY_HEADROOM, device_local_memory / 2));
+        ApplyResidencyHeadroom();
+        LOG_INFO(Render_Vulkan,
+                 "Texture cache: {} MB budget, collector critical at {} MB at most "
+                 "({} MB left for buffers)",
+                 device_local_memory >> 20, headroom_gc_memory >> 20, RESIDENCY_HEADROOM >> 20);
+    }
+}
+
+void TextureCache::ApplyResidencyHeadroom() {
+    if (headroom_gc_memory == 0) {
+        return;
+    }
+    critical_gc_memory = std::min(critical_gc_memory, headroom_gc_memory);
+    pressure_gc_memory = std::min(pressure_gc_memory, critical_gc_memory);
+    trigger_gc_memory = std::min(trigger_gc_memory, pressure_gc_memory);
 }
 
 TextureCache::~TextureCache() {
@@ -1453,6 +1476,9 @@ void TextureCache::GarbageCollectImages() {
                 trigger_gc_memory = budget / 10 * 7;
                 pressure_gc_memory = budget / 100 * 85;
                 critical_gc_memory = budget / 100 * 95;
+                // A forced budget too close to a small card's memory still leaves the
+                // residency headroom (ISS_GC_BUDGET_MB=5600 on a 6 GB card ran out).
+                ApplyResidencyHeadroom();
             }
         }
     }
@@ -1584,6 +1610,38 @@ void TextureCache::RunGarbageCollector() {
 
     GarbageCollectImages();
     GarbageCollectSamplers();
+}
+
+u64 TextureCache::ReleaseMemoryForAllocation() {
+    std::scoped_lock lock{mutex};
+    // Only images unused for as long as the collector's gentlest pass waits go, so the ones the
+    // guest is still drawing with stay. Same rules as the collector's clean-up otherwise.
+    const u64 ticks_to_destroy = std::min<u64>(16, gc_tick);
+    u64 num_freed = 0;
+    u64 freed_bytes = 0;
+    lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, [&](ImageId image_id) {
+        auto& image = slot_images[image_id];
+        ResolveReadbacks(image.info.guest_address, image.info.guest_size, true,
+                         ReadbackSource::CacheCleanup);
+        const bool download = image.SafeToDownload();
+        if (image.info.IsTiled() && download) {
+            // Can't handle non-linear image downloads, same as the collector.
+            return false;
+        }
+        if (download) {
+            // Synchronously, while the image still protects its pages (see the collector).
+            DownloadImageMemory(image_id, true);
+            ++gc_downloads;
+        }
+        freed_bytes += image.info.guest_size;
+        ++gc_evictions;
+        ++num_freed;
+        FreeImage(image_id);
+        return false;
+    });
+    LOG_WARNING(Render_Vulkan, "Texture cache: freed {} images (~{} MB) for an allocation",
+                num_freed, freed_bytes >> 20);
+    return freed_bytes;
 }
 
 void TextureCache::TouchImage(const Image& image) {

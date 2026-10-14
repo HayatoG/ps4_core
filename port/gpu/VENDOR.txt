@@ -13,3 +13,10 @@ Post-processing on the presented image (host_passes/postfx_pass.cpp), MIT licens
   71c806a838bdd7d517df19192a20f0c61b3ca29d (Jimenez, Echevarria, Masia, Navarro, Gutierrez; LICENSE.txt).
   host_shaders/cas/ffx_cas.h from https://github.com/GPUOpen-Effects/FidelityFX-CAS commit
   9fabcc9a2c45f958aff55ddfda337e74ef894b7f (AMD; LICENSE.txt), used with FSR 1's ffx_a.h.
+Ported from the shadPS4-Infamous-FixBuild fork (https://github.com/rayhlancaner-png/shadPS4-Infamous-FixBuild,
+GPL-2.0-or-later; authors Eye Of The Ruins/rayhlancaner-png, TOXIC-KID, 0xDeftones), adapted to our tree:
+  32851afe float atomic min/max with one integer atomic, 03db8f14 stencil test/op values,
+  e656365e allocate past the memory budget, e35e04dc pageable device local memory,
+  4a206865 residency granules, 0c3fada0 residency OOM retry, a107bf06 uploads in parts,
+  89854b0b + bde510f8 compute pipelines off the GPU thread, 0dff21f1 pipeline creation retry,
+  7e1c7cab submit in pieces, ee423726 + 2d2511fe + 9a5224bf guest threads wait for their own readbacks.

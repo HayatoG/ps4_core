@@ -50,6 +50,11 @@ class TextureCache {
     static constexpr s64 DEFAULT_PRESSURE_GC_MEMORY = 1_GB + 512_MB;
     static constexpr s64 DEFAULT_CRITICAL_GC_MEMORY = 3_GB;
     static constexpr s64 TARGET_GC_THRESHOLD = 8_GB;
+    /// tlg (shadPS4-Infamous-FixBuild 0c3fada0): cards with a budget up to this keep the
+    /// collector's critical mark at least RESIDENCY_HEADROOM below it, forced budget or not.
+    static constexpr s64 SMALL_CARD_MEMORY = 6_GB;
+    /// Room the collector tries to leave for memory the buffer cache makes resident.
+    static constexpr s64 RESIDENCY_HEADROOM = 1_GB;
 
     using ImageIds = boost::container::small_vector<ImageId, 16>;
 
@@ -309,6 +314,13 @@ public:
     /// Runs the garbage collector.
     void RunGarbageCollector();
 
+    /// tlg: frees the images unused for as long as the collector's gentlest pass waits, without
+    /// its limit on how many go, for an allocation that failed for lack of device memory. Only
+    /// on the thread that owns the caches, with the texture binding helper joined. Returns
+    /// about how many bytes went. The memory is released once the GPU is done with the images
+    /// (Scheduler::PopPendingOperations after a Finish).
+    u64 ReleaseMemoryForAllocation();
+
     template <typename Func>
     void ForEachImageInRegion(VAddr cpu_addr, size_t size, Func&& func) {
         using FuncReturn = typename std::invoke_result<Func, ImageId, Image&>::type;
@@ -440,6 +452,9 @@ private:
     u64 trigger_gc_memory = 0;
     u64 pressure_gc_memory = 0;
     u64 critical_gc_memory = 0;
+    /// tlg: the most critical_gc_memory may be on small cards (0: no cap), see SMALL_CARD_MEMORY.
+    u64 headroom_gc_memory = 0;
+    void ApplyResidencyHeadroom();
     u64 total_used_samplers = 0;
     u64 trigger_gc_samplers = 0;
     u64 pressure_gc_samplers = 0;

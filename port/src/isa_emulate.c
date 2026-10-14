@@ -124,3 +124,26 @@ void ABI isa_emulate(const IsaSite *site, IsaRegs *regs) {
     write_dst(site, regs, result);
     set_flags(regs, defined, flags);
 }
+
+int isa_kind_is_sse4a(uint8_t kind) { return kind >= ISA_EXTRQ && kind <= ISA_MOVNTSD; }
+
+/* Field length (0 means 64) and bit index: 6 bits each, the upper bits of their bytes are ignored. */
+static uint64_t field_mask(unsigned length) { return length == 0 ? ~0ull : (1ull << length) - 1; }
+
+void ABI isa_emulate_sse4a(const IsaSite *site, uint64_t xmm[4]) {
+    uint64_t control;
+    switch (site->kind) {
+    case ISA_EXTRQ: control = xmm[2]; break;                   /* xmm2[5:0], xmm2[13:8] */
+    case ISA_INSERTQ: control = xmm[3]; break;                 /* xmm2[69:64], xmm2[77:72] */
+    case ISA_EXTRQ_IMM: case ISA_INSERTQ_IMM: control = (uint64_t)site->disp; break;
+    default: return;                                           /* MOVNTSS/MOVNTSD are never applied */
+    }
+    const unsigned length = control & 63, index = control >> 8 & 63;
+    if (site->kind == ISA_EXTRQ || site->kind == ISA_EXTRQ_IMM) {
+        xmm[0] = xmm[0] >> index & field_mask(length);
+    } else {
+        const uint64_t mask = field_mask(length) << index;     /* bits past 63 are dropped */
+        xmm[0] = (xmm[0] & ~mask) | (xmm[2] << index & mask);
+    }
+    xmm[1] = 0;
+}

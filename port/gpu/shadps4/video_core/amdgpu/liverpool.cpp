@@ -26,6 +26,7 @@
 #include "tlg_write_log.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
+#include "video_core/renderer_vulkan/vk_frame_record.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 namespace AmdGpu {
@@ -765,6 +766,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 // They may write guest memory: not before fences deferred earlier.
                 rasterizer->WaitDeferredSignals();
             }
+            // tlg: TLG_FRAME_RECORD_TRIGGER (vk_frame_record.h).
+            if (Vulkan::FrameRecord::Active()) [[unlikely]] {
+                Vulkan::FrameRecord::Packet(-1, header, &regs);
+            }
             switch (opcode) {
             case PM4ItOpcode::Nop: {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -1416,6 +1421,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         const PM4ItOpcode opcode = header->type3.opcode;
 
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
+        if (Vulkan::FrameRecord::Active()) [[unlikely]] {
+            Vulkan::FrameRecord::Packet(static_cast<int>(vqid), header, nullptr);
+        }
         switch (opcode) {
         case PM4ItOpcode::Nop: {
             const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);

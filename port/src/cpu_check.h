@@ -10,10 +10,15 @@
 typedef struct { uint32_t leaf1_ecx, leaf7_ebx, ext1_ecx; } CpuFeatureWords;
 
 CpuFeatureWords cpu_feature_words(void);
-enum { CPU_SET_MOVBE = 1u << 0, CPU_SET_BMI1 = 1u << 1, CPU_SET_LZCNT = 1u << 2, CPU_SET_F16C = 1u << 3 };
+enum { CPU_SET_MOVBE = 1u << 0, CPU_SET_BMI1 = 1u << 1, CPU_SET_LZCNT = 1u << 2, CPU_SET_F16C = 1u << 3, CPU_SET_SSE4A = 1u << 4 };
 /* Fatal sets the host lacks (SSE4.2, POPCNT, AVX), comma separated in out; returns how many. */
 int cpu_missing_fatal(CpuFeatureWords words, char *out, size_t size);
-/* Rewritable sets the host lacks (MOVBE, F16C, BMI1, LZCNT): CPU_SET_* mask; names in out. */
+/* Rewritable sets the host lacks (MOVBE, F16C, BMI1, LZCNT, SSE4A): CPU_SET_* mask; names in out. */
 unsigned cpu_missing_rewritable(CpuFeatureWords words, char *out, size_t size);
+
+/* CPU_SET_* of a TLG_ISA_REWRITE value: "1" = every emulated set (MOVBE, BMI1, LZCNT, SSE4A),
+ * otherwise a comma separated list of names ("sse4a", "movbe,bmi1", case-insensitive); 0 for "0",
+ * empty, or a list with an unknown name (*valid = 0 then). */
+unsigned cpu_sets_named(const char *list, int *valid);
 
 #endif
