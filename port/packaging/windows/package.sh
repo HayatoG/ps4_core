@@ -46,11 +46,27 @@ cp launcher/$PORT_ICON.ico launcher/$PORT_ICON.png "$dest/launcher/"
 for exe in tlg-probe.exe tlg-gpu-capabilities.exe; do
     llvm-strip --strip-debug -o "$dest/out/$exe" "out/$exe"
 done
-# Every DLL the executables load from the CLANG64 tree (SDL3, FFmpeg, Vulkan loader, ...).
-ldd "$dest/out/tlg-probe.exe" "$dest/out/tlg-gpu-capabilities.exe" |
-    awk '/\/clang64\/bin\// {print $3}' | sort -u | while read -r dll; do
-        cp -u "$dll" "$dest/out/"
-    done
+# Every DLL the executables load from the CLANG64 tree (SDL3, FFmpeg, Vulkan loader, ...), found by
+# walking the import tables against /clang64/bin itself. ldd resolved them through PATH, where the
+# runner's Strawberry Perl has its own libiconv-2.dll: that one was filtered out as "not CLANG64"
+# and some packages shipped without libiconv-2.dll ("libiconv-2.dll was not found" at Play).
+# Names not in /clang64/bin are Windows' own DLLs.
+declare -A shipped=()
+queue=("$dest/out/tlg-probe.exe" "$dest/out/tlg-gpu-capabilities.exe")
+while ((${#queue[@]})); do
+    binary=${queue[0]}
+    queue=("${queue[@]:1}")
+    while read -r dll; do
+        key=${dll,,}
+        [[ -n ${shipped[$key]:-} ]] && continue
+        shipped[$key]=1
+        source=$(find /clang64/bin -maxdepth 1 -iname "$dll" -print -quit)
+        [[ -n $source ]] || continue
+        cp -u "$source" "$dest/out/"
+        queue+=("$source")
+    done < <(llvm-readobj --coff-imports "$binary" | awk '$1 == "Name:" && tolower($2) ~ /\.dll$/ {print $2}')
+done
+echo "Packaged $(find "$dest/out" -maxdepth 1 -iname '*.dll' | wc -l) DLLs from /clang64/bin"
 cp -r scripts "$dest/"
 find "$dest" -name __pycache__ -prune -exec rm -r {} +
 cp LICENSE packaging/README-player.md "$dest/"
