@@ -14,6 +14,7 @@
 #include <miniz.h>
 
 #include <condition_variable>
+#include <cstdlib>
 #include <functional>
 #include <future>
 #include <mutex>
@@ -30,9 +31,81 @@ std::mutex m_request{};
 mz_zip_archive zip_ar{};
 bool ar_is_read_only{true};
 
+#ifdef TLG_SHADER_CACHE_KEY
+// tlg: the GPU user folder used to be chosen at load time, before the probe set
+// TLG_GPU_USER_DIR: ~/.local/share/shadPS4 on Linux (shadPS4's own folder) and <saves>/user on
+// Windows. On the first start with the port's folder, this game's cache for the current key is
+// moved here once, so nothing is recompiled. Only that <serial>-<key> folder is taken; nothing
+// else in the shadPS4 folder is touched (an installed shadPS4 emulator may own it).
+void MigrateLegacyCache(const std::filesystem::path& cache_path) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (fs::exists(cache_path, ec)) {
+        return;
+    }
+    const auto name = cache_path.filename();
+    std::vector<fs::path> sources{Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "user" /
+                                  "cache" / name};
+#ifndef _WIN32
+    if (const char* data = std::getenv("XDG_DATA_HOME"); data && data[0]) {
+        sources.push_back(fs::path{data} / "shadPS4" / "cache" / name);
+    } else if (const char* home = std::getenv("HOME"); home && home[0]) {
+        sources.push_back(fs::path{home} / ".local" / "share" / "shadPS4" / "cache" / name);
+    }
+#endif
+    for (const auto& source : sources) {
+        if (!fs::is_directory(source, ec)) {
+            continue;
+        }
+        fs::create_directories(cache_path.parent_path(), ec);
+        fs::rename(source, cache_path, ec);
+        if (ec) {
+            // Another file system: copy, then delete the old folder only if the copy is whole.
+            ec.clear();
+            fs::copy(source, cache_path, fs::copy_options::recursive, ec);
+            if (ec) {
+                LOG_WARNING(Render, "Shader cache: could not move {} here ({}); rebuilding it",
+                            source.string(), ec.message());
+                fs::remove_all(cache_path, ec);
+                return;
+            }
+            fs::remove_all(source, ec);
+        }
+        LOG_INFO(Render, "Shader cache moved from {} to {}", source.string(), cache_path.string());
+        return;
+    }
+}
+
+// tlg: shaders translated by an older recompiler are never reused: this game's folders of other
+// keys (and the unkeyed <serial>) are removed, in the port's own cache folder only.
+void PruneOtherRevisions(const std::filesystem::path& cache_path) {
+    const std::string serial{Common::ElfInfo::Instance().GameSerial()};
+    const auto name = cache_path.filename().string();
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(cache_path.parent_path(), ec)) {
+        const auto other = entry.path().filename().string();
+        if (entry.is_directory(ec) && other != name &&
+            (other == serial || other.rfind(serial + "-", 0) == 0)) {
+            LOG_INFO(Render, "Removing shader cache of another recompiler revision: {}", other);
+            std::filesystem::remove_all(entry.path(), ec);
+        }
+    }
+}
+#endif
+
 } // namespace
 
 namespace Storage {
+
+std::filesystem::path GameCacheDir() {
+    const std::string serial{Common::ElfInfo::Instance().GameSerial()};
+#ifdef TLG_SHADER_CACHE_KEY
+    return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
+           (serial + "-" + TLG_SHADER_CACHE_KEY);
+#else
+    return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / serial;
+#endif
+}
 
 void ProcessIO(const std::stop_token& stoken) {
     Common::SetCurrentThreadName("shadPS4:PipelineCacheIO");
@@ -110,25 +183,10 @@ void DataBase::Open() {
             mz_zip_writer_init_file(&zip_ar, cache_path.string().c_str(), 0);
         }
     } else {
+        cache_path = GameCacheDir();
 #ifdef TLG_SHADER_CACHE_KEY
-        // tlg: one directory per recompiler revision (TLG_SHADER_CACHE_KEY, a hash of the
-        // recompiler sources): shaders translated by older code are never reused, and their
-        // directories (same serial, another key) are removed.
-        const std::string serial{game_info.GameSerial()};
-        const std::string name = serial + "-" + TLG_SHADER_CACHE_KEY;
-        cache_path = GetUserPath(PathType::CacheDir) / name;
-        std::error_code ec;
-        for (const auto& entry :
-             std::filesystem::directory_iterator(GetUserPath(PathType::CacheDir), ec)) {
-            const auto other = entry.path().filename().string();
-            if (entry.is_directory() && other != name &&
-                (other == serial || other.rfind(serial + "-", 0) == 0)) {
-                LOG_INFO(Render, "Removing shader cache of another recompiler revision: {}", other);
-                std::filesystem::remove_all(entry.path(), ec);
-            }
-        }
-#else
-        cache_path = GetUserPath(PathType::CacheDir) / game_info.GameSerial();
+        MigrateLegacyCache(cache_path);
+        PruneOtherRevisions(cache_path);
 #endif
         if (!std::filesystem::exists(cache_path)) {
             std::filesystem::create_directories(cache_path);

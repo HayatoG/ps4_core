@@ -110,7 +110,8 @@ def clear_shader_cache():
     serial = shader_cache.title_id(game)
     if not serial:
         fail(f'No sce_sys/param.sfo in {game} (set TLG_GAME_DIR).')
-    freed, failures = shader_cache.clear([serial], Path(env.get('TLG_USER_DIR', data / 'user')))
+    user_dir = Path(env.get('TLG_GPU_USER_DIR') or env.get('TLG_USER_DIR') or data / 'user')
+    freed, failures = shader_cache.clear([serial], user_dir)
     print(f'Shader cache of {serial}: {shader_cache.human_size(freed)} freed', flush=True)
     for path, error in failures:
         print(f'Not deleted (in use? close the game): {path}: {error}', file=sys.stderr)
@@ -230,7 +231,8 @@ def main():
         env['TLG_DERIVED'] = ','.join(derived)
 
         # The in-game restart starts this script again once this process is gone.
-        # GPU caches (shaders, pipelines) beside the saves; read before main(), so set here.
+        # GPU caches (shaders, pipelines) beside the saves (path_util.cpp reads it when
+        # the GPU starts; set here too so the in-game restart and the tools agree).
         user_dir = Path(env.get('TLG_USER_DIR', data / 'user')).resolve()
         user_dir.mkdir(parents=True, exist_ok=True)
         env.setdefault('TLG_GPU_USER_DIR', str(user_dir))

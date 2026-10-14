@@ -18,6 +18,7 @@
 #include "video_core/renderer_vulkan/vk_lighting_test.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "common/elf_info.h"
+#include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
@@ -448,8 +449,8 @@ GraphicsPipeline::GraphicsPipeline(
         .layout = *pipeline_layout,
     };
 
-    const auto binary_directory = Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
-        Common::ElfInfo::Instance().GameSerial() / "pipeline-binaries";
+    // tlg: in the game's keyed cache folder, so a new recompiler or "clear cache" drops them too.
+    const auto binary_directory = Storage::GameCacheDir() / "pipeline-binaries";
     auto [pipeline_result, pipe] =
         CreateCachedGraphicsPipeline(device, pipeline_cache, pipeline_info, key,
                                      instance.GetPipelineBinaryGlobalKey(), binary_directory);

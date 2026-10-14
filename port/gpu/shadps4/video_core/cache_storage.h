@@ -20,6 +20,10 @@ enum class BlobType : u32 {
     ShaderProfile,
 };
 
+/// tlg: this game's shader cache folder: <gpu user>/cache/<serial>-<recompiler key>
+/// (TLG_SHADER_CACHE_KEY), or <serial> without a key. Pipeline binaries go in it too.
+[[nodiscard]] std::filesystem::path GameCacheDir();
+
 class DataBase {
 public:
     static DataBase& Instance() {

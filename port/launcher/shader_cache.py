@@ -1,15 +1,18 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """The GPU shader cache of one game: where it is, how big it is, and clearing it.
 
-The GPU backend (shadPS4 fork, video_core/cache_storage.cpp) keeps under <gpu user>/cache/:
-  <serial>-<recompiler key>/  translated shaders (*.spv, *.meta, *.key, profile.bin); a new
-                              recompiler gets a new key and the old directories are removed;
-  <serial>/                   the same without a key, and pipeline-binaries/ (VK_KHR_pipeline_binary);
-  <serial>.zip                the archived form of the same cache.
-<gpu user> is TLG_GPU_USER_DIR, else user/ in the game's working directory (the saves folder:
-port/user/user on Windows, where it is always created), else ~/.local/share/shadPS4 on Linux, which
-every port shares: only the entries of this game's serial are touched. Everything here is rebuilt on
-the next start; saves, settings, logs and the console modules are never in it.
+The GPU backend (shadPS4 fork, video_core/cache_storage.cpp) keeps it in the port's own folder,
+<gpu user>/cache/ (<gpu user> = TLG_GPU_USER_DIR, which the probe sets to its --user folder, the
+saves folder, on every OS):
+  <serial>-<recompiler key>/  translated shaders (*.spv, *.meta, *.key, profile.bin) and
+                              pipeline-binaries/; other keys of the game are pruned at start;
+  <serial>/, <serial>.zip     older unkeyed layout and the archived form.
+Before, the folder was picked too early: ~/.local/share/shadPS4 on Linux (shadPS4's own folder,
+shared with an installed shadPS4 emulator) and <saves>/user on Windows. The game moves its current
+<serial>-<key> folder from there once; clearing also takes the port's leftovers there, but in the
+shadPS4 folder only <serial>-<12 hex digits> folders (certainly the port's: the emulator names its
+caches <serial>/ and <serial>.zip). Everything here is rebuilt on the next start; saves, settings,
+logs and the console modules are never in it.
 """
 import os
 from pathlib import Path
@@ -19,6 +22,8 @@ from struct import unpack_from
 import sys
 
 SERIAL = re.compile(r'^[A-Z]{4}[0-9]{5}$')
+# The port's keyed folder name: <serial>-<first 12 hex digits of TLG_SHADER_CACHE_KEY>.
+KEYED = re.compile(r'^([A-Z]{4}[0-9]{5})-[0-9a-f]{12}$')
 
 
 def title_id(game_dir):
@@ -37,38 +42,35 @@ def title_id(game_dir):
     return None
 
 
-def gpu_user_dirs(user_dir, env=None):
-    """Every folder the GPU backend may have used as its user folder for this port."""
+def cache_dirs(gpu_user_dir, env=None):
+    """(folder, keyed_only) pairs: the port's cache, the old Windows one, the shared shadPS4 one."""
     env = os.environ if env is None else env
-    user_dir = Path(user_dir)
-    candidates = [Path(env['TLG_GPU_USER_DIR'])] if env.get('TLG_GPU_USER_DIR') else []
-    candidates += [user_dir, user_dir / 'user']
+    gpu_user_dir = Path(gpu_user_dir)
+    dirs = [(gpu_user_dir / 'cache', False), (gpu_user_dir / 'user' / 'cache', False)]
     if os.name != 'nt':
         data_home = env.get('XDG_DATA_HOME') or str(Path(env.get('HOME') or Path.home()) / '.local' / 'share')
-        candidates.append(Path(data_home) / 'shadPS4')
-    unique = []
-    for path in candidates:
-        if path not in unique:
-            unique.append(path)
-    return unique
+        dirs.append((Path(data_home) / 'shadPS4' / 'cache', True))
+    return dirs
 
 
-def entries(serials, user_dir, env=None):
+def entries(serials, gpu_user_dir, env=None):
     """The cache entries of these serials (directories and archives), existing ones only."""
     serials = {s for s in serials if s and SERIAL.match(s)}
     found = []
-    for base in gpu_user_dirs(user_dir, env):
-        cache = base / 'cache'
+    for cache, keyed_only in cache_dirs(gpu_user_dir, env):
         try:
             names = sorted(os.listdir(cache))
         except OSError:
             continue
         for name in names:
-            stem = name[:-4] if name.endswith('.zip') else name
-            if any(stem == s or stem.startswith(s + '-') for s in serials):
-                path = cache / name
-                if path not in found:
-                    found.append(path)
+            if keyed_only:
+                ours = bool((keyed := KEYED.match(name)) and keyed.group(1) in serials)
+            else:
+                stem = name[:-4] if name.endswith('.zip') else name
+                ours = any(stem == s or stem.startswith(s + '-') for s in serials)
+            path = cache / name
+            if ours and path not in found:
+                found.append(path)
     return found
 
 
@@ -90,15 +92,15 @@ def size_of(path):
     return total
 
 
-def size(serials, user_dir, env=None):
-    return sum(size_of(path) for path in entries(serials, user_dir, env))
+def size(serials, gpu_user_dir, env=None):
+    return sum(size_of(path) for path in entries(serials, gpu_user_dir, env))
 
 
-def clear(serials, user_dir, env=None):
+def clear(serials, gpu_user_dir, env=None):
     """Deletes the cache of these serials; returns (bytes freed, [(path, error)] not deleted).
     A file in use (Windows, the game still open) stays and is reported; the rest goes."""
     freed, failures = 0, []
-    for path in entries(serials, user_dir, env):
+    for path in entries(serials, gpu_user_dir, env):
         before = size_of(path)
         errors = []
         try:

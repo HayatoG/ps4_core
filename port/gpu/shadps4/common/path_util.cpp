@@ -84,29 +84,15 @@ static std::optional<std::filesystem::path> GetBundleParentDirectory() {
 }
 #endif
 
-static auto UserPaths = [] {
-    // tlg: the port keeps GPU caches where TLG_GPU_USER_DIR points.
+// tlg: built on first use, not at load time: tlggpu_init() sets TLG_GPU_USER_DIR from the probe's
+// --user folder (the saves folder) before anything asks for a path, so the GPU caches live in the
+// port's own user folder on every OS. Never shadPS4's ~/.local/share/shadPS4 or %APPDATA% folder:
+// an installed shadPS4 emulator owns those (and the same <serial> cache names).
+static std::unordered_map<PathType, fs::path> MakeUserPaths() {
     const char* port_dir = std::getenv("TLG_GPU_USER_DIR");
-    auto user_dir = port_dir ? std::filesystem::path(port_dir) : std::filesystem::current_path() / PORTABLE_DIR;
-    if (!std::filesystem::exists(user_dir)) {
-        // If it doesn't exist, use the standard path for the platform instead.
-        // NOTE: On Windows we currently just create the portable directory instead.
-#ifdef __APPLE__
-        user_dir =
-            std::filesystem::path(getenv("HOME")) / "Library" / "Application Support" / "shadPS4";
-#elif defined(__linux__)
-        const char* xdg_data_home = getenv("XDG_DATA_HOME");
-        if (xdg_data_home != nullptr && strlen(xdg_data_home) > 0) {
-            user_dir = std::filesystem::path(xdg_data_home) / "shadPS4";
-        } else {
-            user_dir = std::filesystem::path(getenv("HOME")) / ".local" / "share" / "shadPS4";
-        }
-#elif _WIN32
-        // tlg: never shadPS4's %APPDATA% folder (an installed shadPS4 owns it); this runs
-        // before main, so the portable folder is created here (run.py sets TLG_GPU_USER_DIR).
-        std::filesystem::create_directories(user_dir);
-#endif
-    }
+    const auto user_dir = port_dir && port_dir[0] ? std::filesystem::path(port_dir)
+                                                  : std::filesystem::current_path() / PORTABLE_DIR;
+    std::filesystem::create_directories(user_dir);
 
     std::unordered_map<PathType, fs::path> paths;
 
@@ -151,7 +137,12 @@ static auto UserPaths = [] {
     }
 
     return paths;
-}();
+}
+
+static std::unordered_map<PathType, fs::path>& UserPaths() {
+    static auto paths = MakeUserPaths();
+    return paths;
+}
 
 bool ValidatePath(const fs::path& path) {
     if (path.empty()) {
@@ -180,7 +171,7 @@ std::string PathToUTF8String(const std::filesystem::path& path) {
 }
 
 const fs::path& GetUserPath(PathType shad_path) {
-    return UserPaths.at(shad_path);
+    return UserPaths().at(shad_path);
 }
 
 std::string GetUserPathString(PathType shad_path) {
@@ -194,7 +185,7 @@ void SetUserPath(PathType shad_path, const fs::path& new_path) {
         return;
     }
 
-    UserPaths.insert_or_assign(shad_path, new_path);
+    UserPaths().insert_or_assign(shad_path, new_path);
 }
 
 std::optional<fs::path> FindGameByID(const fs::path& dir, const std::string& game_id,
