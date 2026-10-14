@@ -58,6 +58,8 @@ uintptr_t runtime_services_resolve(const char *name);
  * runtime_gr2.c). */
 uintptr_t runtime_eventflag_resolve(const char *name);
 uintptr_t runtime_system_resolve(const char *name);
+uintptr_t runtime_fiber_resolve(const char *name);
+uintptr_t runtime_offline_resolve(const char *name);
 /* Game profile (layer 2, runtime_profile.c): call once at the start of main, after the env
  * prefix alias. Fills unset TLG_* variables from the profile's keys. */
 void runtime_profile_load(void);

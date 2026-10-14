@@ -249,6 +249,10 @@ uintptr_t runtime_resolve(const char *name, int is_data) {
     if (eventflag) return eventflag;
     uintptr_t system = runtime_system_resolve(name);
     if (system) return system;
+    uintptr_t fiber = runtime_fiber_resolve(name);
+    if (fiber) return fiber;
+    uintptr_t offline = runtime_offline_resolve(name);
+    if (offline) return offline;
     uintptr_t services = runtime_services_resolve(name);
     if (services) return services;
     uintptr_t ajm = runtime_ajm_resolve(name);
