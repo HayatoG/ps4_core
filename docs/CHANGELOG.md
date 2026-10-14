@@ -2,6 +2,25 @@
 
 [English below](#english). Hashes da `main` do port onde a mudança nasceu (`iss` = infamous_pc, `gr2` = gr2_pc, `tlg` = tlg_pc). O `ps4_core` só junta: os commits daqui dizem de qual snapshot cada arquivo veio (ver também `CORE_SOURCE`).
 
+## 14/10/2026: sync com o `infamous_pc` `fd78ad5` (PRs #5 e #6)
+
+Do inFAMOUS desde `f76850a`: readback antecipado, ajustes do write merge, prefixo `ISS_` e o gráfico de sessão. O resto do PR #6 é o mesmo sync do upstream gow3_pc que já estava aqui (mesclas em 3 vias com base `iss f76850a`; o lado do núcleo — SMAA/CAS, mouse e teclado, presenter, `TLG_SKIP_ADJACENCY`, upstream — ficou inteiro).
+
+**GPU**
+- **Readback antecipado** (`TLG_EAGER_READBACK=1`, desligado no núcleo; o inFAMOUS liga por padrão no launcher e no `infamous_run.sh`): nos pacotes de fence (`liverpool.cpp` → `Rasterizer::EagerCopyAtFence`) a GPU copia para a CPU os buffers que o jogo costuma ler de volta, e a falta de leitura seguinte é atendida pela cópia sem esperar a GPU (`buffer_cache.cpp`, `TryEagerRead` em `vk_rasterizer.cpp`). `TLG_READBACK_STATS=1` conta readbacks por faixa (`iss c5dd761`).
+- **Cópias velhas descartadas** (`iss f4c30a1`): bytes que a CPU escreve sem falta (`TLG_WRITE_MERGE`) e o upload seguinte mudam a cópia da GPU depois do fence; as cópias antecipadas dessas páginas viram *stale* (`MarkEagerStale`/`NoteGpuWriteForEager`). Antes, servidas juntas, uma cópia velha sobrescrevia os bytes novos do jogo (objetos sumiam quando uma base da D.U.P. explodia). Também não se serve a cópia depois de um readback de imagem da mesma faixa (a imagem resolveu dados mais novos).
+
+**Runtime e loader**
+- **Prefixo de ambiente por jogo** (`iss d62c942`, genérico aqui): `probe.c` `alias_port_environment()` copia cada `<PREFIXO>X` para `TLG_X` no início (se `TLG_X` não estiver definido). O prefixo vem do port: `PORT_ENV_PREFIX="ISS_"` no `port/packaging/port.env` (ou no ambiente); o `build.sh` passa `-DPORT_ENV_PREFIX="ISS_"` ao `tlg-probe` (no Windows, `-DPORT_ENV_PREFIX=` ao CMake). Sem a definição (TLG, build só do núcleo) não há alias. **O `infamous_pc` precisa acrescentar `PORT_ENV_PREFIX="ISS_"` ao seu `port.env` ao trazer este núcleo** (antes o `ISS_` era fixo no `probe.c`).
+- **TSC** (`1bf317a` aqui, `iss d62c942`): o padrão volta a ser o `rdtsc` do host com a frequência medida; o relógio do processo do upstream (1 GHz) fica opcional com `TLG_TSC=process`. O inFAMOUS executa `rdtsc` direto em 391 lugares e rodava 3–4x rápido com o relógio do processo (ver KNOWN_ISSUES #15).
+
+**Scripts**
+- `scripts/session_chart.py`: modo sem limite de FPS (`iss e54913e`).
+
+**Testes**
+- `test_pad.c`/`test_pad_map.c`: stub de `tlggpu_overlay_notice` (o `runtime_pad.c` mesclado avisa na tela ao trocar o modo do sensor; o `build.sh --test` não ligava). `test_gpu_runtime_stubs.cpp`: stub de `runtime_report` (o `tlggpu.cpp` do upstream chama; `motion-shader-test` e afins não ligavam).
+- Conferido num worktree do `infamous_pc` `fd78ad5` com este núcleo: `build.sh` e `build.sh --test` passam. `camera-motion-test` e `postfx-test` caem dentro de `Vulkan::CreateInstance` (ponteiro nulo); o `camera-motion-test` cai igual na `main` do inFAMOUS (lá nem ligava sem os stubs): problema anterior dos testes de GPU sem janela.
+
 ## 13/10/2026: upstream gow3_pc (branch `upstream/gow3-sync`)
 
 Do [FelipePrado0/gow3_pc](https://github.com/FelipePrado0/gow3_pc) `9a6d17c..2a0eac6` (105 commits; os ports copiaram `9a6d17c`), **só a parte de núcleo**, renomeada para `TLG_`/`tlg_` e mesclada em 3 vias sobre as nossas mudanças (chave de permutação de shader, transições parciais, `fs:[0]` em qualquer registrador, wave64, stencil, write merge e o resto ficam como estavam). Hashes do upstream (`up`).
@@ -64,6 +83,8 @@ Do [FelipePrado0/gow3_pc](https://github.com/FelipePrado0/gow3_pc) `9a6d17c..2a0
 <a id="english"></a>
 
 ## English
+
+**2026-10-14: sync with infamous_pc `fd78ad5` (PRs #5, #6).** Eager GPU readback (`TLG_EAGER_READBACK=1`, off in the core, on by default in inFAMOUS): at fence packets the GPU copies the buffers the game reads back, and the next read fault is served from that copy without waiting (`c5dd761`); `TLG_READBACK_STATS=1`. Stale-copy fix (`f4c30a1`): CPU writes merged without a fault (`TLG_WRITE_MERGE`) and their upload mark the eager copies of those pages stale (a stale copy used to overwrite the game's new bytes: objects vanished); no eager copy is served after an image readback of the range. Per-game env prefix made generic: `alias_port_environment()` copies `<PREFIX>X` to `TLG_X`, prefix from the port (`PORT_ENV_PREFIX="ISS_"` in `port/packaging/port.env`, passed by `build.sh` as `-DPORT_ENV_PREFIX`; none = no alias) — infamous_pc must add that line to its `port.env`. TSC default back to the host rdtsc (`TLG_TSC=process` opts in; inFAMOUS executes rdtsc itself). `session_chart.py` uncapped mode. Test stubs: `tlggpu_overlay_notice` (pad tests), `runtime_report` (GPU tests). Verified in an infamous_pc `fd78ad5` worktree: `build.sh` and `build.sh --test` pass; `camera-motion-test`/`postfx-test` segfault in `Vulkan::CreateInstance`, same as on inFAMOUS main (pre-existing). The rest of PR #6 is the upstream sync already here; all core-side work (SMAA/CAS, mouse, presenter, `TLG_SKIP_ADJACENCY`) kept.
 
 **2026-10-13: upstream gow3_pc sync (branch `upstream/gow3-sync`).** Core part of FelipePrado0/gow3_pc `9a6d17c..2a0eac6`, renamed to `TLG_`/`tlg_` and 3-way merged over our changes. Runtime: guest TSC = process clock (`2dea61f`); ISA rewrite for CPUs without MOVBE/BMI1/LZCNT (`--cpu-features`, `scripts/isa_rewrite.py` + iced-x86, `--isa-rewrite`, `TLG_ISA_REWRITE`, `TLG_CPU_CHECK`; each port runner must generate and pass the table, done in `infamous_run.py`); `--gamepad`, `--mount guest=host`; preparation diagnostics and file hashes in the link. GPU: guest multisampling off by default on AMD/Intel Windows drivers (RDNA2/Arc black lines; `TLG_NO_MSAA=0|1`); bisect knobs `TLG_LIGHTING_TEST`, `TLG_AMD_PATHS_OFF`; `TLG_WAVE_STATS=1`, `TLG_FULL_BARRIERS=1`; frame capture census, `TLG_DIAG_IMAGES=1`, null-address crash fix. Window: hidden system cursor (shown while Esc releases the TLG mouse); `TLG_GLYPHS=xbox|nintendo` button names in the menu. Not taken: GoW3 patches/cheats, glyphs.py, the GoW3 launcher (incl. its settings-persistence fix), Steam art, game_update.py, the Linux AppImage, docs.
 

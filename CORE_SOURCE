@@ -3,12 +3,20 @@
 # Linha / line: <repositório/repo> <ref> <commit fixado/pinned commit>   # o que veio / what came
 # O core_sync.py usa o commit fixado (não a ref, que anda) / core_sync.py uses the pinned commit.
 #
-# Snapshot de 13/10/2026 (ps4_core: commits "Sync with infamous_pc ..." e "Sync with tlg_pc ...").
+# Snapshot de 13/10/2026 (ps4_core: commits "Sync with infamous_pc ..." e "Sync with tlg_pc ..."),
+# atualizado em 14/10/2026 com infamous_pc fd78ad5 (PRs #5 e #6).
 
 # Base de tudo / base of everything: loader, runtime, GPU, scripts, packaging (import 4448ef2),
 # + 35d2aba loader: host-resolved imports not overwritten by native libc bindings (probe.c, runtime.c)
 # + 335c0b7 TLG_WRITE_MERGE / download window (buffer_cache.*, tlggpu.cpp, tlggpu.h)
-~/decomp/infamous_pc origin/main f76850a9759c257efb5f067d081177fa2923e91b
+# + 14/10/2026, fd78ad5 (PR #5 c5dd761 f4c30a1: eager readback, readback stats, stale-copy fix;
+#   PR #6 d62c942: ISS_ alias, made generic here via PORT_ENV_PREFIX; e54913e session_chart.py uncapped).
+#   Copiados / copied: liverpool.cpp, buffer_cache.cpp/.h, probe.c (+ PORT_ENV_PREFIX), session_chart.py.
+#   Mesclados em 3 vias com base f76850a / 3-way merged on base f76850a: vk_rasterizer.cpp/.h, runtime_pad.c,
+#   window.cpp (lado do núcleo nos comentários / core side on comments); UPSTREAM.md, build.sh, CMakeLists.txt,
+#   vk_scheduler.cpp, tlg_overlay.cpp, tlggpu.cpp, test_gpu_runtime_stubs.cpp: o lado iss era o mesmo sync do
+#   upstream que já estava aqui / the iss side was the same upstream sync already here.
+~/decomp/infamous_pc origin/main fd78ad5240c35b5547eeafaf824f676da934532b
 
 # Do TLG (PR #12 mesclado) / from TLG (after PR #12):
 # + 4a375f0, 7f8fb85 pós-processamento / post-processing: postfx_pass.*, smaa*, cas*, post_process.frag,

@@ -86,7 +86,15 @@ O **`CORE_MANIFEST`** é a lista exata do que é núcleo (globs, exclusões `!` 
 
 ### Prefixo das variáveis de ambiente
 
-Hoje todo port usa `TLG_` (herdado do primeiro port). Plano: **`TLG_`** (The Last Guardian), **`GR2_`** (Gravity Rush 2), **`ISS_`** (inFAMOUS Second Son), vindo de `PORT_ENV_PREFIX` / `runtime_game.env_prefix`. O carregador procura `<PREFIXO>_X` e depois `TLG_X`, avisando uma vez no log quando usar o nome antigo. Nomes internos (`tlggpu`, `tlg-probe`, `TLG_SHADER_CACHE_KEY`) não mudam agora.
+Hoje o núcleo lê só `TLG_` (herdado do primeiro port). Plano em duas etapas:
+
+1. **Agora, um prefixo por jogo:** **`TLG_`** (The Last Guardian), **`GR2_`** (Gravity Rush 2), **`ISS_`** (inFAMOUS Second Son). O port declara `PORT_ENV_PREFIX="ISS_"` no seu `port/packaging/port.env`; o `build.sh` passa `-DPORT_ENV_PREFIX="ISS_"` ao compilar o `tlg-probe` (no Windows, `-DPORT_ENV_PREFIX=ISS_` ao CMake), e o `alias_port_environment()` do `probe.c` copia cada `ISS_X` para `TLG_X` no início do `main` (se `TLG_X` não estiver definido). Sem `PORT_ENV_PREFIX` (TLG, build só do núcleo) não há alias. Jogador, launcher e scripts usam o prefixo do jogo; o núcleo continua lendo `TLG_X`.
+2. **Depois, um prefixo comum `PSCORE_`** para o que é do núcleo, quando todo port consumir o `ps4_core`: o carregador procura `<PREFIXO>_X`, `PSCORE_X` e por fim `TLG_X`, avisando uma vez no log quando usar o nome antigo (vem de `runtime_game.env_prefix`). Nomes internos (`tlggpu`, `tlg-probe`, `TLG_SHADER_CACHE_KEY`) não mudam agora.
+
+### Escolhas por jogo que ainda vivem no launcher
+
+- **TSC:** o padrão é o `rdtsc` do host com a frequência medida; `TLG_TSC=process` usa o relógio do processo (1 GHz, do upstream gow3_pc, para hosts com TSC diferente entre núcleos). Jogo que executa `rdtsc` direto no código (inFAMOUS: 391 sítios) **tem** de usar o do host, senão roda 3–4x rápido. Ideia: detectar no `prepare.py` contando os `rdtsc` do eboot ([KNOWN_ISSUES](docs/KNOWN_ISSUES.md) #15).
+- **Readback antecipado + write merge** (`TLG_EAGER_READBACK=1`, `TLG_WRITE_MERGE=1`): desligados no núcleo, ligados por padrão só no inFAMOUS. No fence a GPU já copia os buffers que o jogo lê de volta; escritas da CPU sem falta marcam essas cópias como velhas, para uma cópia antiga não sobrescrever bytes novos do jogo (#16).
 
 ## Build
 
@@ -166,7 +174,9 @@ Today each port carries a copy kept in step with `tools/core_sync.py`. Plan: (1)
 
 1. **Core defaults** (core code). 2. **Game profile** (`port.env` identity + `PORT_ENV_PREFIX`, `profile.ini` defaults: readback mode, VRAM budget, `block1d`, skip-adjacency, FPS patches, motion/touchpad, mouse map, upscaler). 3. **Game code** (`runtime_<slug>*.c`, `game_<slug>.c`, patches). 4. **Player choices** (launcher and Insert menu, saved per game). **Precedence: core < game profile < player**; environment variables override everything, for testing only. One generic loader in the core (`core_config.c` + C++ bridge), knowing no game: compiled defaults → game `profile.ini` → player ini → environment; `core_config_get/int/bool("gpu.readbacks")`, env name `<PREFIX>_READBACKS` then `TLG_READBACKS` during the transition.
 
-**Env prefix plan:** `TLG_` (The Last Guardian), `GR2_` (Gravity Rush 2), `ISS_` (inFAMOUS Second Son); the old `TLG_` names stay accepted (logged once). Internal names (`tlggpu`, `tlg-probe`, `TLG_SHADER_CACHE_KEY`) stay.
+**Env prefix plan:** now per game — `TLG_` (The Last Guardian), `GR2_` (Gravity Rush 2), `ISS_` (inFAMOUS Second Son): the port sets `PORT_ENV_PREFIX="ISS_"` in `port/packaging/port.env`, `build.sh` compiles `tlg-probe` with `-DPORT_ENV_PREFIX="ISS_"` (CMake option on Windows), and `probe.c` `alias_port_environment()` copies each `ISS_X` to `TLG_X` at start unless `TLG_X` is set; no define = no alias. Later a common `PSCORE_` prefix for core settings once every port consumes ps4_core (lookup `<PREFIX>_X`, `PSCORE_X`, then `TLG_X`, old name logged once). Internal names (`tlggpu`, `tlg-probe`, `TLG_SHADER_CACHE_KEY`) stay.
+
+**Per-game choices still in the launchers:** TSC — host rdtsc with measured frequency by default, `TLG_TSC=process` for the process clock; games that execute rdtsc directly (inFAMOUS, 391 sites) must use the host rdtsc (idea: auto-detect by counting rdtsc in the eboot at prepare time; KNOWN_ISSUES #15). Eager readback + write merge (`TLG_EAGER_READBACK`, `TLG_WRITE_MERGE`) are off in the core and on by default only in inFAMOUS; CPU writes merged without a fault mark the eager copies stale so an old copy never overwrites the game's new bytes (#16).
 
 ## Build notes
 
