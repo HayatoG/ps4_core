@@ -145,12 +145,40 @@ public:
     /// wrote elsewhere on those pages stay intact. False: the caller writes normally.
     bool CpuWriteMerge(VAddr dst, const void* src, int fill, u64 size);
 
+    /// tlg: TLG_EAGER_READBACK=1 (precise readbacks): pages the guest reads back after GPU
+    /// writes are learnt (NoteReadback). At every fence they are copied to host memory if the
+    /// GPU wrote them since, and the batch is submitted (EagerCopyAtFence). A later CPU read
+    /// fault on such a page is served on the faulting thread (TryEagerRead): it waits only for
+    /// that copy, not for the GPU command thread nor for a full GPU idle.
+    bool TryEagerRead(VAddr addr, u64 size);
+    void NoteReadback(VAddr addr, u64 size);
+    void EagerCopyAtFence();
+
 private:
     /// Uploads the merged guest writes inside [device_addr, device_addr + size) of `arena`.
     void FlushMergedWrites(const Buffer* arena, VAddr device_addr, u64 size);
     std::mutex merge_mutex;
     std::map<VAddr, VAddr> merged_writes; ///< start -> end, disjoint
     std::atomic<u64> merged_count{0};
+
+    struct EagerPage {
+        u64 offset;   ///< in eager_buffer
+        u64 tick;     ///< submission holding the last copy
+        bool dirty;   ///< GPU wrote it since the last copy
+        bool valid;   ///< the copy at `tick` is current
+        u32 idle;     ///< fences since the guest last read it
+    };
+    static bool EagerEnabled();
+    void NoteGpuWriteForEager(VAddr addr, u64 size); ///< GPU-side threads, before the write
+    void MarkEagerStale(VAddr addr, u64 size);       ///< any thread: CPU bytes the copy lacks
+    void ApplyEagerSubtractsLocked();                ///< GPU-side threads, eager_mutex held
+    std::mutex eager_mutex;
+    std::map<VAddr, EagerPage> eager_pages; ///< by 4 KiB page address
+    std::vector<VAddr> eager_free_offsets;
+    u64 eager_next_offset = 0;
+    std::atomic<u32> eager_count{0};
+    std::vector<VAddr> eager_subtracts; ///< pages served on guest threads: leave gpu_modified_ranges
+    std::unique_ptr<Buffer> eager_buffer;
 
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
                            bool is_texel_buffer);

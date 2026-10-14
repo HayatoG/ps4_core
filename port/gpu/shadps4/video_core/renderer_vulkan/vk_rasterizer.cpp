@@ -3292,7 +3292,13 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
     static const bool fast = [] { const char* e = std::getenv("TLG_FAST_READ_FAULT"); return !(e && *e == '0'); }();
     if (fast && !assume_locks && !buffer_cache.IsRegionGpuModified(addr, size)) {
         buffer_cache.ReleaseReadProtection(addr, size);
+    } else if (!assume_locks && !image_readback && buffer_cache.TryEagerRead(addr, size)) {
+        // tlg: served from the copy made at the last fence (TLG_EAGER_READBACK). Not after an
+        // image readback: that resolved newer data the buffer copy would overwrite.
     } else if (!image_readback || buffer_cache.IsRegionGpuModified(addr, size)) {
+        if (!assume_locks) {
+            buffer_cache.NoteReadback(addr, size);
+        }
         buffer_cache.ReadMemory(addr, size, false, assume_locks);
     }
     return true;

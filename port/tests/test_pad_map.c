@@ -4,6 +4,7 @@
 #include "../src/runtime_pad.c"
 
 int tlggpu_overlay_captures_input(void) { return 0; }
+void tlggpu_overlay_notice(const char *text, float seconds) { (void)text; (void)seconds; }
 void tlggpu_mouse_take(TlgGpuMouse *m) { memset(m,0,sizeof(*m)); }
 void tlggpu_input_settings(TlgGpuInputSettings *s) { memset(s,0,sizeof(*s)); }
 uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *name) {

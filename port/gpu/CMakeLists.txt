@@ -249,6 +249,11 @@ if (WIN32)
     set_target_properties(tlg-probe PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
     target_compile_options(tlg-probe PRIVATE $<$<COMPILE_LANGUAGE:C>:-Wall -Wextra -Werror>)
     target_include_directories(tlg-probe PRIVATE .. ../src)
+    # Per-game environment prefix (build.sh passes PORT_ENV_PREFIX from packaging/port.env).
+    set(PORT_ENV_PREFIX "" CACHE STRING "Per-game env prefix aliased to TLG_ (ISS_, GR2_); empty = none")
+    if(PORT_ENV_PREFIX)
+        target_compile_definitions(tlg-probe PRIVATE "PORT_ENV_PREFIX=\"${PORT_ENV_PREFIX}\"")
+    endif()
     # tlg: libSceFont (runtime_gr2_font.c) renders glyphs with FreeType.
     pkg_check_modules(FREETYPE REQUIRED IMPORTED_TARGET freetype2)
     target_link_libraries(tlg-probe PRIVATE tlggpu atrac9 PkgConfig::FREETYPE onecore bcrypt ws2_32 -pthread)

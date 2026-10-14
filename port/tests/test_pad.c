@@ -8,6 +8,7 @@
 
 static int capture;
 int tlggpu_overlay_captures_input(void) { return capture; }
+void tlggpu_overlay_notice(const char *text, float seconds) { (void)text; (void)seconds; }
 /* The window's mouse (gpu/shim/window.cpp), driven by the test. */
 static TlgGpuMouse test_mouse;
 void tlggpu_mouse_take(TlgGpuMouse *m) {

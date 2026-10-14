@@ -42,6 +42,11 @@ public:
         return runtime;
     }
 
+    /// tlg: see BufferCache::EagerCopyAtFence (fence packets, before the guest sees them).
+    void EagerCopyAtFence() {
+        buffer_cache.EagerCopyAtFence();
+    }
+
     [[nodiscard]] VideoCore::BufferCache& GetBufferCache() noexcept {
         return buffer_cache;
     }

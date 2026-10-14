@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
 #include <cstring>
 #include <chrono>
 #include <array>
@@ -147,8 +148,48 @@ void BufferCache::ExtendWriteFault(VAddr device_addr) {
     memory_tracker->ExtendWriteFault(Common::AlignDown(device_addr, window), window);
 }
 
+// tlg: TLG_READBACK_STATS=1: every 5 s, how long CPU read/write faults that need GPU data spend
+// waiting for the GPU command thread to reach them (queue) and inside the download (flush).
+namespace {
+struct ReadbackStats {
+    std::atomic<u64> count{0}, queue_ns{0}, flush_ns{0}, finish_ns{0}, bytes{0};
+    std::atomic<s64> window_start{0};
+};
+ReadbackStats& Readbacks() {
+    static ReadbackStats stats;
+    return stats;
+}
+bool ReadbackStatsEnabled() {
+    static const bool enabled = [] { const char* e = std::getenv("TLG_READBACK_STATS"); return e && *e == '1'; }();
+    return enabled;
+}
+s64 NowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+void ReportReadbacks() {
+    auto& r = Readbacks();
+    const s64 now = NowNs();
+    s64 start = r.window_start.load();
+    if (!start) {
+        r.window_start.compare_exchange_strong(start, now);
+        return;
+    }
+    if (now - start < 5'000'000'000 || !r.window_start.compare_exchange_strong(start, now)) {
+        return;
+    }
+    const u64 n = r.count.exchange(0);
+    std::printf("Readback stats (5 s): %llu downloads, queue %.1f ms, flush %.1f ms (GPU finish %.1f ms), %.1f MB\n",
+                static_cast<unsigned long long>(n), r.queue_ns.exchange(0) / 1e6, r.flush_ns.exchange(0) / 1e6,
+                r.finish_ns.exchange(0) / 1e6, r.bytes.exchange(0) / 1048576.0);
+    std::fflush(stdout);
+}
+} // namespace
+
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
-    const auto flush_request = [this, device_addr, size, is_write] {
+    const s64 queued_at = ReadbackStatsEnabled() ? NowNs() : 0;
+    const auto flush_request = [this, device_addr, size, is_write, queued_at] {
+        const s64 started_at = queued_at ? NowNs() : 0;
         const u32 first_block = device_addr >> block_shift;
         const u32 last_block = (device_addr + size - 1) >> block_shift;
         const auto* arena = GetArena(first_block, last_block);
@@ -172,6 +213,13 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         if (is_write) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
         }
+        if (queued_at) {
+            auto& r = Readbacks();
+            r.count.fetch_add(1);
+            r.queue_ns.fetch_add(started_at - queued_at);
+            r.flush_ns.fetch_add(NowNs() - started_at);
+            ReportReadbacks();
+        }
     };
     if (assume_locks) {
         flush_request();
@@ -185,6 +233,10 @@ void BufferCache::ReleaseReadProtection(VAddr device_addr, u64 size) {
 }
 
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
+    if (eager_count.load(std::memory_order_acquire)) {
+        std::scoped_lock lock{eager_mutex};
+        ApplyEagerSubtractsLocked();
+    }
     FlushMergedWrites(arena, device_addr, size); // merged CPU bytes precede the download
     boost::container::small_vector<vk::BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
@@ -214,7 +266,12 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         copy.dstOffset += download.offset;
     }
     runtime.CopyBuffer(arena, download.buffer, copies);
+    const s64 finish_at = ReadbackStatsEnabled() ? NowNs() : 0;
     scheduler.Finish();
+    if (finish_at) {
+        Readbacks().finish_ns.fetch_add(NowNs() - finish_at);
+        Readbacks().bytes.fetch_add(total_size_bytes);
+    }
 
     download.buffer->Invalidate(download.offset, download.size);
     for (const auto& copy : copies) {
@@ -309,6 +366,9 @@ void PrintBufferStats() {
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer) {
+    if (is_written) {
+        NoteGpuWriteForEager(device_addr, size);
+    }
     texture_cache.ResolveReadbacks(device_addr, size, true, ReadbackSource::BufferObtain);
     const bool stats = BufferStatsEnabled();
     if (stats) {
@@ -527,6 +587,177 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     runtime.CopyBuffer(staging.buffer, bda_pagetable_buffer.get(), copies);
 }
 
+namespace {
+constexpr u64 EagerPageSize = 4096;
+constexpr u64 EagerBufferSize = 32ull << 20; // 8192 pages
+constexpr u32 EagerIdleFences = 2400;        // ~40 s at 60 fences/s: forgotten
+} // namespace
+
+bool BufferCache::EagerEnabled() {
+    static const bool enabled = [] {
+        const char* e = std::getenv("TLG_EAGER_READBACK");
+        return e && *e == '1' && EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise;
+    }();
+    return enabled;
+}
+
+void BufferCache::NoteReadback(VAddr addr, u64 size) {
+    if (!EagerEnabled()) {
+        return;
+    }
+    std::scoped_lock lock{eager_mutex};
+    for (VAddr page = Common::AlignDown(addr, EagerPageSize); page < addr + size; page += EagerPageSize) {
+        auto [it, inserted] = eager_pages.try_emplace(page);
+        if (!inserted) {
+            it->second.idle = 0;
+            continue;
+        }
+        u64 offset;
+        if (!eager_free_offsets.empty()) {
+            offset = eager_free_offsets.back();
+            eager_free_offsets.pop_back();
+        } else if (eager_next_offset + EagerPageSize <= EagerBufferSize) {
+            offset = eager_next_offset;
+            eager_next_offset += EagerPageSize;
+        } else {
+            eager_pages.erase(it);
+            break;
+        }
+        it->second = EagerPage{offset, 0, true, false, 0};
+    }
+    eager_count.store(static_cast<u32>(eager_pages.size()), std::memory_order_release);
+}
+
+void BufferCache::ApplyEagerSubtractsLocked() {
+    for (const VAddr page : eager_subtracts) {
+        gpu_modified_ranges.Subtract(page, EagerPageSize);
+    }
+    eager_subtracts.clear();
+}
+
+void BufferCache::MarkEagerStale(VAddr addr, u64 size) {
+    if (!eager_count.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::scoped_lock lock{eager_mutex};
+    for (auto it = eager_pages.lower_bound(Common::AlignDown(addr, EagerPageSize));
+         it != eager_pages.end() && it->first < addr + size; ++it) {
+        it->second.dirty = true;
+        it->second.valid = false;
+    }
+}
+
+void BufferCache::NoteGpuWriteForEager(VAddr addr, u64 size) {
+    if (!eager_count.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::scoped_lock lock{eager_mutex};
+    ApplyEagerSubtractsLocked();
+    for (auto it = eager_pages.lower_bound(Common::AlignDown(addr, EagerPageSize));
+         it != eager_pages.end() && it->first < addr + size; ++it) {
+        it->second.dirty = true;
+        it->second.valid = false;
+    }
+}
+
+void BufferCache::EagerCopyAtFence() {
+    if (!eager_count.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (!eager_buffer) {
+        eager_buffer = std::make_unique<Buffer>(instance, 0, EagerBufferSize, MemoryType::HostCached,
+                                                "tlg eager readback");
+    }
+    std::scoped_lock lock{eager_mutex};
+    ApplyEagerSubtractsLocked();
+    const Buffer* arena = nullptr;
+    boost::container::small_vector<vk::BufferCopy, 64> copies;
+    boost::container::small_vector<EagerPage*, 64> copied;
+    const auto flush_copies = [&] {
+        if (!copies.empty()) {
+            runtime.CopyBuffer(arena, eager_buffer.get(), copies);
+            copies.clear();
+        }
+    };
+    for (auto it = eager_pages.begin(); it != eager_pages.end();) {
+        auto& page = it->second;
+        if (++page.idle > EagerIdleFences) {
+            eager_free_offsets.push_back(page.offset);
+            it = eager_pages.erase(it);
+            continue;
+        }
+        if (page.dirty && memory_tracker->IsRegionGpuModified(it->first, EagerPageSize)) {
+            const u64 block = it->first >> block_shift;
+            const Buffer* page_arena = GetArena(block, (it->first + EagerPageSize - 1) >> block_shift);
+            if (page_arena != arena) {
+                flush_copies();
+                arena = page_arena;
+            }
+            copies.push_back(vk::BufferCopy{.srcOffset = it->first - arena->cpu_addr,
+                                            .dstOffset = page.offset,
+                                            .size = EagerPageSize});
+            copied.push_back(&page);
+        }
+        ++it;
+    }
+    eager_count.store(static_cast<u32>(eager_pages.size()), std::memory_order_release);
+    flush_copies();
+    if (copied.empty()) {
+        return;
+    }
+    const u64 tick = scheduler.CurrentTick();
+    scheduler.Flush();
+    for (EagerPage* page : copied) {
+        page->tick = tick;
+        page->dirty = false;
+        page->valid = true;
+    }
+}
+
+bool BufferCache::TryEagerRead(VAddr addr, u64 size) {
+    if (!eager_count.load(std::memory_order_acquire)) {
+        return false;
+    }
+    const VAddr page_addr = Common::AlignDown(addr, EagerPageSize);
+    if (addr + size > page_addr + EagerPageSize || !eager_buffer) {
+        return false;
+    }
+    u64 offset, tick;
+    {
+        std::scoped_lock lock{eager_mutex};
+        const auto it = eager_pages.find(page_addr);
+        if (it == eager_pages.end() || !it->second.valid ||
+            !memory_tracker->IsRegionGpuModified(page_addr, EagerPageSize)) {
+            return false;
+        }
+        if (merged_count.load(std::memory_order_acquire)) {
+            std::scoped_lock merge_lock{merge_mutex};
+            const auto m = merged_writes.upper_bound(page_addr + EagerPageSize - 1);
+            if (m != merged_writes.begin() && std::prev(m)->second > page_addr) {
+                return false; // CPU bytes not yet on the GPU: the copy would lose them
+            }
+        }
+        it->second.idle = 0;
+        offset = it->second.offset;
+        tick = it->second.tick;
+    }
+    scheduler.GetWorkSemaphore()->Wait(tick);
+    std::scoped_lock lock{eager_mutex};
+    const auto it = eager_pages.find(page_addr);
+    if (it == eager_pages.end() || !it->second.valid || it->second.tick != tick) {
+        return false; // the GPU wrote it again meanwhile
+    }
+    eager_buffer->Invalidate(offset, EagerPageSize);
+    if (!memory->TryWriteBacking(reinterpret_cast<void*>(page_addr),
+                                 eager_buffer->mapped_data.data() + offset, EagerPageSize)) {
+        return false;
+    }
+    memory_tracker->UnmarkRegionAsGpuModified(page_addr, EagerPageSize);
+    eager_subtracts.push_back(page_addr);
+    it->second.valid = false;
+    return true;
+}
+
 bool BufferCache::CpuWriteMerge(VAddr dst, const void* src, int fill, u64 size) {
     static const bool enabled = [] {
         const char* e = std::getenv("TLG_WRITE_MERGE");
@@ -550,6 +781,9 @@ bool BufferCache::CpuWriteMerge(VAddr dst, const void* src, int fill, u64 size) 
             done += n;
         }
     }
+    // The eager copy of these pages lacks the bytes just written: drop it (guest thread: only
+    // marks the pages, gpu_modified_ranges belongs to the GPU-side threads).
+    MarkEagerStale(dst, size);
     std::scoped_lock lock{merge_mutex};
     VAddr start = dst, end = dst + size;
     auto it = merged_writes.upper_bound(start);
@@ -596,6 +830,9 @@ void BufferCache::FlushMergedWrites(const Buffer* arena, VAddr device_addr, u64 
     }
     if (ranges.empty()) {
         return;
+    }
+    for (const auto& [s, e] : ranges) {
+        NoteGpuWriteForEager(s, e - s); // the GPU copy changes: an older eager copy is stale
     }
     u64 total = 0;
     for (const auto& [s, e] : ranges) {

@@ -728,8 +728,50 @@ static int cpu_supported(char *missing, size_t size) {
     return 1;
 }
 
+/* Per-game environment prefix. The core still reads TLG_* (one shared prefix, PSCORE_, once every
+ * port uses ps4_core), so a port that builds with -DPORT_ENV_PREFIX="ISS_" (inFAMOUS; "GR2_" for
+ * Gravity Rush 2) gets each ISS_X copied to TLG_X at start, unless TLG_X is set too. Without the
+ * define (The Last Guardian, a core-only build) or with "TLG_" there is nothing to alias. */
+#ifdef PORT_ENV_PREFIX
+#ifdef _WIN32
+#define environ _environ
+#else
+extern char **environ;
+#endif
+static void alias_port_environment(void) {
+    const size_t prefix = strlen(PORT_ENV_PREFIX);
+    if (!prefix || !strcmp(PORT_ENV_PREFIX, "TLG_")) return;
+    size_t count = 0;
+    while (environ && environ[count]) ++count;
+    char **copy = calloc(count + 1, sizeof(*copy)); /* setenv may reallocate environ */
+    if (!copy) return;
+    for (size_t i = 0; i < count; ++i) copy[i] = strdup(environ[i]);
+    for (size_t i = 0; i < count; ++i) {
+        char *entry = copy[i], *equals = entry ? strchr(entry, '=') : NULL;
+        if (!equals || strncmp(entry, PORT_ENV_PREFIX, prefix) || equals == entry + prefix) continue;
+        char name[256];
+        const size_t length = (size_t)(equals - entry - prefix);
+        if (length + 5 > sizeof(name)) continue;
+        memcpy(name, "TLG_", 4);
+        memcpy(name + 4, entry + prefix, length);
+        name[4 + length] = 0;
+        if (getenv(name)) continue;
+#ifdef _WIN32
+        _putenv_s(name, equals + 1);
+#else
+        setenv(name, equals + 1, 0);
+#endif
+    }
+    for (size_t i = 0; i < count; ++i) free(copy[i]);
+    free(copy);
+}
+#else
+static void alias_port_environment(void) {}
+#endif
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
+    alias_port_environment();
 #ifndef _WIN32
     /* Keep host heap objects handed to the guest (thread handles, TLS) in the
        non-PIE brk heap, i.e. below 1 TiB: the guest packs pointers into 40 bits. */
