@@ -54,6 +54,9 @@ struct Profile {
     bool needs_unorm_fixup{};
     bool needs_clip_distance_emulation{};
     bool supports_shader_stencil_export{};
+    /// tlg: TLG_LIGHTING_TEST=dref (vk_lighting_test.h): depth comparisons return the result
+    /// in all four channels instead of (v, 0, 0, 0).
+    bool dref_broadcast{};
 
     bool operator==(const Profile&) const = default;
 };
