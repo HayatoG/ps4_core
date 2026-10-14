@@ -1,4 +1,5 @@
 // tlg: SDL3 window for the Vulkan swapchain (X11 or Wayland).
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -45,6 +46,22 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     // Gamepads are sampled by runtime_pad.c; their events are pumped here with the window's.
     if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         UNREACHABLE_MSG("Failed to initialize SDL video: {}", SDL_GetError());
+    }
+    // tlg: the window opens at the game's size (1920x1080) unless the screen is smaller: on a
+    // 1366x768 laptop it was larger than the screen and the picture was cut. It then opens at the
+    // largest same-shape size that fits the usable area (taskbar and title bar kept clear); it can
+    // still be maximized, resized or made fullscreen.
+    SDL_Rect usable{};
+    if (width_ > 0 && height_ > 0 && SDL_GetDisplayUsableBounds(SDL_GetPrimaryDisplay(), &usable) &&
+        usable.w > 0 && usable.h > 0) {
+        const double fit = std::min({1.0, usable.w * 0.95 / width_, (usable.h - 40) * 0.95 / height_});
+        if (fit < 1.0) {
+            const s32 w = std::max<s32>(640, s32(width_ * fit)), h = std::max<s32>(360, s32(height_ * fit));
+            LOG_INFO(Frontend, "Window {}x{} does not fit the screen ({}x{} usable): opening at {}x{}", width_,
+                     height_, usable.w, usable.h, w, h);
+            width_ = w;
+            height_ = h;
+        }
     }
     SDL_PropertiesID props = SDL_CreateProperties();
     SDL_SetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING, title);
