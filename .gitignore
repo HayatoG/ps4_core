@@ -8,6 +8,8 @@
 *.sprx
 *.sfo
 *.plt
+# Exception: synthetic 448-byte x86 image for the ISA rewrite tests (upstream gow3_pc), no game code
+!port/tests/data/isa_fixture.bin
 eboot*
 
 # Saídas de build e dados locais / build outputs and local data

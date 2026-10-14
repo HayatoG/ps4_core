@@ -783,9 +783,13 @@ int main(int argc, char **argv) {
     }
     if (!cpu_supported(missing, sizeof missing)) return 20;
     if (cpu_missing_sets) printf("CPU: missing %s\n", missing);
-    /* TLG_ISA_REWRITE=0 never rewrites, =1 rewrites every site; by default the sets the CPU lacks. */
+    /* TLG_ISA_REWRITE=0 never rewrites, =1 rewrites every emulated site (MOVBE, BMI1, LZCNT: a test
+     * on a complete CPU; tlg: F16C left out, its sites are never emulated and inFAMOUS has 13);
+     * by default the sets the CPU lacks. */
     const char *policy = getenv("TLG_ISA_REWRITE");
-    unsigned isa_sets = policy && !strcmp(policy, "1") ? 0xffffffffu : policy && !strcmp(policy, "0") ? 0 : cpu_missing_sets;
+    const unsigned isa_forced = CPU_SET_MOVBE | CPU_SET_BMI1 | CPU_SET_LZCNT;
+    const int forced = policy && !strcmp(policy, "1");
+    unsigned isa_sets = forced ? isa_forced | cpu_missing_sets : policy && !strcmp(policy, "0") ? 0 : cpu_missing_sets;
     if (cpu_missing_sets && !isa_sets) {
         printf("STOP: this CPU lacks %s and the rewrite is disabled (TLG_ISA_REWRITE=0)\n", missing);
         return 20;
@@ -1047,7 +1051,7 @@ int main(int argc, char **argv) {
             fflush(NULL);
             _exit(20); /* no destructors: GPU threads are running */
         }
-        if (isa_sets == 0xffffffffu) printf("ISA: forced rewrite of all %u sites (TLG_ISA_REWRITE=1), %u skipped\n", r.rewritten, r.skipped);
+        if (forced) printf("ISA: forced rewrite of %u MOVBE/BMI1/LZCNT sites (TLG_ISA_REWRITE=1), %u skipped\n", r.rewritten, r.skipped);
         else printf("ISA: CPU lacks %s: %u sites rewritten (%u jmp, %u relocated, %u int3), %u skipped\n",
                     missing, r.rewritten, r.jmp, r.relocated, r.int3, r.skipped);
         runtime_set_report_hook(isa_report_hook);
