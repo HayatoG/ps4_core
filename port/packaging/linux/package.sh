@@ -13,11 +13,12 @@ python=${PYTHON:-python3}
 if [[ ! -x out/pyenv/bin/python ]]; then
     "$python" -m venv out/pyenv
 fi
-out/pyenv/bin/python -m pip install -q --disable-pip-version-check pyinstaller
-# The scripts run inside the executable (--script): the standard modules they import come along.
+out/pyenv/bin/python -m pip install -q --disable-pip-version-check pyinstaller iced-x86==1.21.0
+# The scripts run inside the executable (--script): the standard modules they import come along,
+# and iced-x86 for scripts/isa_rewrite.py (CPUs without MOVBE/BMI1/LZCNT).
 hidden=()
 for module in argparse base64 collections hashlib json re shutil struct tempfile xml.etree.ElementTree \
-              urllib.request runpy; do
+              urllib.request runpy iced_x86; do
     hidden+=(--hidden-import "$module")
 done
 out/pyenv/bin/python -m PyInstaller --noconfirm --clean --log-level WARN --windowed \

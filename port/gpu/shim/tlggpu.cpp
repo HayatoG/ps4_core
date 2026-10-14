@@ -47,6 +47,8 @@ uint64_t runtime_tsc_frequency(void);
 uint64_t runtime_read_tsc(void);
 int32_t* runtime_errno(void);
 void runtime_memory_set_gpu_hooks(RuntimeGpuRange map, RuntimeGpuRange unmap, RuntimeGpuRange invalidate);
+// runtime.c: exit counters (and the ISA site report), as on the guest's own exit
+void runtime_report(void);
 }
 
 Frontend::WindowSDL* g_window = nullptr;
@@ -239,6 +241,7 @@ extern "C" int tlggpu_init(const TlgGpuConfig* config) {
             SDL_Delay(2);
         }
         LOG_INFO(Frontend, "Window closed by user");
+        runtime_report();
         std::fflush(stdout);
         std::_Exit(0);
     });
