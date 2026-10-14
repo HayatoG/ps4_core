@@ -40,6 +40,11 @@ static uint64_t pool_size_bytes(void) {
 #define PAGE UINT64_C(16384)
 #define USER_MIN UINT64_C(0x1000000000)
 #define USER_MAX UINT64_C(0xfc00000000)
+/* System-reserved window (shim AddressSpace::SystemReservedVirtualBase/Size). Gnm places fixed
+ * objects there, e.g. the tessellation factor ring at 0x7f0000000 that The Last Guardian maps by
+ * hint and then verifies; an exact free hint in this window is honoured. */
+#define SYSTEM_RESERVED_MIN UINT64_C(0x700000000)
+#define SYSTEM_RESERVED_MAX UINT64_C(0x800000000)
 #define LIMIT 4096
 #define INVALID ((int32_t)UINT32_C(0x80020016))
 #define NO_MEMORY ((int32_t)UINT32_C(0x8002000c))
@@ -140,8 +145,14 @@ void runtime_memory_reserve(void) {
     if (region_count) return;
     if (!VirtualAlloc2(NULL,(void *)USER_MIN,USER_MAX-USER_MIN,MEM_RESERVE|MEM_RESERVE_PLACEHOLDER,PAGE_NOACCESS,NULL,0))
         win_fail("reserving the PS4 address range (link with --disable-high-entropy-va)",USER_MIN,USER_MAX-USER_MIN);
-    region_insert(0,(HostRegion){USER_MIN,USER_MAX,0,0});
+    /* The system-reserved window sits below USER_MIN; without its own placeholder, a hinted map
+     * there (TLG's tessellation ring) stopped the game with "guest range outside the reservation". */
+    if (VirtualAlloc2(NULL,(void *)SYSTEM_RESERVED_MIN,SYSTEM_RESERVED_MAX-SYSTEM_RESERVED_MIN,MEM_RESERVE|MEM_RESERVE_PLACEHOLDER,PAGE_NOACCESS,NULL,0))
+        region_insert(region_count,(HostRegion){SYSTEM_RESERVED_MIN,SYSTEM_RESERVED_MAX,0,0});
+    else fprintf(stderr,"Runtime: system-reserved window %p unavailable (error %lu); hinted maps there move to the user range\n",(void *)SYSTEM_RESERVED_MIN,GetLastError());
+    region_insert(region_count,(HostRegion){USER_MIN,USER_MAX,0,0});
 }
+static int system_window_reserved(void) { return region_count && regions[0].start==SYSTEM_RESERVED_MIN; }
 static void view_map(const HostRegion *r, DWORD protect) {
     DWORD initial=protect==PAGE_NOACCESS ? PAGE_READWRITE : protect, old;
     if (!MapViewOfFile3(section,GetCurrentProcess(),(void *)r->start,r->phys,r->end-r->start,MEM_REPLACE_PLACEHOLDER,initial,NULL,0))
@@ -253,6 +264,7 @@ static int pool(void) {
     return 0;
 }
 void runtime_memory_reserve(void) {}
+static int system_window_reserved(void) { return 1; }
 static int host_map(uintptr_t address, uint64_t size, int prot, int reserved, uint64_t phys) {
     void *mapped = !reserved
         ? mmap((void *)address,size,prot,MAP_SHARED|MAP_FIXED,pool_fd,(off_t)phys)
@@ -347,17 +359,12 @@ static int overlaps(uintptr_t start, uintptr_t end, int ignore_reserved) {
     return 0;
 }
 /* First-fit search in the PS4 user range, starting from the hint. */
-/* System-reserved window (shim AddressSpace::SystemReservedVirtualBase/Size). Gnm places fixed
- * objects there, e.g. the tessellation factor ring at 0x7f0000000 that The Last Guardian maps by
- * hint and then verifies; an exact free hint in this window is honoured. */
-#define SYSTEM_RESERVED_MIN UINT64_C(0x700000000)
-#define SYSTEM_RESERVED_MAX UINT64_C(0x800000000)
 static int range_free(uintptr_t start, uint64_t size) {
     size_t i=vma_index(start);
     return i==vma_count || vmas[i].start>=start+size;
 }
 static uintptr_t find_free(uintptr_t hint, uint64_t size, uint64_t alignment) {
-    if (hint>=SYSTEM_RESERVED_MIN && hint+size<=SYSTEM_RESERVED_MAX && !(hint%alignment) && range_free(hint,size))
+    if (hint>=SYSTEM_RESERVED_MIN && hint+size<=SYSTEM_RESERVED_MAX && !(hint%alignment) && system_window_reserved() && range_free(hint,size))
         return hint;
     uintptr_t at=align_up(hint<USER_MIN ? USER_MIN : hint, alignment);
     for (size_t i=vma_index(at); at+size<=USER_MAX; ++i) {
