@@ -576,3 +576,34 @@ now reads guest memory for the constant ring, is not treated as a GPU-side threa
 (`IsGpuSideThreadId` accepts only stage B). Next: a run with `TLG_WRITE_LOG=1` that crashes
 prints which logged write landed near the corrupted block; bisect the pipeline toggles
 (38 tasks, 39 pending fence waits, 41 recorder fences, 42 memory writes, 36 constant ring).
+
+## Freeze report (TLG_FREEZE_REPORT_SECONDS)
+
+`src/runtime_freeze.c`: a monitor thread watches the flips shown (`tlggpu_frame_counters`). After
+`TLG_FREEZE_REPORT_SECONDS` (default 10, `0` off; `ISS_`/`GR2_` aliases) without a new one it
+writes one report to stdout, then `FREEZE: frames resumed after N s` if they come back. Armed by
+the first frame; never stops the game.
+
+```
+FREEZE: no frame for 10 s; threads:
+  frames: S flips submitted by the game (+s since the last shown frame), N shown, P presented (+p), V vblank ticks (+v); page faults being handled now: F (H handled, +h)
+  guest 'Name' (tid T): waiting on <kind> '<object name>' <handle> for X ms[, held by 'Other' (tid U)] [(inside <outer wait>)]
+      now at guest+0x... | libc.so.6+0x... (sym) | tlg-probe.exe+0x...; frames: <rbp chain>
+      wait called from guest+0x... < guest+0x...   (the guest frames that called the marked wait)
+  host 'shadPS4:GpuCommandProcessor' (tid T): no marked wait | waiting on GPU thread (command) ...
+FREEZE: end of report (N threads; the game keeps running)
+```
+
+- `+s > 0, +p = 0`: the game still submits flips, the present path is stuck; `+v = 0`: the
+  present thread itself is stuck. `+s = 0`: the game stopped submitting (look at its threads).
+- Marked waits: guest mutexes (with holder), condition variables, semaphores, event flags,
+  sleeps, file open/read/write/sync, `sceKernelWaitEqueue` (queue name), `sceGnmSubmitDone`
+  (GPU idle), `sceVideoOutWaitVblank`, Liverpool `SendCommand<true>` ("GPU thread (command)"),
+  texture readbacks, and the page-fault handler (`GPU page fault handler`, a thread stuck in
+  `tlggpu_handle_fault`). Host threads get a wait slot on their first marked wait.
+- Guest offsets are relative to the loaded image (same as the crash report); host addresses are
+  `module+offset` (Linux adds the dynamic symbol). Windows: resolve `tlg-probe.exe+0x...` with
+  `llvm-symbolizer --obj=tlg-probe.exe 0x<image base + offset>` on the same build.
+- Registers: Linux sends SIGURG to each thread (handler copies registers and the frame chain);
+  Windows suspends each thread for `GetThreadContext`. Memory is read with
+  `process_vm_readv` / `ReadProcessMemory`.

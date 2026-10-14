@@ -16,6 +16,7 @@
 #endif
 #include "common/assert.h"
 #include "tlg_toggles.h"
+#include "tlg_freeze.h"
 #include "tlg_settings.h"
 #include "tlg_graphics.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
@@ -303,9 +304,11 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
 
 void VideoOutDriver::Flip(const Request& req) {
     // Update HDR status before presenting, then present the frame (tlg: on the swap thread).
+    TlgFreeze::flips_shown.fetch_add(1, std::memory_order_relaxed);
     RunPresenter([this, frame = req.frame, hdr = req.port->is_hdr] {
         presenter->SetHDR(hdr);
         presenter->Present(frame);
+        TlgFreeze::presents.fetch_add(1, std::memory_order_relaxed);
     });
     Vulkan::FrameCapture::OnFlip(req.index >= 0 ? req.port->buffer_slots[req.index].address_left
                                                 : 0);
@@ -609,6 +612,7 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
         if (is_eop) {
             ++port->flip_status.gc_queue_num;
         }
+        TlgFreeze::flips_submitted.fetch_add(1, std::memory_order_relaxed);
         ++port->flip_status.flip_pending_num; // integral GPU and CPU pending flips counter
         port->flip_status.submit_tsc = Libraries::Kernel::sceKernelReadTsc();
     }
@@ -754,6 +758,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
             // Update vblank status
             vblank_status.count++;
+            TlgFreeze::vblanks.fetch_add(1, std::memory_order_relaxed);
             vblank_status.process_time = Libraries::Kernel::sceKernelGetProcessTime();
             vblank_status.tsc = Libraries::Kernel::sceKernelReadTsc();
             main_port.vblank_cv.notify_all();

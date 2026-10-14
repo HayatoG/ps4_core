@@ -15,6 +15,7 @@
 #include "core/libraries/kernel/posix_error.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/libs.h"
+#include "tlg_freeze.h"
 
 namespace Libraries::Kernel {
 
@@ -479,7 +480,14 @@ int PS4_SYSV_ABI sceKernelWaitEqueue(OrbisKernelEqueue eq, OrbisKernelEvent* ev,
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
 
-    *out = equeue->WaitForEvents(ev, num, timo);
+    {
+        // tlg: freeze report (the equeue name says which: flip, GPU EOP, user events...).
+        TlgFreeze::WaitScope wait{timo ? "event queue (timed)" : "event queue",
+                                  reinterpret_cast<const void*>(static_cast<std::uintptr_t>(eq)),
+                                  equeue->GetName().data(),
+                                  reinterpret_cast<std::uintptr_t>(__builtin_frame_address(0))};
+        *out = equeue->WaitForEvents(ev, num, timo);
+    }
 
     if (*out == 0) {
         return ORBIS_KERNEL_ERROR_ETIMEDOUT;

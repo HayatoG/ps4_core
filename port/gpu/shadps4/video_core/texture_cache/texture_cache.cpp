@@ -6,6 +6,7 @@
 #include "video_core/amdgpu/liverpool.h"
 
 #include "tlg_toggles.h"
+#include "tlg_freeze.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
@@ -166,6 +167,7 @@ bool TextureCache::ResolveReadbacks(VAddr address, u64 size, bool assume_locks,
         }
         if (diag) readback_sources.Record(source, waited, wait_ns, size);
     };
+    TlgFreeze::WaitScope wait{"GPU readback", reinterpret_cast<const void*>(address)}; // tlg
     if (assume_locks) resolve();
     else liverpool->SendCommand<true>(resolve);
     return true;

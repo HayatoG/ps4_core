@@ -14,6 +14,7 @@
 #include <sched.h>
 #include <setjmp.h>
 #include <errno.h>
+#include <time.h>
 #include <unistd.h>
 #ifdef _WIN32
 #include <windows.h>
@@ -46,6 +47,8 @@ typedef struct GuestThread {
     ThreadAttr attr;
     char name[32];
     int detached, finished, joined, host_owned;
+    uint64_t os_tid;  /* freeze report: matches the OS thread list */
+    RuntimeWait wait; /* freeze report: what the thread is blocked on */
 #ifdef _WIN32
     tlg_jmp_buf exit_jump; /* no SEH unwinding through guest frames */
 #else
@@ -88,6 +91,13 @@ static void set_gs(void *base) {
 }
 #define tls_block_alloc(size) aligned_alloc(64,size)
 #endif
+static uint64_t os_thread_id(void) {
+#ifdef _WIN32
+    return GetCurrentThreadId();
+#else
+    return (uint64_t)gettid();
+#endif
+}
 /* Build TCB/static TLS for the calling host thread and point GS at it. */
 static void attach(GuestThread *t) {
     uint64_t offset=tls_offset();
@@ -103,6 +113,7 @@ static void attach(GuestThread *t) {
     tcb[2]=(uint64_t)(uintptr_t)t;           /* tcb_thread */
     t->tls_block=block; t->tcb=tcb;
     set_gs(tcb);
+    t->os_tid=os_thread_id();
     current=t;
 }
 static GuestThread *new_thread(void) {
@@ -152,6 +163,101 @@ static ThreadAttr *find_attr(ThreadAttr **slot) {
 }
 
 static ABI void *thread_self(void) { return runtime_thread_current(); }
+void *runtime_thread_self(void) { return current; }
+
+/* ---- Wait slots (freeze report) ----
+ * Guest threads keep theirs in the thread record; host threads (GPU library, decoders) that
+ * block in a marked wait get one of a fixed set on first use, matched by OS thread id (a
+ * thread that reuses the id of a finished one takes its slot over). */
+#define HOST_WAIT_SLOTS 64
+static struct { uint64_t os_tid; RuntimeWait wait; } host_waits[HOST_WAIT_SLOTS];
+static unsigned host_wait_count;
+static _Thread_local RuntimeWait *host_wait;
+uint64_t runtime_wait_now_ms(void) {
+#ifdef _WIN32
+    return GetTickCount64();
+#else
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC_COARSE,&t);
+    return (uint64_t)t.tv_sec*1000+(uint64_t)t.tv_nsec/1000000;
+#endif
+}
+RuntimeWait *runtime_wait_slot(void) {
+    if (current) return &current->wait;
+    if (host_wait) return host_wait;
+    /* No lock: this may run inside a fault handler, on a thread that faulted holding one. */
+    uint64_t tid=os_thread_id();
+    unsigned count=__atomic_load_n(&host_wait_count,__ATOMIC_ACQUIRE);
+    for (unsigned i=0;i<count && i<HOST_WAIT_SLOTS && !host_wait;++i)
+        if (__atomic_load_n(&host_waits[i].os_tid,__ATOMIC_ACQUIRE)==tid) host_wait=&host_waits[i].wait;
+    if (!host_wait) {
+        unsigned i=__atomic_fetch_add(&host_wait_count,1,__ATOMIC_ACQ_REL);
+        if (i>=HOST_WAIT_SLOTS) return NULL;
+        __atomic_store_n(&host_waits[i].os_tid,tid,__ATOMIC_RELEASE);
+        host_wait=&host_waits[i].wait;
+    }
+    return host_wait;
+}
+/* The name is copied (the object may go away while a report reads it); long names keep
+ * their tail, the distinctive part of a path. */
+static void copy_wait_name(char *out,size_t size,const char *name) {
+    size_t n=name ? strnlen(name,512) : 0;
+    if (n<size) { memcpy(out,name ? name : "",n); out[n]=0; return; }
+    memcpy(out,"...",3);
+    memcpy(out+3,name+n-(size-4),size-4);
+    out[size-1]=0;
+}
+void runtime_wait_slot_begin(RuntimeWait *w,const char *kind,const void *object,const char *name,
+                             const void *const *owner,uintptr_t frame,uint64_t now_ms) {
+    if (!w) return;
+    unsigned depth=w->depth++;
+    if (depth>=RUNTIME_WAIT_LEVELS) return;
+    RuntimeWaitLevel *l=&w->level[depth];
+    __atomic_add_fetch(&w->generation,1,__ATOMIC_ACQ_REL); /* odd: being written */
+    l->object=object; l->owner=owner; l->frame=frame; l->since_ms=now_ms;
+    copy_wait_name(l->name,sizeof(l->name),name);
+    __atomic_store_n(&l->kind,kind,__ATOMIC_RELEASE);
+    __atomic_add_fetch(&w->generation,1,__ATOMIC_RELEASE);
+}
+void runtime_wait_slot_end(RuntimeWait *w) {
+    if (!w || !w->depth) return;
+    unsigned depth=--w->depth;
+    if (depth>=RUNTIME_WAIT_LEVELS) return;
+    __atomic_add_fetch(&w->generation,1,__ATOMIC_ACQ_REL);
+    __atomic_store_n(&w->level[depth].kind,NULL,__ATOMIC_RELEASE);
+    __atomic_add_fetch(&w->generation,1,__ATOMIC_RELEASE);
+}
+void runtime_wait_begin(const char *kind,const void *object,const char *name,const void *const *owner,uintptr_t frame) {
+    runtime_wait_slot_begin(runtime_wait_slot(),kind,object,name,owner,frame,runtime_wait_now_ms());
+}
+void runtime_wait_end(void) { runtime_wait_slot_end(runtime_wait_slot()); }
+int runtime_wait_copy(const RuntimeWait *from,RuntimeWait *to) {
+    for (int attempt=0;attempt<8;++attempt) {
+        uint32_t before=__atomic_load_n(&from->generation,__ATOMIC_ACQUIRE);
+        if (before&1) continue;
+        memcpy(to,(const void *)from,sizeof(*to));
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&from->generation,__ATOMIC_ACQUIRE)==before) return 1;
+    }
+    memset(to,0,sizeof(*to));
+    return 0;
+}
+size_t runtime_thread_snapshot(RuntimeThreadInfo *out,size_t max) {
+    size_t n=0;
+    pthread_mutex_lock(&lock);
+    for (GuestThread *t=threads;t && n<max;t=t->next,++n) {
+        out[n]=(RuntimeThreadInfo){.record=t,.os_tid=t->os_tid,.finished=t->finished};
+        memcpy(out[n].name,t->name,sizeof(out[n].name)); out[n].name[sizeof(out[n].name)-1]=0;
+        runtime_wait_copy(&t->wait,&out[n].wait);
+    }
+    unsigned hosts=__atomic_load_n(&host_wait_count,__ATOMIC_ACQUIRE);
+    for (unsigned i=0;i<hosts && i<HOST_WAIT_SLOTS && n<max;++i,++n) {
+        out[n]=(RuntimeThreadInfo){.os_tid=__atomic_load_n(&host_waits[i].os_tid,__ATOMIC_ACQUIRE)};
+        runtime_wait_copy(&host_waits[i].wait,&out[n].wait);
+    }
+    pthread_mutex_unlock(&lock);
+    return n;
+}
 static ABI int32_t *guest_error(void) { return &guest_errno; }
 int32_t *runtime_errno(void) { return &guest_errno; }
 

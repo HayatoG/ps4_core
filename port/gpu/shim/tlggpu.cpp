@@ -8,6 +8,7 @@
 #include <sys/resource.h>
 #endif
 #include "tlg_toggles.h"
+#include "tlg_freeze.h"
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -277,7 +278,30 @@ extern "C" uintptr_t tlggpu_resolve(const char* scoped_nid) {
 }
 
 extern "C" int tlggpu_handle_fault(void* ucontext, void* address) {
-    return Core::Signals::Instance()->DispatchAccessViolation(ucontext, address) ? 1 : 0;
+    // tlg: the freeze report shows threads stuck in a page-protection fault (and how many).
+    TlgFreeze::faults_in_progress.fetch_add(1, std::memory_order_relaxed);
+    int handled;
+    {
+        TlgFreeze::WaitScope wait{"GPU page fault handler", address};
+        handled = Core::Signals::Instance()->DispatchAccessViolation(ucontext, address) ? 1 : 0;
+    }
+    TlgFreeze::faults_in_progress.fetch_sub(1, std::memory_order_relaxed);
+    TlgFreeze::faults_handled.fetch_add(handled, std::memory_order_relaxed);
+    return handled;
+}
+
+extern "C" void tlggpu_set_wait_hooks(TlgGpuWaitBegin begin, TlgGpuWaitEnd end) {
+    TlgFreeze::end_hook.store(end);
+    TlgFreeze::begin_hook.store(begin);
+}
+
+extern "C" void tlggpu_frame_counters(TlgGpuFrameCounters* out) {
+    out->submitted = TlgFreeze::flips_submitted.load(std::memory_order_relaxed);
+    out->shown = TlgFreeze::flips_shown.load(std::memory_order_relaxed);
+    out->presented = TlgFreeze::presents.load(std::memory_order_relaxed);
+    out->vblanks = TlgFreeze::vblanks.load(std::memory_order_relaxed);
+    out->faults_in_progress = TlgFreeze::faults_in_progress.load(std::memory_order_relaxed);
+    out->faults_handled = TlgFreeze::faults_handled.load(std::memory_order_relaxed);
 }
 
 extern "C" unsigned tlggpu_symbol_count(void) {

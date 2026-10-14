@@ -473,12 +473,22 @@ static int64_t posix(int64_t r) { if (r<0) { *runtime_errno()=runtime_guest_errn
 #define PAIR(name,params,args) \
     static ABI int64_t sce_##name params { return sce(do_##name args); } \
     static ABI int64_t posix_##name params { return posix(do_##name args); }
-PAIR(open,(const char *p,int f,int m),(p,f,m))
+/* Calls that may block on the disk are marked for the freeze report (object: the descriptor
+ * or the path, name: the path). */
+static const char *fd_path(int fd) { File *f=get(fd); return f ? f->path : NULL; }
+#define PAIR_IO(name,params,args,kind,object,path) \
+    static ABI int64_t sce_##name params { \
+        runtime_wait_begin(kind,(const void *)(uintptr_t)(object),path,NULL,RUNTIME_GUEST_FRAME()); \
+        int64_t r=sce(do_##name args); runtime_wait_end(); return r; } \
+    static ABI int64_t posix_##name params { \
+        runtime_wait_begin(kind,(const void *)(uintptr_t)(object),path,NULL,RUNTIME_GUEST_FRAME()); \
+        int64_t r=posix(do_##name args); runtime_wait_end(); return r; }
+PAIR_IO(open,(const char *p,int f,int m),(p,f,m),"file open",p,p)
 PAIR(close,(int fd),(fd))
-PAIR(read,(int fd,void *b,uint64_t n),(fd,b,n))
-PAIR(pread,(int fd,void *b,uint64_t n,int64_t o),(fd,b,n,o))
-PAIR(write,(int fd,const void *b,uint64_t n),(fd,b,n))
-PAIR(pwrite,(int fd,const void *b,uint64_t n,int64_t o),(fd,b,n,o))
+PAIR_IO(read,(int fd,void *b,uint64_t n),(fd,b,n),"file read",fd,fd_path(fd))
+PAIR_IO(pread,(int fd,void *b,uint64_t n,int64_t o),(fd,b,n,o),"file read",fd,fd_path(fd))
+PAIR_IO(write,(int fd,const void *b,uint64_t n),(fd,b,n),"file write",fd,fd_path(fd))
+PAIR_IO(pwrite,(int fd,const void *b,uint64_t n,int64_t o),(fd,b,n,o),"file write",fd,fd_path(fd))
 PAIR(lseek,(int fd,int64_t o,int w),(fd,o,w))
 PAIR(fstat,(int fd,GuestStat *s),(fd,s))
 PAIR(stat,(const char *p,GuestStat *s),(p,s))
@@ -486,7 +496,7 @@ PAIR(getdents,(int fd,char *b,uint64_t n,int64_t *base),(fd,b,n,base))
 PAIR(rename,(const char *a,const char *b),(a,b))
 PAIR(ftruncate,(int fd,int64_t l),(fd,l))
 PAIR(truncate,(const char *p,int64_t l),(p,l))
-PAIR(fsync,(int fd),(fd))
+PAIR_IO(fsync,(int fd),(fd),"file sync",fd,fd_path(fd))
 static ABI int64_t posix_access(const char *p,int m) { return posix(do_access(p,m)); }
 static ABI int64_t sce_mkdir(const char *p,int m) { return sce(path_op(p,0,m)); }
 static ABI int64_t posix_mkdir(const char *p,int m) { return posix(path_op(p,0,m)); }

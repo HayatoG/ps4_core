@@ -14,6 +14,7 @@
 #include <span>
 #include <thread>
 #include <vector>
+#include "tlg_freeze.h"
 #include <queue>
 
 #include "common/assert.h"
@@ -143,6 +144,7 @@ public:
                 ++num_commands;
                 submit_cv.notify_one();
             }
+            TlgFreeze::WaitScope wait{"GPU thread (command)"}; // tlg: freeze report
             sem.acquire();
         } else {
             std::scoped_lock lk{submit_mutex};
