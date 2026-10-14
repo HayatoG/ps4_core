@@ -33,14 +33,19 @@ public:
         if (!thread.joinable()) return;
         try {
             if (thread.get_id() == std::this_thread::get_id()) thread.detach();
+#ifndef _WIN32
             else if (finished) {
                 // tlg: Gravity Rush 2 hung 86 s in sceAvPlayerStop joining an AvPlayer decoder
                 // whose function had already returned (its exit log was printed; the join only
                 // came back when a debugger attached). Wait for the function itself, then let the
-                // exiting thread go: after `finished` it touches nothing of its owner.
+                // exiting thread go: after `finished` it touches nothing of its owner. Linux only:
+                // on Windows detaching a thread that has already returned fails ("Invalid
+                // argument"), and the join there never showed the hang.
                 while (!finished->load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 thread.detach();
-            } else thread.join();
+            }
+#endif
+            else thread.join();
         } catch (const std::system_error& error) {
             // Windows (libc++ on Win32 threads): the join can fail although the thread is fine.
             // Wait for its function to return, so nothing it uses is freed under it, then let go.
