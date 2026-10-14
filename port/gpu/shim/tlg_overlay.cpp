@@ -182,6 +182,15 @@ void Choice(const char* label, std::atomic<int>& target, const char* const* labe
     }
 }
 
+// Controller button names in the help text follow TLG_GLYPHS=xbox|nintendo (upstream 9155cdc;
+// a port's runner can pick it from `tlg-probe --gamepad`); unset is PlayStation. Read once: the
+// environment is fixed for a run.
+static const char* PadText(const char* playstation, const char* xbox, const char* nintendo) {
+    static const char* style = std::getenv("TLG_GLYPHS");
+    if (!style) return playstation;
+    return !std::strcmp(style, "xbox") ? xbox : !std::strcmp(style, "nintendo") ? nintendo : playstation;
+}
+
 // The note for the item under the mouse or the gamepad/keyboard focus, shown in the footer.
 const char* footer_help = nullptr;
 
@@ -576,7 +585,7 @@ void Menu() {
         const std::string_view title = Common::ElfInfo::Instance().Title();
         const char* app_name = std::getenv("TLG_APP_NAME");
         return std::string(!title.empty() ? title : app_name && *app_name ? app_name : "The Last Guardian") +
-               "  (Insert / R3+L2)";
+               PadText("  (Insert / R3+L2)", "  (Insert / RS+LT)", "  (Insert / RS+ZL)");
     }();
     if (!ImGui::Begin(heading.c_str(), &keep_open, ImGuiWindowFlags_NoCollapse)) {
         ImGui::End();
@@ -628,7 +637,13 @@ void Menu() {
 
     ImGui::Separator();
     ImGui::PushTextWrapPos(0.0f);
-    ImGui::TextDisabled("%s", footer_help ? footer_help : TL("L1 / R1 or Q / E: switch tabs. Settings are saved in tlg.ini.", "L1 / R1 ou Q / E: trocar de aba. As configurações ficam salvas em tlg.ini."));
+    ImGui::TextDisabled("%s", footer_help ? footer_help
+                              : TL(PadText("L1 / R1 or Q / E: switch tabs. Settings are saved in tlg.ini.",
+                                           "LB / RB or Q / E: switch tabs. Settings are saved in tlg.ini.",
+                                           "L / R or Q / E: switch tabs. Settings are saved in tlg.ini."),
+                                   PadText("L1 / R1 ou Q / E: trocar de aba. As configurações ficam salvas em tlg.ini.",
+                                           "LB / RB ou Q / E: trocar de aba. As configurações ficam salvas em tlg.ini.",
+                                           "L / R ou Q / E: trocar de aba. As configurações ficam salvas em tlg.ini.")));
     ImGui::PopTextWrapPos();
     if (const int changes = RestartChanges()) {
         ImGui::TextColored(ImVec4(0.85f, 0.72f, 0.45f, 1.0f), "%d change%s need%s a restart (unsaved progress is lost).",
@@ -726,7 +741,8 @@ void TextEntryBox() {
     ImGui::SetWindowFontScale(1.0f);
     ImGui::Separator();
     ImGui::TextDisabled("Keyboard: type, Backspace to erase, Enter = OK, Esc = cancel");
-    ImGui::TextDisabled("Controller: Cross (A) = OK, Circle (B) = cancel");
+    ImGui::TextDisabled("%s", TL(PadText("Controller: Cross (A) = OK, Circle (B) = cancel", "Controller: A = OK, B = cancel", "Controller: B = OK, A = cancel"),
+                                 PadText("Controle: Xis (A) = OK, Círculo (B) = cancelar", "Controle: A = OK, B = cancelar", "Controle: B = OK, A = cancelar")));
     ImGui::End();
 }
 
@@ -779,7 +795,8 @@ void ChoiceBox() {
         }
     }
     ImGui::Separator();
-    ImGui::TextDisabled("Up/Down or D-pad: choose   Enter or Cross (A): OK   Esc or Circle (B): cancel");
+    ImGui::TextDisabled("%s", TL(PadText("Up/Down or D-pad: choose   Enter or Cross (A): OK   Esc or Circle (B): cancel", "Up/Down or D-pad: choose   Enter or A: OK   Esc or B: cancel", "Up/Down or D-pad: choose   Enter or B: OK   Esc or A: cancel"),
+                                 PadText("Cima/Baixo ou direcional: escolher   Enter ou Xis (A): OK   Esc ou Círculo (B): cancelar", "Cima/Baixo ou direcional: escolher   Enter ou A: OK   Esc ou B: cancelar", "Cima/Baixo ou direcional: escolher   Enter ou B: OK   Esc ou A: cancelar")));
     ImGui::End();
 }
 
