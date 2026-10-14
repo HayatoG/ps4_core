@@ -47,6 +47,9 @@ static uint64_t pool_size_bytes(void) {
  * hint and then verifies; an exact free hint in this window is honoured. */
 #define SYSTEM_RESERVED_MIN UINT64_C(0x700000000)
 #define SYSTEM_RESERVED_MAX UINT64_C(0x800000000)
+/* Games also map fixed addresses below the system window: Gravity Rush 2 maps 0x400000000 and
+ * 0x500000000 (3 GB) with MAP_FIXED. Windows reserves this whole low window as a placeholder too. */
+#define LOW_WINDOW_MIN UINT64_C(0x200000000)
 #define LIMIT 4096
 #define INVALID ((int32_t)UINT32_C(0x80020016))
 #define NO_MEMORY ((int32_t)UINT32_C(0x8002000c))
@@ -147,14 +150,19 @@ void runtime_memory_reserve(void) {
     if (region_count) return;
     if (!VirtualAlloc2(NULL,(void *)USER_MIN,USER_MAX-USER_MIN,MEM_RESERVE|MEM_RESERVE_PLACEHOLDER,PAGE_NOACCESS,NULL,0))
         win_fail("reserving the PS4 address range (link with --disable-high-entropy-va)",USER_MIN,USER_MAX-USER_MIN);
-    /* The system-reserved window sits below USER_MIN; without its own placeholder, a hinted map
-     * there (TLG's tessellation ring) stopped the game with "guest range outside the reservation". */
-    if (VirtualAlloc2(NULL,(void *)SYSTEM_RESERVED_MIN,SYSTEM_RESERVED_MAX-SYSTEM_RESERVED_MIN,MEM_RESERVE|MEM_RESERVE_PLACEHOLDER,PAGE_NOACCESS,NULL,0))
+    /* The low window (0x200000000 up to the system-reserved one at 0x700000000-0x800000000) sits
+     * below USER_MIN; without its own placeholder, a fixed or hinted map there (TLG's tessellation
+     * ring, GR2's 0x400000000 and 0x500000000) stopped the game with "guest range outside the
+     * reservation". If something of Windows' already sits low, keep at least the system window. */
+    if (VirtualAlloc2(NULL,(void *)LOW_WINDOW_MIN,SYSTEM_RESERVED_MAX-LOW_WINDOW_MIN,MEM_RESERVE|MEM_RESERVE_PLACEHOLDER,PAGE_NOACCESS,NULL,0))
+        region_insert(region_count,(HostRegion){LOW_WINDOW_MIN,SYSTEM_RESERVED_MAX,0,0});
+    else if (VirtualAlloc2(NULL,(void *)SYSTEM_RESERVED_MIN,SYSTEM_RESERVED_MAX-SYSTEM_RESERVED_MIN,MEM_RESERVE|MEM_RESERVE_PLACEHOLDER,PAGE_NOACCESS,NULL,0)) {
+        fprintf(stderr,"Runtime: low window %p unavailable (error %lu); only the system-reserved window is kept\n",(void *)LOW_WINDOW_MIN,GetLastError());
         region_insert(region_count,(HostRegion){SYSTEM_RESERVED_MIN,SYSTEM_RESERVED_MAX,0,0});
-    else fprintf(stderr,"Runtime: system-reserved window %p unavailable (error %lu); hinted maps there move to the user range\n",(void *)SYSTEM_RESERVED_MIN,GetLastError());
+    } else fprintf(stderr,"Runtime: system-reserved window %p unavailable (error %lu); hinted maps there move to the user range\n",(void *)SYSTEM_RESERVED_MIN,GetLastError());
     region_insert(region_count,(HostRegion){USER_MIN,USER_MAX,0,0});
 }
-static int system_window_reserved(void) { return region_count && regions[0].start==SYSTEM_RESERVED_MIN; }
+static int system_window_reserved(void) { return region_count && regions[0].start<=SYSTEM_RESERVED_MIN; }
 static void view_map(const HostRegion *r, DWORD protect) {
     DWORD initial=protect==PAGE_NOACCESS ? PAGE_READWRITE : protect, old;
     if (!MapViewOfFile3(section,GetCurrentProcess(),(void *)r->start,r->phys,r->end-r->start,MEM_REPLACE_PLACEHOLDER,initial,NULL,0))
