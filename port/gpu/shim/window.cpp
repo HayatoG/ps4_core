@@ -91,6 +91,9 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
         TlgSettings::Get().display_mode = TlgGraphics::Borderless;
     }
     ApplyDisplayMode(TlgSettings::Get().display_mode);
+    // tlg: no system cursor over the game; the in-game menu draws its own (TlgOverlay::SetOpen).
+    // UpdateMouseCapture shows it again only while Esc keeps the mouse released.
+    SDL_HideCursor();
     int w = 0, h = 0;
     SDL_GetWindowSizeInPixels(window, &w, &h);
     width = w;
@@ -183,6 +186,13 @@ void WindowSDL::UpdateMouseCapture() {
         LOG_WARNING(Frontend, "Mouse capture: {}", SDL_GetError());
     }
     mouse_captured = want;
+    // tlg: the system cursor stays hidden over the game (upstream 252a279) except while Esc
+    // keeps the mouse released, so the player sees where to click to capture it again.
+    if (!want && mouse_released && !TlgOverlay::CapturesInput()) {
+        SDL_ShowCursor();
+    } else {
+        SDL_HideCursor();
+    }
     wheel_x = wheel_y = 0.0f;
     {
         std::scoped_lock lock{mouse_mutex};
