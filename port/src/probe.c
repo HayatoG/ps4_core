@@ -1144,6 +1144,12 @@ int main(int argc, char **argv) {
             if (result) fail("module initializer failed");
         }
     }
+    {   /* TLG_FREEZE_REPORT_SECONDS (default 10, 0 = off): no new frame for that long writes
+         * every thread's wait, RIP and frames to the log (runtime_freeze.c). Needs the GPU. */
+        const char *freeze = getenv("TLG_FREEZE_REPORT_SECONDS");
+        unsigned seconds = freeze && *freeze ? (unsigned)strtoul(freeze, NULL, 10) : 10;
+        runtime_freeze_start((uintptr_t)image, round_page(size) + stub_area, gpu_enabled ? seconds : 0);
+    }
     printf("Entering original x86-64 code at guest offset 0x%" PRIx64 "\n", entry);
     entered_game=1;
     struct { uint64_t argc; const char *argv[2]; } params = {1, {"/app0/eboot.bin", NULL}};

@@ -12,6 +12,7 @@
 #include "core/libraries/videoout/videoout_error.h"
 #include "core/platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "tlg_freeze.h"
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
 
@@ -377,6 +378,8 @@ s32 PS4_SYSV_ABI sceVideoOutWaitVblank(s32 handle) {
         return ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
     }
 
+    TlgFreeze::WaitScope wait{"vblank", nullptr, nullptr,
+                              reinterpret_cast<std::uintptr_t>(__builtin_frame_address(0))};
     std::unique_lock lock{port->vo_mutex};
     const auto prev_counter = port->vblank_status.count;
     port->vblank_cv.wait(lock, [&]() { return prev_counter != port->vblank_status.count; });

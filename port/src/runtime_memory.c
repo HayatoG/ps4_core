@@ -68,23 +68,55 @@ typedef struct { void *start; uint64_t offset, length; int8_t prot, type; int16_
 _Static_assert(sizeof(VirtualQueryInfo)==72,"PS4 virtual query info layout");
 _Static_assert(sizeof(BatchEntry)==32,"PS4 batch map entry layout");
 
+#include "rwlock_rp.h"
 /* Region table lock. Lookups (GPU per-draw queries, VirtualQuery, GPU page
  * protection) share it; map/unmap/protect take it exclusively. Both nest: code
  * under the lock may write guest memory, and a GPU-tracked page then faults into
- * runtime_memory_gpu_protect on the same thread. Readers nest because glibc's
- * default rwlock prefers readers; a thread holding it exclusively skips relocking. */
+ * runtime_memory_gpu_protect on the same thread. Readers nest because the lock prefers readers
+ * (glibc's default rwlock; rwlock_rp.h on Windows); a thread holding it exclusively skips relocking. */
+/* Windows: winpthreads' rwlock blocks new readers behind a waiting writer, so a nested reader
+ * deadlocks with it; rwlock_rp.h has glibc's reader preference. */
+#ifdef _WIN32
+static RpLock lock=RP_LOCK_INITIALIZER;
+#define table_rdlock() rp_read_lock(&lock)
+#define table_wrlock() rp_write_lock(&lock)
+#define table_rdunlock() rp_read_unlock(&lock)
+#define table_wrunlock() rp_write_unlock(&lock)
+#define table_tryrdlock() rp_try_read_lock(&lock)
+#define table_trywrlock() rp_try_write_lock(&lock)
+#else
 static pthread_rwlock_t lock=PTHREAD_RWLOCK_INITIALIZER;
+#define table_rdlock() pthread_rwlock_rdlock(&lock)
+#define table_wrlock() pthread_rwlock_wrlock(&lock)
+#define table_rdunlock() pthread_rwlock_unlock(&lock)
+#define table_wrunlock() pthread_rwlock_unlock(&lock)
+#define table_tryrdlock() pthread_rwlock_tryrdlock(&lock)
+#define table_trywrlock() pthread_rwlock_trywrlock(&lock)
+#endif
 static __thread unsigned exclusive_depth;
 /* Odd while a writer holds the lock; readers' region caches are valid for one even value. */
 static uint64_t table_generation;
+/* Contended acquisitions are marked for the freeze report (the uncontended path only adds a try). */
 static void write_lock(void) {
-    if (!exclusive_depth++) { pthread_rwlock_wrlock(&lock); __atomic_add_fetch(&table_generation,1,__ATOMIC_ACQ_REL); }
+    if (!exclusive_depth++) {
+        if (table_trywrlock()) {
+            runtime_wait_begin("runtime memory map lock (write)",&lock,NULL,NULL,0);
+            table_wrlock();
+            runtime_wait_end();
+        }
+        __atomic_add_fetch(&table_generation,1,__ATOMIC_ACQ_REL);
+    }
 }
 static void write_unlock(void) {
-    if (!--exclusive_depth) { __atomic_add_fetch(&table_generation,1,__ATOMIC_RELEASE); pthread_rwlock_unlock(&lock); }
+    if (!--exclusive_depth) { __atomic_add_fetch(&table_generation,1,__ATOMIC_RELEASE); table_wrunlock(); }
 }
-static void read_lock(void) { if (!exclusive_depth) pthread_rwlock_rdlock(&lock); }
-static void read_unlock(void) { if (!exclusive_depth) pthread_rwlock_unlock(&lock); }
+static void read_lock(void) {
+    if (exclusive_depth || !table_tryrdlock()) return;
+    runtime_wait_begin("runtime memory map lock (read)",&lock,NULL,NULL,0);
+    table_rdlock();
+    runtime_wait_end();
+}
+static void read_unlock(void) { if (!exclusive_depth) table_rdunlock(); }
 static Block blocks[LIMIT];
 static Vma *vmas; static size_t vma_count, vma_capacity;
 #ifndef _WIN32

@@ -2,6 +2,7 @@
 #define TLG_RUNTIME_H
 #include <stdint.h>
 #include <stddef.h>
+#include <stdio.h>
 #ifdef _WIN32
 #include "compat_win.h"
 /* No signals on Windows: the exception handler resumes the thread in tlg_longjmp
@@ -122,4 +123,64 @@ int runtime_savedata_param(int32_t user, const char *dir, void *param);
 int runtime_savedata_icon(int32_t user, const char *dir, char *out, size_t size);
 uint64_t runtime_savedata_size(int32_t user, const char *dir); /* bytes on disk, 0 unknown */
 void runtime_thread_attach_host(const char *name);
+
+/* Freeze report (runtime_freeze.c). Each thread keeps what it is blocked on in a wait slot:
+ * the runtime's blocking calls mark it before they block and clear it after (a few stores).
+ * Two levels are kept, so a GPU readback inside a file read shows both. */
+#define RUNTIME_WAIT_LEVELS 2
+typedef struct RuntimeWaitLevel {
+    const char *kind;           /* static text ("mutex", "semaphore", ...); NULL: none */
+    const void *object;         /* handle or address of what is waited on */
+    const void *const *owner;   /* where the holder's thread record is kept (mutexes), or NULL */
+    uintptr_t frame;            /* frame of the guest-called import: [frame] guest rbp, [frame+8] return */
+    uint64_t since_ms;          /* runtime_wait_now_ms() when the wait started */
+    char name[48];              /* object name (tail of long ones) */
+} RuntimeWaitLevel;
+typedef struct RuntimeWait {
+    unsigned depth;             /* nesting; levels past RUNTIME_WAIT_LEVELS are only counted */
+    uint32_t generation;        /* changes on every begin/end: readers detect a torn copy */
+    RuntimeWaitLevel level[RUNTIME_WAIT_LEVELS];
+} RuntimeWait;
+/* Frame of the calling (guest-called) function, for runtime_wait_begin. Use it in the ABI
+ * entry itself: there [frame+8] is the guest call site and [frame] the guest frame chain. */
+#define RUNTIME_GUEST_FRAME() ((uintptr_t)__builtin_frame_address(0))
+uint64_t runtime_wait_now_ms(void);
+/* The calling thread's slot: its guest thread record, else a host slot (NULL when all are taken). */
+RuntimeWait *runtime_wait_slot(void);
+void runtime_wait_slot_begin(RuntimeWait *w, const char *kind, const void *object, const char *name,
+                             const void *const *owner, uintptr_t frame, uint64_t now_ms);
+void runtime_wait_slot_end(RuntimeWait *w);
+void runtime_wait_begin(const char *kind, const void *object, const char *name,
+                        const void *const *owner, uintptr_t frame);
+void runtime_wait_end(void);
+/* Consistent copy of a slot another thread may be changing (0: it kept changing). */
+int runtime_wait_copy(const RuntimeWait *from, RuntimeWait *to);
+/* Thread record of the calling guest (or attached host) thread, NULL on other threads. */
+void *runtime_thread_self(void);
+typedef struct RuntimeThreadInfo {
+    const void *record;         /* guest thread record (compare with a mutex owner); NULL: host slot */
+    uint64_t os_tid;            /* gettid() / GetCurrentThreadId() */
+    char name[32];
+    int finished;
+    RuntimeWait wait;
+} RuntimeThreadInfo;
+/* Guest threads and host wait slots; returns how many were written (at most max). */
+size_t runtime_thread_snapshot(RuntimeThreadInfo *out, size_t max);
+/* One line: "waiting on mutex 'name' 0x... for 1234 ms, held by 'Main'" ("running" without a
+ * wait). threads/count resolve owners to names. */
+void runtime_freeze_describe_wait(char *out, size_t size, const RuntimeWait *wait, uint64_t now_ms,
+                                  const RuntimeThreadInfo *threads, size_t count);
+/* Monitor state machine: called with the frames shown so far; returns 1 when a report is due
+ * (once per freeze), 2 when frames resumed after a report, else 0. */
+typedef struct FreezeMonitor {
+    uint64_t seconds;           /* report after this long without a new frame (0: never) */
+    uint64_t last_frames, last_change_ms;
+    uint64_t freeze_ms;         /* after a 2: how long the frames had stopped */
+    int reported;
+} FreezeMonitor;
+int runtime_freeze_step(FreezeMonitor *m, uint64_t frames, uint64_t now_ms);
+/* Guest image range (guest offsets in the report) and the monitor thread (seconds 0: none). */
+void runtime_freeze_start(uintptr_t image, uint64_t image_size, unsigned seconds);
+/* Writes a report now (every thread: name, wait, RIP and frame chain) to out. */
+void runtime_freeze_report(FILE *out, const char *head);
 #endif
