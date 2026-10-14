@@ -124,13 +124,13 @@ tools/core_sync.py --pull --ref origin/main ~/decomp/tlg_pc   # traz o que o por
 
 Estados: `port-newer` (a versão daqui está no histórico do port: o port andou), `port-only`, `diverged` (os dois mudaram: mesclar à mão), `core-newer` (a versão do port está no histórico daqui ou no commit fixado de um port do `CORE_SOURCE`: o port está atrás), `core-only`, `submodule`. O `--pull` copia `port-newer` e `port-only` (com `--force`, também `diverged`) só para o working tree: revise com `git diff` e faça o commit à mão, atualizando o `CORE_SOURCE`.
 
-### Estado em 13/10/2026 (`--status-all`, depois do sync)
+### Estado em 14/10/2026 (`--status-all`, depois do sync com o inFAMOUS `fd78ad5`)
 
 | Port | `origin/main` | Diferentes | Leva do port | Port atrasado |
 |---|---|---|---|---|
-| tlg_pc | `f3eece1` (PR #12) | 25 | 0 | 23 `core-newer` + 2 `core-only` (`make_game_view.py`, `runtime_game.h`) |
-| gr2_pc | `a0fd165` (PR #9) | 51 | 0 | 35 `core-newer` + 16 `core-only` (SMAA/CAS, mouse, `runtime_game.h`) |
-| infamous_pc | `7ab8c4d` (= `f76850a` + ícone) | 40 | 0 | 24 `core-newer` + 16 `core-only` (o que veio do TLG) |
+| tlg_pc | `639d6ce` | 102 | 0 | 73 `core-newer` + 29 `core-only` |
+| gr2_pc | `4f5958f` | 124 | 0 | 81 `core-newer` + 43 `core-only` |
+| infamous_pc | `fd78ad5` (PR #6) | 41 | 0 | 25 `core-newer` + 16 `core-only` (SMAA/CAS, mouse, presenter, `PORT_ENV_PREFIX`) |
 
 Nenhum port tem trabalho de núcleo que falte aqui. Para levar o núcleo a um port: copiar os arquivos `core-newer`/`core-only` numa branch do port, compilar e testar o jogo (com a trava), e abrir o PR.
 
@@ -191,7 +191,7 @@ No core-only build yet (runtime.c links the per-game resolvers; build globs `src
 
 ## `tools/core_sync.py`
 
-`--status-all [--fetch]` (table of the three ports vs `origin/main`), `--ref`, `--diff`, `--pull` (copies `port-newer` and `port-only`, plus `diverged` with `--force`, into the working tree for review). States: `port-newer`, `port-only`, `diverged`, `core-newer` (port behind; checked against this history and the pinned commits in `CORE_SOURCE`), `core-only`, `submodule`. Status on 2026-10-13 after the sync: no port has core work missing here; tlg_pc `f3eece1` 25 behind (23 core-newer, 2 core-only), gr2_pc `a0fd165` 51 behind (35 + 16: SMAA/CAS, mouse), infamous_pc `7ab8c4d` (= `f76850a` + icon) 40 behind (24 + 16: the TLG work).
+`--status-all [--fetch]` (table of the three ports vs `origin/main`), `--ref`, `--diff`, `--pull` (copies `port-newer` and `port-only`, plus `diverged` with `--force`, into the working tree for review). States: `port-newer`, `port-only`, `diverged`, `core-newer` (port behind; checked against this history and the pinned commits in `CORE_SOURCE`), `core-only`, `submodule`. Status on 2026-10-14 after the infamous_pc `fd78ad5` sync: no port has core work missing here; tlg_pc `639d6ce` 102 behind (73 core-newer, 29 core-only), gr2_pc `4f5958f` 124 behind (81 + 43), infamous_pc `fd78ad5` 41 behind (25 + 16: SMAA/CAS, mouse, presenter, `PORT_ENV_PREFIX`; inFAMOUS must add `PORT_ENV_PREFIX="ISS_"` to its `port.env` when it takes this core).
 
 ## Tools
 
