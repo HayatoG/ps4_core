@@ -4,6 +4,11 @@
 #include <string.h>
 
 enum { HEADER_BYTES = 64, RECORD_BYTES = 64, MAX_SITES = 1u << 20, JMP_BYTES = 5 };
+/* Red-zone section (scripts/red_zone.py): SECTION (the last u32, a source CRC, is the script's
+ * cache key), STATS, code, then the groups. */
+enum { RZ_SECTION_BYTES = 36, RZ_STATS_BYTES = 4 * ISA_RZ_STATS, RZ_GROUP_BYTES = 20, RZ_PATCH_BYTES = 10,
+       RZ_VERSION = 1, RZ_MAX_PATCH = 64 };
+#define RZ_MAX_SECTION (256ull << 20)
 
 /* ---- SHA-256 (FIPS 180-4), for isa_table_matches ---- */
 
@@ -97,9 +102,44 @@ static IsaTable *load_fail(FILE *f, IsaTable *t, const char *reason, const char 
     if (t) {
         free(t->sites);
         free(t->hits);
+        free(t->rz);
+        free(t->rz_applied);
         free(t);
     }
     return NULL;
+}
+
+static uint16_t read_u16(const unsigned char *p) { return (uint16_t)(p[0] | p[1] << 8); }
+
+/* Checks the red-zone section's layout: every group, patch and stub inside its bounds. */
+static int red_zone_valid(IsaTable *t) {
+    const unsigned char *p = t->rz;
+    if (t->rz_size < RZ_SECTION_BYTES + RZ_STATS_BYTES || memcmp(p, "G3RZONE1", 8) != 0) return 0;
+    t->rz_code_offset = read_u64(p + 8);
+    t->rz_code_bytes = read_u32(p + 16);
+    t->rz_groups = read_u32(p + 20);
+    t->rz_group_bytes = read_u32(p + 24);
+    if (read_u32(p + 28) != RZ_VERSION) return 0;
+    for (int i = 0; i < ISA_RZ_STATS; i++) t->rz_stats[i] = read_u32(p + RZ_SECTION_BYTES + 4 * i);
+    if ((uint64_t)RZ_SECTION_BYTES + RZ_STATS_BYTES + t->rz_code_bytes + t->rz_group_bytes != t->rz_size) return 0;
+    if (t->rz_code_offset < t->image_size || t->rz_code_offset > (1ull << 31)) return 0;
+    const unsigned char *g = p + RZ_SECTION_BYTES + RZ_STATS_BYTES + t->rz_code_bytes, *end = g + t->rz_group_bytes;
+    for (uint32_t i = 0; i < t->rz_groups; i++) {
+        if (end - g < RZ_GROUP_BYTES) return 0;
+        uint32_t stub = read_u32(g + 8), bytes = read_u32(g + 12), patches = read_u16(g + 18);
+        if (!patches || stub > t->rz_code_bytes || bytes > t->rz_code_bytes - stub) return 0;
+        g += RZ_GROUP_BYTES;
+        for (uint32_t k = 0; k < patches; k++) {
+            if (end - g < RZ_PATCH_BYTES) return 0;
+            uint64_t offset = read_u64(g);
+            uint16_t length = read_u16(g + 8);
+            if (!length || length > RZ_MAX_PATCH || offset > t->image_size || length > t->image_size - offset ||
+                end - g < RZ_PATCH_BYTES + 2 * length)
+                return 0;
+            g += RZ_PATCH_BYTES + 2 * length;
+        }
+    }
+    return g == end;
 }
 
 IsaTable *isa_table_load(const char *path) {
@@ -109,8 +149,10 @@ IsaTable *isa_table_load(const char *path) {
     if (fread(header, 1, sizeof header, f) != sizeof header || memcmp(header, "G3ISA1\0\0", 8) != 0)
         return load_fail(f, NULL, "not a G3ISA1 table: ", path);
     uint32_t count = read_u32(header + 48);
+    uint64_t rz_size = read_u64(header + 56);
     if (count > MAX_SITES) return load_fail(f, NULL, "table has too many sites", NULL);
-    if (fseek(f, 0, SEEK_END) != 0 || ftell(f) != (long)(HEADER_BYTES + (uint64_t)RECORD_BYTES * count) ||
+    if (rz_size > RZ_MAX_SECTION) return load_fail(f, NULL, "red-zone section too large", NULL);
+    if (fseek(f, 0, SEEK_END) != 0 || ftell(f) != (long)(HEADER_BYTES + (uint64_t)RECORD_BYTES * count + rz_size) ||
         fseek(f, HEADER_BYTES, SEEK_SET) != 0)
         return load_fail(f, NULL, "table size does not match its site count", NULL);
     IsaTable *t = calloc(1, sizeof *t);
@@ -119,10 +161,17 @@ IsaTable *isa_table_load(const char *path) {
     t->hits = calloc(count ? count : 1, sizeof *t->hits);
     if (!t->sites || !t->hits) return load_fail(f, t, "out of memory", NULL);
     if (fread(t->sites, sizeof *t->sites, count, f) != count) return load_fail(f, t, "cannot read table ", path);
+    if (rz_size) {
+        t->rz = malloc((size_t)rz_size);
+        t->rz_size = rz_size;
+        if (!t->rz) return load_fail(f, t, "out of memory", NULL);
+        if (fread(t->rz, 1, (size_t)rz_size, f) != rz_size) return load_fail(f, t, "cannot read table ", path);
+    }
     fclose(f);
     t->count = count;
     t->unsupported = read_u32(header + 52);
     t->image_size = read_u64(header + 8);
+    if (t->rz && !red_zone_valid(t)) return load_fail(NULL, t, "invalid red-zone section", NULL);
     memcpy(t->sha256, header + 16, sizeof t->sha256);
     for (uint32_t i = 0; i < count; i++) {
         if (i > 0 && t->sites[i].offset <= t->sites[i - 1].offset)
@@ -193,12 +242,22 @@ static void emit_movdqu_rsp(unsigned char **p, int store, int xmm, uint8_t disp)
     emit_bytes(p, (const uint8_t[]){0x0f, store ? 0x7f : 0x6f, (uint8_t)(0x44 | (xmm & 7) << 3), 0x24, disp}, 5);
 }
 
-/* Shared tail: the relocated instruction (JMP_RELOCATE) and the jmp back; 0 when out of rel32 range. */
+static const uint8_t lea_rsp_below_red_zone[] = {0x48, 0x8d, 0x64, 0x24, 0x80};                   /* lea rsp,[rsp-0x80] */
+static const uint8_t lea_rsp_above_red_zone[] = {0x48, 0x8d, 0xa4, 0x24, 0x80, 0x00, 0x00, 0x00};   /* lea rsp,[rsp+0x80] */
+
+/* Shared tail: the relocated instruction (JMP_RELOCATE) and the jmp back; 0 when out of rel32 range.
+ * With red-zone protection a relocated instruction that can fault runs with rsp 128 bytes lower (a
+ * Windows exception frame then lands below the guest's red zone), when the stub has room. */
 static size_t emit_return(unsigned char *code, unsigned char *p, const unsigned char *at, const IsaSite *s,
-                          unsigned char *image) {
+                          unsigned char *image, int protect) {
     const unsigned char *back = image + s->offset + s->length;
     if (s->mode == ISA_MODE_JMP_RELOCATE) {
+        size_t wrapped = (size_t)(p - code) + sizeof lea_rsp_below_red_zone + s->relocated_length +
+                         sizeof lea_rsp_above_red_zone + JMP_BYTES;
+        int wrap = protect && (s->mem_flags & ISA_MEM_RELOCATED_FAULTABLE) && wrapped <= ISA_STUB_BYTES;
+        if (wrap) emit_bytes(&p, lea_rsp_below_red_zone, sizeof lea_rsp_below_red_zone);
         emit_bytes(&p, s->relocated, s->relocated_length);
+        if (wrap) emit_bytes(&p, lea_rsp_above_red_zone, sizeof lea_rsp_above_red_zone);
         back = image + s->offset + 4 + s->relocated_length;
     }
     int32_t rel;
@@ -214,7 +273,7 @@ static size_t emit_return(unsigned char *code, unsigned char *p, const unsigned 
  * it and loads the destination back. The movdqu are legacy SSE like EXTRQ itself: bits 255:128 of
  * the YMM register stay as they were, and no other XMM register is touched. */
 static size_t emit_sse4a_stub(unsigned char *code, const unsigned char *at, const IsaSite *s, uint64_t *hit,
-                              unsigned char *image) {
+                              unsigned char *image, int protect) {
     static const uint8_t pushes[] = {0x50, 0x51, 0x52, 0x56, 0x57, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53, 0x55};
     static const uint8_t pops[] = {0x5d, 0x41, 0x5b, 0x41, 0x5a, 0x41, 0x59, 0x41, 0x58, 0x5f, 0x5e, 0x5a, 0x59, 0x58};
     unsigned char *p = code;
@@ -242,17 +301,17 @@ static size_t emit_sse4a_stub(unsigned char *code, const unsigned char *at, cons
     emit_bytes(&p, pops, sizeof pops);
     emit_u8(&p, 0x9d);                                                     /* popfq */
     emit_bytes(&p, (const uint8_t[]){0x48, 0x8d, 0xa4, 0x24, 0x80, 0x00, 0x00, 0x00}, 8); /* lea rsp,[rsp+0x80] */
-    return emit_return(code, p, at, s, image);
+    return emit_return(code, p, at, s, image, protect);
 }
 
 /* Writes the stub for `s` into `code` (laid out to run at `at`). Returns its size, or 0 when the
  * jmp back is out of rel32 range. */
 static size_t emit_stub(unsigned char *code, const unsigned char *at, const IsaSite *s, uint64_t *hit,
-                        unsigned char *image) {
+                        unsigned char *image, int protect) {
     static const uint8_t lea_rsp_down[] = {0x48, 0x8d, 0xa4, 0x24, 0x00, 0xff, 0xff, 0xff};   /* lea rsp,[rsp-0x100] */
     static const uint8_t lea_rax_rsp_up[] = {0x48, 0x8d, 0x84, 0x24, 0x00, 0x01, 0x00, 0x00}; /* lea rax,[rsp+0x100] */
     static const uint8_t lea_rsp_up[] = {0x48, 0x8d, 0xa4, 0x24, 0x00, 0x01, 0x00, 0x00};     /* lea rsp,[rsp+0x100] */
-    if (isa_kind_is_sse4a(s->kind)) return emit_sse4a_stub(code, at, s, hit, image);
+    if (isa_kind_is_sse4a(s->kind)) return emit_sse4a_stub(code, at, s, hit, image, protect);
     unsigned char *p = code;
     emit_bytes(&p, lea_rsp_down, sizeof lea_rsp_down);
     for (int reg = 0; reg < 16; reg++)
@@ -276,7 +335,7 @@ static size_t emit_stub(unsigned char *code, const unsigned char *at, const IsaS
     for (int reg = 0; reg < 16; reg++)
         if (reg != 4) emit_mov_load(&p, reg, (uint8_t)(8 * reg));
     emit_bytes(&p, lea_rsp_up, sizeof lea_rsp_up);
-    return emit_return(code, p, at, s, image);
+    return emit_return(code, p, at, s, image, protect);
 }
 
 /* Site bytes of spec 4.3. */
@@ -326,7 +385,7 @@ IsaReport isa_rewrite_apply(IsaTable *t, unsigned char *image, unsigned char *st
         unsigned char code[2 * ISA_STUB_BYTES];
         int32_t rel;
         size_t size;
-        if (!rel32_to(site + JMP_BYTES, stub, &rel) || (size = emit_stub(code, stub, s, &t->hits[i], image)) == 0) {
+        if (!rel32_to(site + JMP_BYTES, stub, &rel) || (size = emit_stub(code, stub, s, &t->hits[i], image, t->protect_red_zone)) == 0) {
             fprintf(stderr, "ISA: site 0x%llx out of rel32 range\n", (unsigned long long)s->offset);
             report.skipped++;
             continue;
@@ -344,6 +403,71 @@ IsaReport isa_rewrite_apply(IsaTable *t, unsigned char *image, unsigned char *st
         report.rewritten++;
     }
     return report;
+}
+
+/* ---- red-zone protection ---- */
+
+size_t isa_red_zone_code_size(const IsaTable *t) { return t && t->rz ? t->rz_code_bytes : 0; }
+
+IsaRedZoneReport isa_red_zone_apply(IsaTable *t, unsigned char *image, unsigned char *area) {
+    IsaRedZoneReport report = {0};
+    if (!t || !t->rz) return report;
+    if (area != image + t->rz_code_offset) {
+        fprintf(stderr, "Red zone: stub area not where the table expects it, protection off\n");
+        report.skipped = t->rz_groups;
+        return report;
+    }
+    free(t->rz_applied);
+    t->rz_applied = calloc(t->rz_groups ? t->rz_groups : 1, sizeof *t->rz_applied);
+    t->rz_applied_count = 0;
+    if (!t->rz_applied) {
+        report.skipped = t->rz_groups;
+        return report;
+    }
+    const unsigned char *code = t->rz + RZ_SECTION_BYTES + RZ_STATS_BYTES, *g = code + t->rz_code_bytes;
+    memcpy(area, code, t->rz_code_bytes);
+    t->rz_area = area;
+    for (uint32_t i = 0; i < t->rz_groups; i++) {
+        uint64_t site = read_u64(g);
+        uint32_t stub = read_u32(g + 8), bytes = read_u32(g + 12), protected_count = read_u16(g + 16),
+                 patches = read_u16(g + 18);
+        const unsigned char *first = g + RZ_GROUP_BYTES, *q = first;
+        int matches = 1;
+        for (uint32_t k = 0; k < patches; k++) {
+            uint16_t length = read_u16(q + 8);
+            if (memcmp(image + read_u64(q), q + RZ_PATCH_BYTES, length) != 0) matches = 0;
+            q += RZ_PATCH_BYTES + 2 * length;
+        }
+        if (!matches) {
+            fprintf(stderr, "Red zone: site 0x%llx skipped: bytes changed\n", (unsigned long long)site);
+            report.skipped++;
+        } else {
+            for (const unsigned char *r = first; r < q;) {
+                uint16_t length = read_u16(r + 8);
+                memcpy(image + read_u64(r), r + RZ_PATCH_BYTES + length, length);
+                r += RZ_PATCH_BYTES + 2 * length;
+            }
+            t->rz_applied[t->rz_applied_count++] = (IsaRedZoneStub){site, stub, bytes};
+            report.groups++;
+            report.protected_instructions += protected_count;
+            report.short_relays += patches > 1;
+        }
+        g = q;
+    }
+    return report;
+}
+
+int isa_red_zone_site_of_stub(const IsaTable *t, uintptr_t rip, uint64_t *site) {
+    if (!t || !t->rz_area || rip < (uintptr_t)t->rz_area || rip - (uintptr_t)t->rz_area >= t->rz_code_bytes) return 0;
+    uint32_t at = (uint32_t)(rip - (uintptr_t)t->rz_area), lo = 0, hi = t->rz_applied_count;
+    while (lo < hi) {   /* stubs are laid out in group order: ascending offsets */
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (t->rz_applied[mid].stub + t->rz_applied[mid].stub_bytes <= at) lo = mid + 1;
+        else hi = mid;
+    }
+    if (lo == t->rz_applied_count || at < t->rz_applied[lo].stub) return 0;
+    *site = t->rz_applied[lo].site;
+    return 1;
 }
 
 /* ---- int3 trap, stub lookup, report ---- */

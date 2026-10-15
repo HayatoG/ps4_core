@@ -358,9 +358,12 @@ static void set_host_name(const char *name) {
 #define exit_setjmp(t) setjmp((t)->exit_jump)
 #define exit_longjmp(t) longjmp((t)->exit_jump,1)
 #endif
+static void (*thread_start_hook)(void);
+void runtime_set_thread_start_hook(void (*hook)(void)) { thread_start_hook=hook; }
 static void *host_start(void *p) {
     GuestThread *t=p;
     attach(t);
+    if (thread_start_hook) thread_start_hook();
     set_host_name(t->name);
     if (!exit_setjmp(t)) t->result=t->entry(t->argument);
     runtime_thread_keys_cleanup();

@@ -68,3 +68,8 @@ https://github.com/FelipePrado0/gow3_pc main 2a0eac6522d6e2e5b0fbfe25f49abd3dbe1
 # test_ngs2.c, tools/ngs2_compare.py copiados / copied; probe.c, runtime.c/.h, build.sh à mão / by hand
 # (runtime_ngs2_resolve antes dos jogos, como no gr2_pc test/gr2-ngs2-avstop-sse4a dc84b9e). Fora / not taken:
 # runtime_tlg.c, launchers, README-player.md, docs/TECNICO.md do TLG.
+
+# Branch fix/windows-red-zone-io (14/10/2026): infamous_pc origin/main 6b668a0. Red zone a5120b1 (PR #45) +
+# 00b1d37 (PR #46): scripts/red_zone.py, isa_rewrite.py, isa_rewrite.c/.h, probe.c, runtime.h, runtime_thread.c,
+# tests, docs/red_zone.md (run.py à mão / by hand: port_env_prefix). File I/O f0151cb (#24), 7964b9b dee27df (#43),
+# cd4c6be (#48): runtime_file.c, compat_win.c/.h copiados / copied. Fora / not taken: infamous_run.py, README.

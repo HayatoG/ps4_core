@@ -47,7 +47,14 @@ typedef struct {
 _Static_assert(sizeof(GuestStat)==120,"FreeBSD stat layout");
 
 typedef struct { char *names; size_t count, *offsets; unsigned char *types; } Listing;
-typedef struct { int used, host; Listing *dir; size_t position; char path[512]; } File;
+/* Windows: `offset` is the descriptor's position, kept here (under `io`) instead of in the CRT/
+ * Win32 file pointer. Positioned reads there move that pointer (compat_pread restores it, racing
+ * with any other thread's read on the descriptor), and the CRT's read() reports a GPU-protected
+ * destination page as EINVAL, not EFAULT, so it was never retried: short or misplaced reads made
+ * inFAMOUS say "the disc or hard disk is corrupted" at the graffiti. Reads at the position go
+ * through compat_pread like pread. */
+typedef struct { int used, host; Listing *dir; size_t position; char path[512];
+                 int64_t offset; int append; pthread_mutex_t io; } File;
 typedef struct { char guest[64]; char host[512]; } Mount;
 static File files[MAX_FILES];
 static Mount mounts[MAX_MOUNTS];
@@ -199,6 +206,7 @@ static int game_path(const char *p) {
            (!strncmp(p,"/hostapp",8) && (!p[8] || p[8]=='/'));
 }
 /* All operations return >=0 or -(host errno); wrappers adapt the convention. */
+static void log_io_problem(const char *what,const char *detail,int64_t n,int error);
 static int64_t do_open(const char *guest,int flags,int mode) {
     if (game_path(guest) && (flags & (3|0x8|0x200|0x400|0x800))) return -EROFS;
     char path[1024];
@@ -222,6 +230,7 @@ static int64_t do_open(const char *guest,int flags,int mode) {
         if (host<0) {
             e=errno;
             if (e==ENOENT) { ++missing; printf("Runtime: open(%s) -> not found\n",guest); }
+            else { compat_last_io_error=GetLastError(); log_io_problem("open",guest,host,e); }
             return -e;
         }
         if (host_fstat(host,&s)) memset(&s,0,sizeof(s));
@@ -241,7 +250,8 @@ static int64_t do_open(const char *guest,int flags,int mode) {
     int fd=-1;
     for (int i=3;i<MAX_FILES;++i) if (!files[i].used) { fd=i; break; }
     if (fd<0) { pthread_mutex_unlock(&lock); if (host>=0) close(host); free_listing(dir); return -EMFILE; }
-    files[fd]=(File){.used=1,.host=host,.dir=dir};
+    files[fd]=(File){.used=1,.host=host,.dir=dir,.append=(flags&0x8)!=0};
+    pthread_mutex_init(&files[fd].io,NULL);
     snprintf(files[fd].path,sizeof(files[fd].path),"%s",guest);
     ++opens;
     pthread_mutex_unlock(&lock);
@@ -266,6 +276,7 @@ static int64_t do_close(int fd) {
     if (!f) { pthread_mutex_unlock(&lock); return -EBADF; }
     if (f->host>=0) close(f->host);
     free_listing(f->dir);
+    pthread_mutex_destroy(&f->io);
     *f=(File){0};
     pthread_mutex_unlock(&lock);
     return 0;
@@ -294,30 +305,91 @@ static void touch_for_write(void *buffer,uint64_t size) {
         *b=*b;
     }
 }
+/* A failed or short game read is logged (the first 32): on Windows "The disc or Hard Disk Drive
+ * is corrupt" is the game's answer to EIO from a file read, so the log must say why. */
+static void log_read_problem(const char *what,int fd,uint64_t size,int64_t offset,ssize_t n,int error) {
+    static int logged;
+    if (__atomic_fetch_add(&logged,1,__ATOMIC_RELAXED)>=32) return;
+#ifdef _WIN32
+    printf("Runtime: %s(fd %d, %llu bytes @%lld) %s %lld, errno %d, Win32 error %lu\n",what,fd,(unsigned long long)size,
+           (long long)offset,n<0 ? "failed" : "short:",(long long)n,error,compat_last_io_error);
+#else
+    printf("Runtime: %s(fd %d, %llu bytes @%lld) %s %lld, errno %d\n",what,fd,(unsigned long long)size,(long long)offset,
+           n<0 ? "failed" : "short:",(long long)n,error);
+#endif
+}
+/* A failed path operation or write is logged (the first 32), like reads: on Windows the game
+ * shows "The disc or Hard Disk Drive is corrupt" when a FIOS operation gets EIO. */
+static void log_io_problem(const char *what,const char *detail,int64_t n,int error) {
+    static int logged;
+    if (__atomic_fetch_add(&logged,1,__ATOMIC_RELAXED)>=32) return;
+#ifdef _WIN32
+    printf("Runtime: %s(%s) failed %lld, errno %d, Win32 error %lu\n",what,detail,(long long)n,error,compat_last_io_error);
+#else
+    printf("Runtime: %s(%s) failed %lld, errno %d\n",what,detail,(long long)n,error);
+#endif
+}
 /* Reads `size` bytes (offset<0: at the file position), re-touching the rest of the destination
  * after a short read or EFAULT: with precise readbacks the GPU tracker can protect a page again
  * between touch_for_write and the kernel copy, which then stops early without an error. The
  * game treats a short texture read as fatal (JsTex.cpp ASSERT readSize == sizeAlign.m_size). */
+#ifdef _WIN32
+/* Windows: the kernel copy into a GPU-protected guest page fails (ERROR_NOACCESS) instead of
+ * faulting to our handler, and touching the pages first is not enough: the GPU can protect them
+ * again before the copy (seen under Wine: 64 retries in a row, then a short read). Read into a
+ * host buffer instead and copy in user mode, where every fault goes through the handler. */
+enum { BOUNCE_BYTES=4u<<20 };
+static ssize_t bounce_read(int h,unsigned char *at,uint64_t size,int64_t offset) {
+    static _Thread_local unsigned char *bounce;
+    if (!bounce && !(bounce=malloc(BOUNCE_BYTES))) return -2;   /* no buffer: read directly */
+    uint64_t want=size<BOUNCE_BYTES ? size : BOUNCE_BYTES;
+    ssize_t n=offset<0 ? host_read(h,bounce,want) : pread(h,bounce,want,offset);
+    if (n>0) memcpy(at,bounce,(size_t)n);
+    return n;
+}
+#endif
 static ssize_t full_io(int h,void *buffer,uint64_t size,int64_t offset) {
     unsigned char *at=buffer;
     uint64_t done=0;
-    for (int stalls=0; done<size && stalls<64;) {
+    int stalls=0;
+    for (; done<size && stalls<64;) {
+#ifdef _WIN32
+        ssize_t n=bounce_read(h,at+done,size-done,offset<0 ? -1 : offset+(int64_t)done);
+        if (n==-2) {
+            touch_for_write(at+done,size-done);
+            n=offset<0 ? host_read(h,at+done,size-done) : pread(h,at+done,size-done,offset+(int64_t)done);
+        }
+#else
         touch_for_write(at+done,size-done);
         ssize_t n=offset<0 ? host_read(h,at+done,size-done) : pread(h,at+done,size-done,offset+(int64_t)done);
+#endif
         if (n<0) {
             if (errno==EINTR || errno==EFAULT) { ++stalls; continue; }
+            if (done) log_read_problem("io (error after a partial read)",h,size,offset,(ssize_t)done,errno);
             return done ? (ssize_t)done : -1;
         }
         if (n==0) break; /* end of file */
         done+=(uint64_t)n;
     }
+    if (stalls>=64) log_read_problem("io (gave up after 64 retries)",h,size,offset,(ssize_t)done,EFAULT);
     return (ssize_t)done;
 }
 static int64_t do_read(int fd,void *buffer,uint64_t size) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
+#ifdef _WIN32
+    File *f=fd>=3 ? get(fd) : NULL;
+    ssize_t n;
+    if (f) {
+        pthread_mutex_lock(&f->io);
+        n=full_io(h,buffer,size,f->offset);
+        if (n>0) f->offset+=n;
+        pthread_mutex_unlock(&f->io);
+    } else n=full_io(h,buffer,size,-1);
+#else
     ssize_t n=full_io(h,buffer,size,-1);
-    if (n<0) { if (audio_trace()) printf("Audio trace: read(fd %d, %llu) failed, errno %d\n",fd,(unsigned long long)size,errno); return -errno; }
+#endif
+    if (n<0) { int e=errno; log_read_problem("read",fd,size,-1,n,e); return -e; }
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;
 }
@@ -325,23 +397,72 @@ static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
     ssize_t n=full_io(h,buffer,size,offset);
-    if (n<0) { if (audio_trace()) printf("Audio trace: pread(fd %d, %llu @%lld) failed, errno %d\n",fd,(unsigned long long)size,(long long)offset,errno); return -errno; }
+    if (n<0) { int e=errno; log_read_problem("pread",fd,size,offset,n,e); return -e; }
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;
 }
+#ifdef _WIN32
+/* Windows: WriteFile reading a guest page the GPU tracker has read-protected fails
+ * (ERROR_NOACCESS) instead of faulting to our handler. Copy each part to a host buffer in user
+ * mode first, where the fault goes through the handler, then write from there. */
+static ssize_t bounce_write(int h,const unsigned char *at,uint64_t size,int64_t offset) {
+    static _Thread_local unsigned char *bounce;
+    if (!bounce && !(bounce=malloc(BOUNCE_BYTES))) return offset<0 ? host_write(h,at,size) : pwrite(h,at,size,offset);
+    uint64_t done=0;
+    while (done<size) {
+        const uint64_t part=size-done<BOUNCE_BYTES ? size-done : BOUNCE_BYTES;
+        memcpy(bounce,at+done,(size_t)part);
+        ssize_t n=offset<0 ? host_write(h,bounce,part) : pwrite(h,bounce,part,offset+(int64_t)done);
+        if (n<0) return done ? (ssize_t)done : -1;
+        done+=(uint64_t)n;
+        if ((uint64_t)n<part) break;
+    }
+    return (ssize_t)done;
+}
+#endif
 static int64_t do_write(int fd,const void *buffer,uint64_t size) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
+#ifdef _WIN32
+    /* The CRT writes at its own file pointer: put it at the descriptor's position first. */
+    File *f=fd>=3 ? get(fd) : NULL;
+    ssize_t n;
+    if (f) {
+        pthread_mutex_lock(&f->io);
+        if (f->append || host_lseek(h,f->offset,SEEK_SET)>=0) {
+            n=bounce_write(h,buffer,size,-1);
+            const int64_t at=host_lseek(h,0,SEEK_CUR);
+            if (at>=0) f->offset=at;
+        } else n=-1;
+        pthread_mutex_unlock(&f->io);
+    } else n=host_write(h,buffer,size);
+#else
     ssize_t n=host_write(h,buffer,size);
-    if (n<0) return -errno;
+#endif
+    if (n<0) {
+        int e=errno; char what[64];
+        snprintf(what,sizeof(what),"fd %d, %llu bytes",fd,(unsigned long long)size);
+        log_io_problem("write",what,n,e);
+        return -e;
+    }
     __atomic_add_fetch(&writes,1,__ATOMIC_RELAXED);
     return n;
 }
 static int64_t do_pwrite(int fd,const void *buffer,uint64_t size,int64_t offset) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
+#ifdef _WIN32
+    ssize_t n=bounce_write(h,buffer,size,offset);
+#else
     ssize_t n=pwrite(h,buffer,size,offset);
-    return n<0 ? -errno : n;
+#endif
+    if (n<0) {
+        int e=errno; char what[80];
+        snprintf(what,sizeof(what),"fd %d, %llu bytes @%lld",fd,(unsigned long long)size,(long long)offset);
+        log_io_problem("pwrite",what,n,e);
+        return -e;
+    }
+    return n;
 }
 static int64_t do_lseek(int fd,int64_t offset,int whence) {
     File *f=get(fd);
@@ -352,8 +473,25 @@ static int64_t do_lseek(int fd,int64_t offset,int whence) {
         if (whence==0 && offset>=0) { f->position=(size_t)offset; return offset; }
         return -EINVAL;
     }
+#ifdef _WIN32
+    pthread_mutex_lock(&f->io);
+    int64_t base=0;
+    if (whence==1) base=f->offset;
+    else if (whence==2) {
+        HostStat s;
+        if (host_fstat(f->host,&s)) { pthread_mutex_unlock(&f->io); return -errno; }
+        base=(int64_t)s.st_size;
+    }
+    const int64_t r=base+offset;
+    if (r<0) { pthread_mutex_unlock(&f->io); return -EINVAL; }
+    f->offset=r;
+    host_lseek(f->host,r,SEEK_SET); /* the CRT pointer follows, for anything that still uses it */
+    pthread_mutex_unlock(&f->io);
+    return r;
+#else
     int64_t r=host_lseek(f->host,offset,whence);
     return r<0 ? -errno : r;
+#endif
 }
 static int64_t do_fstat(int fd,GuestStat *out) {
     int h=host_fd(fd);
@@ -416,7 +554,15 @@ static int64_t path_op(const char *guest,int op,int mode) {
     int e=translate(guest,path,sizeof(path));
     if (e) return -e;
     int r= op==0 ? mkdir(path,mode ? mode : 0755) : op==1 ? rmdir(path) : unlink(path);
-    return r ? -errno : 0;
+    if (r) {
+        int e=errno;
+#ifdef _WIN32
+        compat_last_io_error=GetLastError();
+#endif
+        if (e!=ENOENT && e!=EEXIST) log_io_problem(op==0 ? "mkdir" : op==1 ? "rmdir" : "unlink",guest,r,e);
+        return -e;
+    }
+    return 0;
 }
 static int64_t do_rename(const char *from,const char *to) {
     if (game_path(from) || game_path(to)) return -EROFS;
@@ -426,7 +572,13 @@ static int64_t do_rename(const char *from,const char *to) {
     if (e) return -e;
 #ifdef _WIN32
     /* POSIX rename replaces an existing target; the CRT's fails. */
-    return MoveFileExA(a,b,MOVEFILE_REPLACE_EXISTING) ? 0 : -compat_errno_from_win32(GetLastError());
+    if (MoveFileExA(a,b,MOVEFILE_REPLACE_EXISTING)) return 0;
+    compat_last_io_error=GetLastError();
+    e=compat_errno_from_win32(compat_last_io_error);
+    char what[600];
+    snprintf(what,sizeof(what),"%s -> %s",from,to);
+    log_io_problem("rename",what,-1,e);
+    return -e;
 #else
     return rename(a,b) ? -errno : 0;
 #endif

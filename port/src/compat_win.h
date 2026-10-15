@@ -70,6 +70,8 @@ void compat_sleep_ns(uint64_t ns);
 int compat_remove_tree(const char *path);
 /* errno for a Win32 error code. */
 int compat_errno_from_win32(unsigned long error);
+/* The Win32 error of this thread's last failed positioned read/write (for the log). */
+extern _Thread_local unsigned long compat_last_io_error;
 /* User and kernel CPU time of the process (who=0) or calling thread (who=1), microseconds. */
 int compat_cpu_times(int who, int64_t *user_us, int64_t *kernel_us);
 /* setjmp/longjmp without SEH unwinding (guest frames have no unwind data) that saves every
