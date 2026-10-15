@@ -35,6 +35,8 @@ __asm__(".text\n"
         "    movups 224(%rcx),%xmm15\n    ldmxcsr 240(%rcx)\n    fldcw 244(%rcx)\n"
         "    mov 64(%rcx),%rsp\n    jmp *72(%rcx)\n");
 
+_Thread_local unsigned long compat_last_io_error;
+
 int compat_errno_from_win32(unsigned long error) {
     switch (error) {
     case ERROR_SUCCESS: return 0;
@@ -50,7 +52,10 @@ int compat_errno_from_win32(unsigned long error) {
     case ERROR_DIRECTORY: return ENOTDIR;
     case ERROR_FILENAME_EXCED_RANGE: case ERROR_BUFFER_OVERFLOW: return ENAMETOOLONG;
     case ERROR_TOO_MANY_OPEN_FILES: return EMFILE;
-    case ERROR_NOACCESS: return EFAULT;
+    /* The destination is (partly) a GPU-protected page, or the kernel could not lock or map it
+     * for this read: the caller touches the pages and retries (runtime_file.c full_io). */
+    case ERROR_NOACCESS: case ERROR_INVALID_USER_BUFFER: case ERROR_NO_SYSTEM_RESOURCES:
+    case ERROR_WORKING_SET_QUOTA: case ERROR_NOT_ENOUGH_QUOTA: case ERROR_INVALID_ADDRESS: return EFAULT;
     case ERROR_HANDLE_EOF: return 0;
     case ERROR_NEGATIVE_SEEK: case ERROR_INVALID_PARAMETER: return EINVAL;
     default: return EIO;
@@ -67,7 +72,9 @@ static ssize_t positioned(int fd, void *buffer, size_t size, int64_t offset, int
     if (!SetFilePointerEx(h, zero, &saved, FILE_CURRENT)) { errno = compat_errno_from_win32(GetLastError()); return -1; }
     size_t done = 0;
     while (done < size) {
-        DWORD chunk = size - done > 0x40000000u ? 0x40000000u : (DWORD)(size - done), n = 0;
+        /* 16 MiB per call: one ReadFile of hundreds of MiB can fail for lack of system resources
+         * (ERROR_NO_SYSTEM_RESOURCES / ERROR_WORKING_SET_QUOTA) while locking the buffer. */
+        DWORD chunk = size - done > 0x1000000u ? 0x1000000u : (DWORD)(size - done), n = 0;
         OVERLAPPED at = {0};
         uint64_t position = (uint64_t)offset + done;
         at.Offset = (DWORD)position; at.OffsetHigh = (DWORD)(position >> 32);
@@ -77,6 +84,7 @@ static ssize_t positioned(int fd, void *buffer, size_t size, int64_t offset, int
             DWORD e = GetLastError();
             if (e == ERROR_HANDLE_EOF) break;
             SetFilePointerEx(h, saved, NULL, FILE_BEGIN);
+            compat_last_io_error = e;
             if (done) return (ssize_t)done;
             errno = compat_errno_from_win32(e);
             return -1;

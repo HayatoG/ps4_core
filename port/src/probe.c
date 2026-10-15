@@ -44,6 +44,9 @@ static int entered_game;
 static int gpu_enabled;
 static unsigned cpu_missing_sets; /* CPU_SET_* the host lacks; the guest code needs them rewritten */
 static IsaTable *isa_table; /* rewritten sites (--isa-rewrite); the fault handlers and the report read it */
+#ifndef _WIN32
+static uintptr_t guest_code_end; /* end of the image and its stub areas (emulation, red zone); TLG_CLOBBER_RED_ZONE */
+#endif
 static void isa_report_hook(void) { isa_rewrite_report(isa_table, stdout); }
 int vulkan_smoke(void);
 
@@ -145,10 +148,14 @@ static void describe_address(char *out, size_t size, uintptr_t address) {
     HMODULE module=NULL;
     char name[MAX_PATH]="?";
     int site=isa_table ? isa_rewrite_site_of_stub(isa_table,address) : -1;
+    uint64_t rz_site=0;
+    int rz=isa_red_zone_site_of_stub(isa_table,address,&rz_site);
     if (site>=0 || (image && address-(uintptr_t)image<0x20000000)) {
         int n=snprintf(out,size,"guest offset 0x%" PRIxPTR,address-(uintptr_t)image);
         if (site>=0 && n>=0 && (size_t)n<size)
             snprintf(out+n,size-n," While emulating site 0x%" PRIx64 " (%s)",isa_table->sites[site].offset,isa_kind_name(isa_table->sites[site].kind));
+        else if (rz && n>=0 && (size_t)n<size)
+            snprintf(out+n,size-n," (red-zone stub of 0x%" PRIx64 ")",rz_site);
         return;
     }
     if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)address,&module) && module) {
@@ -266,6 +273,42 @@ static uint64_t patch_tcb_loads(const Segment *segments, uint64_t count) {
 /* ucontext gregs of IsaRegs.gpr (x86 numbering). */
 static const int isa_gregs[16]={REG_RAX,REG_RCX,REG_RDX,REG_RBX,REG_RSP,REG_RBP,REG_RSI,REG_RDI,
                                 REG_R8,REG_R9,REG_R10,REG_R11,REG_R12,REG_R13,REG_R14,REG_R15};
+/* TLG_CLOBBER_RED_ZONE=<bytes> (test, Linux): after each guest fault the handler resolved (GPU page
+ * tracking, int3 ISA sites), zero that many bytes below the interrupted rsp, as Windows' exception
+ * dispatch overwrites them: reproduces the Windows-only corruption here ("1" = the 128-byte red
+ * zone). Over 128 bytes the handler needs an alternate signal stack (the kernel's frame starts 128
+ * bytes below rsp): each guest thread gets one; elsewhere the clobber stays at 128. The first
+ * distinct guest RIPs are logged. */
+static unsigned clobber_red_zone;
+static void clobber_thread_init(void) {
+    if (clobber_red_zone <= 128) return;
+    stack_t ss = {0};
+    ss.ss_size = 256 * 1024;
+    ss.ss_sp = mmap(NULL, ss.ss_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (ss.ss_sp != MAP_FAILED) sigaltstack(&ss, NULL);
+}
+static void clobber_below(ucontext_t *uc) {
+    uintptr_t rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP], rsp = (uintptr_t)uc->uc_mcontext.gregs[REG_RSP];
+    if (!clobber_red_zone || rip < (uintptr_t)image || rip >= guest_code_end) return;
+    unsigned bytes = clobber_red_zone;
+    stack_t current;
+    if (bytes > 128 && (sigaltstack(NULL, &current) || !(current.ss_flags & SS_ONSTACK))) bytes = 128;
+    memset((void *)(rsp - bytes), 0, bytes);
+    static uintptr_t seen[32];
+    static unsigned seen_count;
+    for (unsigned i = 0; i < seen_count && i < 32; ++i) if (seen[i] == rip) return;
+    unsigned slot = __atomic_fetch_add(&seen_count, 1, __ATOMIC_RELAXED);
+    if (slot >= 32) return;
+    seen[slot] = rip;
+    char line[96];
+    uint64_t site = 0;
+    int in_stub = isa_red_zone_site_of_stub(isa_table, rip, &site);
+    int n = snprintf(line, sizeof line, "Test: red zone clobbered (%u bytes) at guest offset 0x%lx%s%lx\n", bytes,
+                     (unsigned long)(rip - (uintptr_t)image), in_stub ? ", red-zone stub of 0x" : "", in_stub ? (unsigned long)site : 0ul);
+    if (!in_stub) n = snprintf(line, sizeof line, "Test: red zone clobbered (%u bytes) at guest offset 0x%lx\n", bytes,
+                               (unsigned long)(rip - (uintptr_t)image));
+    if (n > 0) { ssize_t written_ = write(2, line, (size_t)n); (void)written_; }
+}
 static void fault(int sig, siginfo_t *info, void *context) {
     if (sig == SIGTRAP && isa_table) {
         /* An int3 ISA site (RIP is past the CC byte); any other trap ends in the report below. */
@@ -285,6 +328,7 @@ static void fault(int sig, siginfo_t *info, void *context) {
             for (int i = 0; i < 16; ++i) g[isa_gregs[i]] = (greg_t)regs.gpr[i];
             g[REG_EFL] = (greg_t)regs.rflags;
             g[REG_RIP] = (greg_t)rip;
+            clobber_below(context);
             return;
         }
     }
@@ -302,7 +346,10 @@ static void fault(int sig, siginfo_t *info, void *context) {
         siglongjmp(*recover, 1);
     }
     /* GPU page tracking (write-protected guest pages) is resolved next. */
-    if (gpu_enabled && sig == SIGSEGV && tlggpu_handle_fault(context, info->si_addr)) return;
+    if (gpu_enabled && sig == SIGSEGV && tlggpu_handle_fault(context, info->si_addr)) {
+        clobber_below(context);
+        return;
+    }
     /* The process is terminating: dladdr/snprintf are acceptable here. */
     ucontext_t *uc = context;
     uintptr_t rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
@@ -310,9 +357,12 @@ static void fault(int sig, siginfo_t *info, void *context) {
     Dl_info where;
     int site = isa_table ? isa_rewrite_site_of_stub(isa_table, rip) : -1;
     char emulating[64] = "";
+    uint64_t rz_site = 0;
     if (site >= 0)
         snprintf(emulating, sizeof(emulating), " While emulating site 0x%" PRIx64 " (%s)",
                  isa_table->sites[site].offset, isa_kind_name(isa_table->sites[site].kind));
+    else if (isa_red_zone_site_of_stub(isa_table, rip, &rz_site))
+        snprintf(emulating, sizeof(emulating), " (red-zone stub of 0x%" PRIx64 ")", rz_site);
     if (site >= 0 || rip - (uintptr_t)image < 0x10000000)
         snprintf(line, sizeof(line), "Guest fault (signal %d) at guest offset 0x%lx, address %p%s\n",
                  sig, (unsigned long)(rip - (uintptr_t)image), info->si_addr, emulating);
@@ -851,6 +901,16 @@ int main(int argc, char **argv) {
         printf("STOP: this CPU lacks %s and no rewrite table matches the image\n", missing);
         return 20;
     }
+    /* Red-zone protection (scripts/red_zone.py, the table's G3RZONE1 section): guest code keeps data
+     * below rsp (SysV red zone) and Windows' exception dispatch overwrites it on every fault (#29,
+     * #41). On by default on Windows; TLG_RED_ZONE_REWRITE=1 forces it (Linux tests, with
+     * TLG_CLOBBER_RED_ZONE), =0 turns it off. */
+    const char *red_zone_policy = getenv("TLG_RED_ZONE_REWRITE");
+#ifdef _WIN32
+    int red_zone_on = !(red_zone_policy && !strcmp(red_zone_policy, "0"));
+#else
+    int red_zone_on = red_zone_policy && !strcmp(red_zone_policy, "1");
+#endif
     if (content_profile) {
         FILE *profile=fopen(content_profile,"rb");
         unsigned char data[28];
@@ -895,7 +955,16 @@ int main(int argc, char **argv) {
     (void)timeout_seconds; /* no watchdog on Windows */
 #else
     page_size = (size_t)sysconf(_SC_PAGESIZE);
-    struct sigaction sa = {0}; sa.sa_sigaction = fault; sa.sa_flags = SA_SIGINFO;
+    {
+        const char *clobber = getenv("TLG_CLOBBER_RED_ZONE");
+        long bytes = clobber ? strtol(clobber, NULL, 0) : 0;
+        clobber_red_zone = bytes == 1 ? 128 : bytes > 0 && bytes <= 65536 ? (unsigned)bytes : 0;
+        if (clobber_red_zone) {
+            printf("Test: fault handler zeroes %u bytes below the guest rsp (TLG_CLOBBER_RED_ZONE)\n", clobber_red_zone);
+            runtime_set_thread_start_hook(clobber_thread_init);
+        }
+    }
+    struct sigaction sa = {0}; sa.sa_sigaction = fault; sa.sa_flags = SA_SIGINFO | (clobber_red_zone > 128 ? SA_ONSTACK : 0);
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, NULL); sigaction(SIGILL, &sa, NULL); sigaction(SIGBUS, &sa, NULL);
     sigaction(SIGTRAP, &sa, NULL); /* int3 ISA sites */
@@ -1007,17 +1076,33 @@ int main(int argc, char **argv) {
             if (!executable) fail("native function is not executable");
         }
     }
-    isa_table = isa_sets && isa_file ? isa_table_load(isa_file) : NULL;
+    isa_table = (isa_sets || red_zone_on) && isa_file ? isa_table_load(isa_file) : NULL;
     if (!isa_table && cpu_missing_sets) { printf("STOP: this CPU lacks %s and no rewrite table matches the image\n", missing); return 20; }
-    /* The stubs follow the image in the same low mapping (rel32 jmps reach them). */
+    /* The stubs follow the image in the same low mapping (rel32 jmps reach them): the emulation
+     * stubs, then the red-zone stub code at the offset scripts/red_zone.py encoded it for. */
     size_t stub_area = isa_table ? round_page(isa_stub_area_size(isa_table)) : 0;
-    image = allocate(round_page(size) + stub_area);
+    size_t red_zone_area = 0;
+    if (red_zone_on) {
+        if (!isa_table || !isa_table->rz) printf("Red zone: protection unavailable (no red-zone section in the rewrite table)\n");
+        else if (isa_table->rz_code_offset != round_page(size) + stub_area) printf("Red zone: protection unavailable (stub offset does not match this page size)\n");
+        else red_zone_area = round_page(isa_red_zone_code_size(isa_table));
+        if (!red_zone_area) red_zone_on = 0;
+    }
+    image = allocate(round_page(size) + stub_area + red_zone_area);
     unsigned char *stubs = image + round_page(size);
+#ifndef _WIN32
+    guest_code_end = (uintptr_t)image + round_page(size) + stub_area + red_zone_area;
+#endif
     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
     fclose(f);
     if (isa_table && isa_table_matches(isa_table, image, size)) {
-        printf("STOP: this CPU lacks %s and no rewrite table matches the image\n", missing);
-        return 20;
+        if (cpu_missing_sets) {
+            printf("STOP: this CPU lacks %s and no rewrite table matches the image\n", missing);
+            return 20;
+        }
+        printf("Red zone: protection unavailable (the rewrite table is for another image)\n");
+        isa_table = NULL;
+        red_zone_on = 0;
     }
     if (!cpu_only) {
         char title[128]="God of War III", serial[16]="UNKNOWN", sfo[4096];
@@ -1099,6 +1184,7 @@ int main(int argc, char **argv) {
     printf("Guest TCB loads redirected to the TEB TLS slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));
 #endif
     if (isa_table) {
+        isa_table->protect_red_zone = red_zone_on;
         IsaReport r = isa_rewrite_apply(isa_table, image, stubs, isa_sets);
         if (r.unsupported_needed) {
             printf("STOP: this CPU lacks %s and %u sites use encodings the rewrite cannot emulate\n", missing, r.unsupported_needed);
@@ -1107,10 +1193,20 @@ int main(int argc, char **argv) {
         }
         if (forced) printf("ISA: forced rewrite of %u sites (TLG_ISA_REWRITE=%s; %u jmp, %u relocated, %u int3), %u skipped\n",
                            r.rewritten, policy, r.jmp, r.relocated, r.int3, r.skipped);
-        else printf("ISA: CPU lacks %s: %u sites rewritten (%u jmp, %u relocated, %u int3), %u skipped\n",
-                    missing, r.rewritten, r.jmp, r.relocated, r.int3, r.skipped);
+        else if (isa_sets) printf("ISA: CPU lacks %s: %u sites rewritten (%u jmp, %u relocated, %u int3), %u skipped\n",
+                                  missing, r.rewritten, r.jmp, r.relocated, r.int3, r.skipped);
+        if (red_zone_on) {
+            const uint32_t *st = isa_table->rz_stats;   /* scripts/red_zone.py STATS_FIELDS */
+            IsaRedZoneReport z = isa_red_zone_apply(isa_table, image, stubs + stub_area);
+            printf("Red zone: %u instructions protected in %u patches (%u short-jump relays), %u patches skipped; "
+                   "%u red-zone functions of %u (%u conservative); not protected: %u use rsp, %u control flow, "
+                   "%u unrelocatable\n",
+                   z.protected_instructions, z.groups, z.short_relays, z.skipped, st[1], st[0], st[2], st[7], st[8],
+                   st[10]);
+            if (r.int3) printf("Red zone: %u int3 ISA sites trap through the exception handler (not protected)\n", r.int3);
+        }
         runtime_set_report_hook(isa_report_hook);
-        protect(stubs, stub_area, 5);
+        protect(stubs, stub_area + red_zone_area, 5);
     }
     protect(traps, round_page((import_count + 1) * 32), 5);
     if (trace_stubs) protect(trace_stubs, round_page((import_count + 1) * TRACE_STUB_SIZE), 5);
@@ -1148,7 +1244,7 @@ int main(int argc, char **argv) {
          * every thread's wait, RIP and frames to the log (runtime_freeze.c). Needs the GPU. */
         const char *freeze = getenv("TLG_FREEZE_REPORT_SECONDS");
         unsigned seconds = freeze && *freeze ? (unsigned)strtoul(freeze, NULL, 10) : 10;
-        runtime_freeze_start((uintptr_t)image, round_page(size) + stub_area, gpu_enabled ? seconds : 0);
+        runtime_freeze_start((uintptr_t)image, round_page(size) + stub_area + red_zone_area, gpu_enabled ? seconds : 0);
     }
     printf("Entering original x86-64 code at guest offset 0x%" PRIx64 "\n", entry);
     entered_game=1;
@@ -1161,6 +1257,7 @@ int main(int argc, char **argv) {
     enum { MAIN_STACK=8*1024*1024 };
     unsigned char *stack=runtime_low_map(MAIN_STACK,PROT_READ|PROT_WRITE);
     if (!stack) fail("cannot allocate guest main stack");
+    clobber_thread_init();
     enter_on_stack(image+entry,&params,(void *)guest_exit,stack+MAIN_STACK-64);
 #endif
     fail("entry unexpectedly returned");

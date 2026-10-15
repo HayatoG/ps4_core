@@ -136,6 +136,28 @@ static void test_relocated_site(void) {
     assert(buffer == 0x44332211 && result == 0x11223344);
 }
 
+/* Red-zone protection on: a relocated instruction that can fault (mem_flags bit 1) runs between
+ * lea rsp,[rsp-0x80] and lea rsp,[rsp+0x80]; without the bit, or with protection off, it does not. */
+static void test_relocated_fault_steps_over_red_zone(void) {
+    static const uint8_t below[] = {0x48, 0x8d, 0x64, 0x24, 0x80, 0x89, 0xc8, 0x48, 0x8d, 0xa4, 0x24, 0x80, 0x00, 0x00, 0x00};
+    for (int protect = 0; protect < 2; protect++)
+        for (int flag = 0; flag < 2; flag++) {
+            reset_region();
+            IsaTable *t = snippet_table();
+            t->protect_red_zone = protect;
+            if (flag) t->sites[1].mem_flags |= ISA_MEM_RELOCATED_FAULTABLE;
+            isa_rewrite_apply(t, image, stubs, 0xffffffffu);
+            const unsigned char *stub = stubs + ISA_STUB_BYTES, *found = NULL;
+            for (int i = 0; i + (int)sizeof below <= ISA_STUB_BYTES && !found; i++)
+                if (memcmp(stub + i, below, sizeof below) == 0) found = stub + i;
+            assert((found != NULL) == (protect && flag));
+            uint32_t buffer = 0;
+            Snippet s2 = (Snippet)(void *)(image + S2);
+            assert(s2((uint64_t)(uintptr_t)&buffer, (uint64_t *)(uintptr_t)0x11223344) == 0x11223344);
+            assert(buffer == 0x44332211);
+        }
+}
+
 static void test_adjacent_sites(void) {
     reset_region();
     IsaTable *t = snippet_table();
@@ -437,6 +459,7 @@ int main(int argc, char **argv) {
     test_jmp_site();
     test_relocated_site();
     test_adjacent_sites();
+    test_relocated_fault_steps_over_red_zone();
     test_xmm_preserved();
     test_sets_filter();
     test_skipped_when_bytes_differ();

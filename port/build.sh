@@ -135,6 +135,9 @@ if [[ ${1:-} == --test ]]; then
     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -c src/isa_rewrite.c -I. -Isrc -o out/isa_rewrite.o
     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -mbmi -mlzcnt -I. -Isrc tests/test_isa_stub.c out/isa_rewrite.o out/isa_emulate.o -o out/isa-stub-test
     out/isa-stub-test tests/data/isa_fixture.bin
+    # Windows red-zone protection: patched fixture functions survive a Windows-like clobber below rsp.
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -I. -Isrc tests/test_red_zone.c out/isa_rewrite.o out/isa_emulate.o -o out/red-zone-test
+    out/red-zone-test tests/data/red_zone_image.bin tests/data/red_zone_table.bin
     # SSE4A (EXTRQ/INSERTQ): the CPU is the oracle on AMD; elsewhere recorded AMD results.
     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -msse4a -I. -Isrc tests/test_isa_sse4a.c out/isa_rewrite.o out/isa_emulate.o -o out/isa-sse4a-test
     out/isa-sse4a-test

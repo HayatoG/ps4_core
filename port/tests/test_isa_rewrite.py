@@ -150,8 +150,9 @@ class TableTests(unittest.TestCase):
         sites = isa_rewrite.scan_segment(BLSR_ECX + MOVBE_STORE + NOP + RET, 0x2000)
         image = bytes(0x2000) + BLSR_ECX + MOVBE_STORE + NOP + RET
         table = isa_rewrite.encode_table(image, sites)
-        magic, size, sha, count, unsupported = isa_rewrite.HEADER.unpack_from(table, 0)
-        self.assertEqual((magic, size, sha, count, unsupported), (b'G3ISA1\0\0', len(image), hashlib.sha256(image).digest(), 2, 0))
+        magic, size, sha, count, unsupported, red_zone_bytes = isa_rewrite.HEADER.unpack_from(table, 0)
+        self.assertEqual((magic, size, sha, count, unsupported, red_zone_bytes),
+                         (b'G3ISA1\0\0', len(image), hashlib.sha256(image).digest(), 2, 0, 0))
         self.assertEqual(len(table), 64 + 2 * 64)
         offset, length, kind, width, mode, dst, src1, src2, mem_slot, base, index, scale, flags, disp, original, rl, relocated = \
             isa_rewrite.RECORD.unpack_from(table, 64 + 64)
