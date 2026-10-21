@@ -11,6 +11,9 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 
+#include <atomic>
+#include <chrono>
+#include <thread>
 #include <miniz.h>
 
 #include <condition_variable>
@@ -84,7 +87,10 @@ void PruneOtherRevisions(const std::filesystem::path& cache_path) {
     std::error_code ec;
     for (const auto& entry : std::filesystem::directory_iterator(cache_path.parent_path(), ec)) {
         const auto other = entry.path().filename().string();
-        if (entry.is_directory(ec) && other != name &&
+        // tlg: <serial>-<key> and <serial>-<key>-dma (TLG_DIRECT_MEMORY_ACCESS) are the same
+        // revision: switching the option keeps both caches.
+        const std::string base = serial + "-" + TLG_SHADER_CACHE_KEY;
+        if (entry.is_directory(ec) && other != name && other.rfind(base, 0) != 0 &&
             (other == serial || other.rfind(serial + "-", 0) == 0)) {
             LOG_INFO(Render, "Removing shader cache of another recompiler revision: {}", other);
             std::filesystem::remove_all(entry.path(), ec);
@@ -100,8 +106,11 @@ namespace Storage {
 std::filesystem::path GameCacheDir() {
     const std::string serial{Common::ElfInfo::Instance().GameSerial()};
 #ifdef TLG_SHADER_CACHE_KEY
+    // tlg: direct memory access changes how shaders read constants, so its shaders live in a
+    // folder of their own (TLG_DIRECT_MEMORY_ACCESS=1: <serial>-<key>-dma).
     return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
-           (serial + "-" + TLG_SHADER_CACHE_KEY);
+           (serial + "-" + TLG_SHADER_CACHE_KEY +
+            (EmulatorSettings.IsDirectMemoryAccessEnabled() ? "-dma" : ""));
 #else
     return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / serial;
 #endif
@@ -217,33 +226,36 @@ void DataBase::Close() {
 template <typename T>
 bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector<T>&& v) {
     {
-        auto request = std::packaged_task<void()>{[=]() {
-            auto path{path_};
-            path.replace_extension(GetBlobFileExtension(type));
-            if (EmulatorSettings.IsPipelineCacheArchived()) {
-                ASSERT_MSG(!ar_is_read_only,
-                           "The archive is read-only. Did you forget to call `FinishPreload`?");
-                if (!mz_zip_writer_add_mem(&zip_ar, path.string().c_str(), v.data(),
-                                           v.size() * sizeof(T), MZ_BEST_COMPRESSION)) {
-                    LOG_ERROR(Render, "Failed to add {} to the archive", path.string().c_str());
-                }
-            } else {
-                // tlg: write beside and rename into place, so a game that ends during the
-                // write (the queue is not drained at exit) never leaves a truncated blob that
-                // the next start would load.
-                using namespace Common::FS;
-                auto temp{path};
-                temp += ".tmp";
-                {
-                    const auto file = IOFile{temp, FileAccessMode::Create};
-                    if (!file.IsOpen() || file.Write(v) != v.size()) {
-                        return;
+        // tlg: the blob and its path move into the job: capturing them by value copied the whole
+        // blob on the caller, once per pipeline the game builds (tens per second while it plays).
+        auto request = std::packaged_task<void()>{
+            [type, v = std::move(v), path_ = std::move(path_)]() mutable {
+                auto path{std::move(path_)};
+                path.replace_extension(GetBlobFileExtension(type));
+                if (EmulatorSettings.IsPipelineCacheArchived()) {
+                    ASSERT_MSG(!ar_is_read_only,
+                               "The archive is read-only. Did you forget to call `FinishPreload`?");
+                    if (!mz_zip_writer_add_mem(&zip_ar, path.string().c_str(), v.data(),
+                                               v.size() * sizeof(T), MZ_BEST_COMPRESSION)) {
+                        LOG_ERROR(Render, "Failed to add {} to the archive", path.string().c_str());
                     }
+                } else {
+                    // tlg: write beside and rename into place, so a game that ends during the
+                    // write (the queue is not drained at exit) never leaves a truncated blob that
+                    // the next start would load.
+                    using namespace Common::FS;
+                    auto temp{path};
+                    temp += ".tmp";
+                    {
+                        const auto file = IOFile{temp, FileAccessMode::Create};
+                        if (!file.IsOpen() || file.Write(v) != v.size()) {
+                            return;
+                        }
+                    }
+                    std::error_code error;
+                    std::filesystem::rename(temp, path, error);
                 }
-                std::error_code error;
-                std::filesystem::rename(temp, path, error);
-            }
-        }};
+            }};
         std::scoped_lock lock{m_request};
         req_queue.emplace(std::move(request));
     }
@@ -371,6 +383,35 @@ void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u
                 }
             }
         }
+    }
+}
+
+void DataBase::ForEachBlobName(BlobType type,
+                               const std::function<void(std::string_view name)>& func) {
+    const auto ext = "." + GetBlobFileExtension(type);
+    const auto visit = [&](std::string_view name) {
+        if (name.ends_with(ext)) {
+            func(name.substr(0, name.size() - ext.size()));
+        }
+    };
+    if (EmulatorSettings.IsPipelineCacheArchived()) {
+        const auto num_files = mz_zip_reader_get_num_files(&zip_ar);
+        for (int index = 0; index < num_files; ++index) {
+            std::array<char, MZ_ZIP_MAX_ARCHIVE_FILENAME_SIZE> file_name{};
+            mz_zip_reader_get_filename(&zip_ar, index, file_name.data(), file_name.size());
+            visit(file_name.data());
+        }
+        return;
+    }
+    std::error_code error;
+    for (const auto& entry : std::filesystem::directory_iterator{cache_path, error}) {
+        visit(entry.path().filename().string());
+    }
+}
+
+void DataBase::WaitIdle() {
+    while (opened && std::atomic_ref<u32>(num_requests).load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 }
 

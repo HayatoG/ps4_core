@@ -1,3 +1,4 @@
+#include "tlg_perf_trace.h"
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "tlg_overlay.h"
 
@@ -24,6 +25,8 @@
 extern TlgActorSlot tlg_actor_slots[2];
 extern "C" void runtime_restart(void); // src/probe.c: starts run.py again, ends this process
 #include "common/elf_info.h"
+#include "common/backports.h"
+#include "shader_recompiler/recompiler_toggles.h"
 #include "imgui.h"
 #include "imgui_internal.h" // RegisterUserTexture (save pictures)
 #include "imgui_impl_vulkan.h"
@@ -66,6 +69,8 @@ std::atomic<bool> menu_open{false};
 bool r3_down = false, l2_down = false;
 std::atomic<bool> loading{false};
 std::atomic<u32> loading_done{0}, loading_total{0};
+std::atomic<bool> loading_compile{false}; // first-run shader compilation (SetLoadingCompile)
+std::chrono::steady_clock::time_point loading_compile_started{};
 std::atomic<u32> background_done{0}, background_total{0};
 bool dirty = false; // settings changed while open: saved on close
 int requested_tab = -1; // switch on the next frame (L1/R1, Q/E, menu opened)
@@ -278,6 +283,17 @@ void MultiplierRow(const char* label, std::atomic<float>& value, const char* hel
     ImGui::PopID();
 }
 
+void FloatRow(const char* label, std::atomic<float>& value, float lo, float hi, const char* format, const char* help,
+              ImGuiSliderFlags flags = 0) {
+    Row(label);
+    float v = value;
+    if (ImGui::SliderFloat("##value", &v, lo, hi, format, ImGuiSliderFlags_AlwaysClamp | flags)) {
+        Store(value, std::clamp(v, lo, hi), true);
+    }
+    Help(help);
+    ImGui::PopID();
+}
+
 void InfoRow(const char* label, const char* text) {
     Row(label);
     ImGui::TextDisabled("%s", text);
@@ -288,16 +304,6 @@ void SliderRow(const char* label, std::atomic<int>& value, int lo, int hi, const
     Row(label);
     int v = value;
     if (ImGui::SliderInt("##value", &v, lo, hi, format, ImGuiSliderFlags_AlwaysClamp)) {
-        Store(value, std::clamp(v, lo, hi), true);
-    }
-    Help(help);
-    ImGui::PopID();
-}
-
-void FloatRow(const char* label, std::atomic<float>& value, float lo, float hi, const char* format, const char* help) {
-    Row(label);
-    float v = value;
-    if (ImGui::SliderFloat("##value", &v, lo, hi, format, ImGuiSliderFlags_AlwaysClamp)) {
         Store(value, std::clamp(v, lo, hi), true);
     }
     Help(help);
@@ -342,7 +348,7 @@ const char* UpscalerLabel(int upscaler) {
 // Portuguese when it starts with "pt", English otherwise.
 bool UiPortuguese() {
     static const bool pt = [] {
-        for (const char* name : {"TLG_UI_LANG", "LC_ALL", "LC_MESSAGES", "LANG"}) {
+        for (const char* name : {"TLG_UI_LANG", "LC_MESSAGES", "LANG"}) {
             if (const char* v = std::getenv(name); v && *v) return v[0] == 'p' && v[1] == 't';
         }
         return false;
@@ -432,6 +438,20 @@ void ImageTab() {
         ImGui::EndDisabled();
         ImGui::EndTable();
     }
+    ImGui::SeparatorText(TL("Texture detail", "Detalhe das texturas"));
+    if (BeginRows("##view")) {
+        FloatRow(TL("Texture LOD bias (MipLodBias)", "Bias de LOD das texturas (MipLodBias)"), s.mip_lod_bias, -3.0f, 3.0f,
+                 "%+.2f",
+                 TL("Negative: sharper textures at a distance (more shimmer, a little more GPU). Positive: blurrier.",
+                    "Negativo: texturas mais nítidas ao longe (mais cintilação, um pouco mais de GPU). Positivo: mais borradas."));
+        Row(TL("Restore the game's values", "Voltar aos valores do jogo"));
+        if (ImGui::SmallButton(TL("Restore", "Restaurar"))) {
+            s.mip_lod_bias = 0.0f;
+            dirty = true;
+        }
+        ImGui::PopID();
+        ImGui::EndTable();
+    }
     ImGui::SeparatorText(TL("Information", "Informações"));
     if (BeginRows("##image_info")) {
         char text[96];
@@ -445,7 +465,21 @@ void ImageTab() {
     }
 }
 
+void FixesSection();
+
 void PerformanceTab() {
+    if (TlgPerf::Enabled()) {
+        ImGui::SeparatorText(TL("Performance capture", "Captura de desempenho"));
+        static int category = 0;
+        const char* labels[] = {TL("Absorb smoke", "Absorver fumaça"), TL("Use power", "Usar poder"),
+                                TL("Movement", "Movimentação"), TL("Other", "Outro")};
+        ImGui::Combo(TL("Event", "Evento"), &category, labels, 4);
+        if (ImGui::Button(TL("Mark performance event", "Marcar evento de desempenho"))) {
+            const bool accepted = TlgPerf::Mark(static_cast<unsigned>(category + 1));
+            TlgOverlay::Notice(accepted ? TL("Event marked", "Evento marcado") :
+                                          TL("Capture queue full", "Fila de captura cheia"), 2.0f);
+        }
+    }
     namespace G = TlgGraphics;
     auto& s = TlgSettings::Get();
     // tlg: GoW3's render-resolution and engine-frame-rate patches and the readback shortcuts are not
@@ -470,6 +504,95 @@ void PerformanceTab() {
                   int(G::FramesQueued.size()), TL("More frames queued: steadier FPS, slower response to input.", "Mais quadros na fila: FPS mais estável, resposta mais lenta."));
         CheckRow(TL("Compile new shaders in the background", "Compilar shaders novos em segundo plano"), s.async_shaders,
                  TL("Fewer stutters in new areas; an object or effect may appear a moment later.", "Menos engasgos em áreas novas; um objeto ou efeito pode aparecer um instante depois."));
+        ImGui::EndTable();
+    }
+    FixesSection();
+}
+
+
+// tlg: the fixes (common/backports.h) and the A/B switches. Live ones change at once; the others
+// are only recorded in tlg.ini (bpNN=0/1, wqm=0/1, ...) and apply on the next start, when the
+// launcher turns the keys into TLG_BPnn / TLG_<NAME>. The table is iterated, so a reordered
+// backports.h still lists every entry.
+void FixesSection() {
+    namespace B = Common::Backports;
+    auto& s = TlgSettings::Get();
+    ImGui::SeparatorText(TL("Fixes", "Correções"));
+    ImGui::TextDisabled("%s", TL("Marked (next start) are saved now and apply the next time the game starts.",
+                                 "As marcadas (próxima partida) são gravadas agora e valem na próxima vez que o jogo abrir."));
+    const ImVec4 amber(0.85f, 0.72f, 0.45f, 1.0f);
+    if (ImGui::BeginTable("##fixes", 4, ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("name", ImGuiTableColumnFlags_WidthStretch, 0.50f);
+        ImGui::TableSetupColumn("on", ImGuiTableColumnFlags_WidthFixed);
+        ImGui::TableSetupColumn("hits", ImGuiTableColumnFlags_WidthStretch, 0.14f);
+        ImGui::TableSetupColumn("source", ImGuiTableColumnFlags_WidthStretch, 0.36f);
+        for (std::size_t i = 0; i < B::kEntries.size(); ++i) {
+            const B::Entry& e = B::kEntries[i];
+            const B::Id id = static_cast<B::Id>(i);
+            const bool live = B::IsLive(id);
+            const bool running = B::On(id);
+            const int pref = i < std::size_t(TlgSettings::kBackportPrefs) ? s.backport_pref[i].load() : -1;
+            bool shown = live || pref < 0 ? running : pref != 0;
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::AlignTextToFramePadding();
+            ImGui::Text("%s  %s", e.id, e.what);
+            ImGui::TableNextColumn();
+            ImGui::PushID(e.id);
+            if (ImGui::Checkbox("##on", &shown)) {
+                if (live) {
+                    B::SetLive(id, shown);
+                }
+                if (i < std::size_t(TlgSettings::kBackportPrefs)) {
+                    s.backport_pref[i] = shown ? 1 : 0;
+                    dirty = true;
+                }
+            }
+            Help(live ? TL("Applies at once.", "Vale na hora.")
+                      : TL("Applies on next start.", "Vale na próxima partida."));
+            ImGui::PopID();
+            if (!live) {
+                ImGui::SameLine();
+                const bool differs = shown != running;
+                ImGui::TextColored(differs ? amber : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled), "%s",
+                                   TL("(next start)", "(próxima partida)"));
+            }
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("%llu", static_cast<unsigned long long>(B::Hits(id)));
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("%s", e.source);
+        }
+        ImGui::EndTable();
+    }
+
+    // A/B switches read once at start (recompiler or device creation): next start only.
+    ImGui::SeparatorText(TL("A/B switches (next start)", "Chaves A/B (próxima partida)"));
+    struct Extra { const char* name; bool (*current)(); };
+    static const Extra extras[] = {
+        {"WQM", Shader::Toggles::WholeQuadMode},
+        {"LDS_SMALL", Shader::Toggles::SmallGroupLdsBarriers},
+        {"LDS_MULTI", Shader::Toggles::MultiWaveLdsBarriers},
+        {"LDS_READLANE", Shader::Toggles::LdsUniformReadLane},
+        {"LANE_DIVERGENCE", Shader::Toggles::LaneDivergence},
+        {"RFL_ALL", Shader::Toggles::ReadFirstLaneAll},
+        {"BLOCK1D", nullptr},
+        {"BC_TINY", nullptr},
+        {"NO_MSAA", nullptr},
+    };
+    static_assert(sizeof(extras) / sizeof(extras[0]) == TlgSettings::kExtraPrefs);
+    if (BeginRows("##extras")) {
+        static const char* const choices[] = {TL("Default", "Padrão"), TL("Off", "Desligado"), TL("On", "Ligado")};
+        static const int values[] = {-1, 0, 1};
+        for (int e = 0; e < TlgSettings::kExtraPrefs; ++e) {
+            char label[64];
+            std::snprintf(label, sizeof(label), "%s%s", extras[e].name,
+                          extras[e].current ? (extras[e].current() ? TL("  (running: on)", "  (rodando: ligado)")
+                                                                    : TL("  (running: off)", "  (rodando: desligado)"))
+                                            : "");
+            ChoiceRow(label, s.extra_pref[e], choices, values, 3,
+                      TL("Read once at start; saved in tlg.ini and applied on the next start.",
+                         "Lida uma vez ao iniciar; gravada no tlg.ini e aplicada na próxima partida."));
+        }
         ImGui::EndTable();
     }
 }
@@ -902,7 +1025,7 @@ std::string SaveWhen(s64 mtime) {
         std::snprintf(out, sizeof(out), "%02d/%02d/%04d · %02d:%02d", tm.tm_mday, tm.tm_mon + 1,
                       tm.tm_year + 1900, tm.tm_hour, tm.tm_min);
     } else {
-        static const char* months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        static const char* months[] = {"Jan", "Mar", "Apr", "May", "Jun",
                                        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
         const int hour = tm.tm_hour % 12 ? tm.tm_hour % 12 : 12;
         std::snprintf(out, sizeof(out), "%s %d, %d · %d:%02d %s", months[tm.tm_mon % 12], tm.tm_mday,
@@ -1253,8 +1376,11 @@ void LoadingScreen() {
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
                      ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing);
     const u32 done = loading_done, total = loading_total;
+    const bool compile = loading_compile;
     ImGui::SetWindowFontScale(1.6f);
-    ImGui::TextUnformatted(total ? "Loading shader cache..." : "Preparing graphics...");
+    ImGui::TextUnformatted(compile ? TL("Compiling shaders...", "Compilando shaders...")
+                           : total ? TL("Loading shader cache...", "Carregando o cache de shaders...")
+                                   : TL("Preparing graphics...", "Preparando os gráficos..."));
     ImGui::SetWindowFontScale(1.0f);
     if (total) {
         char count[64];
@@ -1262,7 +1388,21 @@ void LoadingScreen() {
                       u32(u64(done) * 100 / total));
         ImGui::ProgressBar(float(done) / float(total), ImVec2(-1.0f, 0.0f), count);
     }
-    ImGui::TextDisabled("The first start after an update takes longer.");
+    if (compile && total && done > 0 && done < total) {
+        const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                             loading_compile_started)
+                                   .count();
+        const u32 left = u32(elapsed * double(total - done) / double(done)) + 1;
+        ImGui::Text(TL("About %u:%02u left", "Faltam cerca de %u:%02u"), left / 60, left % 60);
+    }
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::TextDisabled("%s", compile ? TL("Only on the first start on this computer and after updates: "
+                                           "then the game runs without compiling shaders.",
+                                           "Só na primeira abertura neste computador e depois de "
+                                           "atualizações: depois o jogo roda sem compilar shaders.")
+                                      : TL("The first start after an update takes longer.",
+                                           "A primeira abertura depois de uma atualização demora mais."));
+    ImGui::PopTextWrapPos();
     ImGui::End();
 }
 
@@ -1304,6 +1444,38 @@ void NoticeBox() {
                      ImGuiWindowFlags_NoFocusOnAppearing);
     ImGui::SetWindowFontScale(1.3f);
     ImGui::TextUnformatted(notice_text.c_str());
+    ImGui::End();
+}
+
+// The mouse's touchpad (touchpad mode): the pad as the game sees it and the finger on it.
+std::atomic<bool> mouse_pad_on{false}, mouse_pad_touch{false}, mouse_pad_click{false};
+std::atomic<float> mouse_pad_x{0.5f}, mouse_pad_y{0.5f};
+
+void MousePadBox() {
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const float w = 240.0f * base_scale, h = w * 942.0f / 1919.0f;
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + 24.0f * base_scale,
+                                   viewport->WorkPos.y + viewport->WorkSize.y - 24.0f * base_scale),
+                            ImGuiCond_Always, ImVec2(0.0f, 1.0f));
+    ImGui::SetNextWindowBgAlpha(0.45f);
+    ImGui::SetNextWindowSize(ImVec2(w + 16.0f * base_scale, h + 16.0f * base_scale));
+    ImGui::Begin("##mousepad", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                     ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoSavedSettings);
+    const ImVec2 origin = ImVec2(ImGui::GetWindowPos().x + 8.0f * base_scale, ImGui::GetWindowPos().y + 8.0f * base_scale);
+    ImDrawList* list = ImGui::GetWindowDrawList();
+    const bool click = mouse_pad_click, touch = mouse_pad_touch;
+    list->AddRectFilled(origin, ImVec2(origin.x + w, origin.y + h), IM_COL32(20, 20, 20, 160), 6.0f * base_scale);
+    list->AddRect(origin, ImVec2(origin.x + w, origin.y + h), click ? IM_COL32(255, 200, 60, 255) : IM_COL32(220, 220, 220, 200),
+                  6.0f * base_scale, 0, 2.0f * base_scale);
+    const ImVec2 finger(origin.x + std::clamp(mouse_pad_x.load(), 0.0f, 1.0f) * w,
+                        origin.y + std::clamp(mouse_pad_y.load(), 0.0f, 1.0f) * h);
+    const float r = 7.0f * base_scale;
+    if (touch) {
+        list->AddCircleFilled(finger, r, click ? IM_COL32(255, 200, 60, 255) : IM_COL32(80, 200, 255, 255));
+    } else {
+        list->AddCircle(finger, r, IM_COL32(255, 255, 255, 220), 0, 2.0f * base_scale);
+    }
     ImGui::End();
 }
 
@@ -1664,6 +1836,13 @@ void SetBackgroundLoading(u32 done, u32 total) {
     background_total = total;
 }
 
+void SetLoadingCompile(bool compile) {
+    if (compile && !loading_compile) {
+        loading_compile_started = std::chrono::steady_clock::now();
+    }
+    loading_compile = compile;
+}
+
 void SetLoading(bool active, u32 done, u32 total) {
     loading_done = done;
     loading_total = total;
@@ -1681,12 +1860,20 @@ static bool NoticeActive() {
     return std::chrono::steady_clock::now() < notice_until;
 }
 
+void SetMousePad(bool active, float x, float y, bool touching, bool clicking) {
+    mouse_pad_x = x;
+    mouse_pad_y = y;
+    mouse_pad_touch = touching;
+    mouse_pad_click = clicking;
+    mouse_pad_on = active;
+}
+
 bool Visible() {
     const auto& s = TlgSettings::Get();
     const auto now = std::chrono::steady_clock::now();
     return initialized && (loading || background_total || menu_open || text_entry_active || choice_active ||
                            message_active || progress_on || now < progress_until || now < toast_until ||
-                           NoticeActive() ||
+                           NoticeActive() || mouse_pad_on ||
                            choice_retiring || s.show_fps ||
                            (s.actor_watch_supported && s.enemy_health_bar));
 }
@@ -1849,6 +2036,9 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     }
     if (NoticeActive() && !menu_open) {
         NoticeBox();
+    }
+    if (mouse_pad_on && !menu_open) {
+        MousePadBox();
     }
     ImGui::Render();
 

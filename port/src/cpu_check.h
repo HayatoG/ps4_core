@@ -16,8 +16,8 @@ int cpu_missing_fatal(CpuFeatureWords words, char *out, size_t size);
 /* Rewritable sets the host lacks (MOVBE, F16C, BMI1, LZCNT, SSE4A): CPU_SET_* mask; names in out. */
 unsigned cpu_missing_rewritable(CpuFeatureWords words, char *out, size_t size);
 
-/* CPU_SET_* of a TLG_ISA_REWRITE value: "1" = every emulated set (MOVBE, BMI1, LZCNT, SSE4A),
- * otherwise a comma separated list of names ("sse4a", "movbe,bmi1", case-insensitive); 0 for "0",
+/* CPU_SET_* of a TLG_ISA_REWRITE value: "1" = every emulated set (MOVBE, BMI1, LZCNT, F16C, SSE4A),
+ * otherwise a comma separated list of names ("sse4a", "f16c", "movbe,bmi1", case-insensitive); 0 for "0",
  * empty, or a list with an unknown name (*valid = 0 then). */
 unsigned cpu_sets_named(const char *list, int *valid);
 

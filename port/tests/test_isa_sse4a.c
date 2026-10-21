@@ -225,6 +225,7 @@ __asm__(".text\n"
         "mov %r14, 112(%rsi)\n mov %r15, 120(%rsi)\n"
         "mov 16(%rsp), %rax\n mov %rax, 48(%rsi)\n"
         "pop %rax\n mov %rax, 128(%rsi)\n"
+        "cld\n"  /* guest DF is captured above; the C caller requires DF clear */
         RS_IRP16 "vmovdqu %ymm\\i, 144+32*\\i(%rsi)\n .endr\n"
         RS_IRP16 "mov -16-8*\\i(%rsp), %rax\n mov %rax, 656+8*\\i(%rsi)\n .endr\n"
         "vzeroupper\n"
@@ -450,6 +451,11 @@ int main(void) {
     pristine = region + 2 * PAGE;
     jit = region + 3 * PAGE;
     __builtin_cpu_init();
+    /* run_state saves and compares YMM registers: a host without AVX cannot run the game either. */
+    if (!__builtin_cpu_supports("avx")) {
+        puts("isa-sse4a-test SKIP (host without AVX)");
+        return 0;
+    }
     native = __builtin_cpu_supports("sse4a");
 #ifndef __SSE4A__
     native = 0;

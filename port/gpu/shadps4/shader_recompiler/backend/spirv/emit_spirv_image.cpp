@@ -186,6 +186,19 @@ Id EmitImageQueryDimensions(EmitContext& ctx, IR::Inst* inst, u32 handle, Id lod
         return uses_lod ? ctx.OpImageQuerySizeLod(type, image, lod)
                         : ctx.OpImageQuerySize(type, image);
     }};
+    // tlg: BP09 or the BC 1D promotion (TLG_BLOCK1D): a 1D image declared as 2D (height 1) answers
+    // as the 1D image it is for the guest: (width, 0, 0, mips), and for an array
+    // (width, layers, 0, mips).
+    if (sharp.IsBlock1D()) {
+        if (texture.view_type == AmdGpu::ImageType::Color2DArray) {
+            const Id size = query(ctx.U32[3]);
+            const Id width = ctx.OpCompositeExtract(ctx.U32[1], size, 0U);
+            const Id layers = ctx.OpCompositeExtract(ctx.U32[1], size, 2U);
+            return ctx.OpCompositeConstruct(ctx.U32[4], width, layers, zero, mips());
+        }
+        const Id width = ctx.OpCompositeExtract(ctx.U32[1], query(ctx.U32[2]), 0U);
+        return ctx.OpCompositeConstruct(ctx.U32[4], width, zero, zero, mips());
+    }
     switch (texture.view_type) {
     case AmdGpu::ImageType::Color1D:
         return ctx.OpCompositeConstruct(ctx.U32[4], query(ctx.U32[1]), zero, zero, mips());

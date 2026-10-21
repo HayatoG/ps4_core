@@ -52,8 +52,9 @@ u32 DefaultWorkerCount() {
         return static_cast<u32>(std::clamp(std::atoi(env), 0, 16));
     }
     // Workers are SCHED_IDLE and claim whole buffers, so more of them only use more idle
-    // cores: half the hardware threads (Steam Deck 4, 16-thread desktop 8).
-    return std::clamp<u32>(TlgThreads::Available() / 2, 1, 8);
+    // cores: half the cores (Steam Deck 4, 16-thread desktop 8), physical cores with
+    // TLG_PHYS_CORES=1.
+    return std::clamp<u32>(TlgThreads::SizingCount() / 2, 1, 8);
 }
 
 /// Flattened user data of one submission: chunks never move, so the GPU thread can read a

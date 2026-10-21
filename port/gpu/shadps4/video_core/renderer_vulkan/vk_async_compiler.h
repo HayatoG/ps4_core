@@ -20,8 +20,14 @@ namespace Vulkan {
 // tlg: bounded compiler queue. Stop drains accepted work before Vulkan resources are released.
 class AsyncCompiler {
 public:
+    struct TraceHooks {
+        std::function<uint64_t(bool,size_t)> enqueued;
+        std::function<uint64_t(uint64_t)> begin;
+        std::function<void(uint64_t,uint64_t)> end;
+    };
     explicit AsyncCompiler(unsigned count, size_t capacity = 64,
-                           std::function<void(unsigned)> initialize = {}) : capacity{capacity} {
+                           std::function<void(unsigned)> initialize = {}, TraceHooks trace_hooks = {})
+        : capacity{capacity}, trace{std::move(trace_hooks)} {
         for (unsigned i = 0; i < count; ++i) {
             workers.emplace_back([this, i, initialize] {
                 worker_index = i;
@@ -30,6 +36,7 @@ public:
                 }
                 for (;;) {
                     std::function<void()> task;
+                    uint64_t operation = 0;
                     {
                         std::unique_lock lock{mutex};
                         cv.wait(lock, [&] { return stopping || !tasks.empty() || !urgent.empty(); });
@@ -41,9 +48,13 @@ public:
                         queue.pop_front();
                         queue_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now() - next.enqueued).count();
+                        operation = next.operation;
                         task = std::move(next.function);
                     }
+                    uint64_t parent = 0;
+                    if (operation && trace.begin) { try { parent = trace.begin(operation); } catch (...) {} }
                     task();
+                    if (operation && trace.end) { try { trace.end(operation,parent); } catch (...) {} }
                 }
             });
         }
@@ -56,7 +67,9 @@ public:
             if (stopping || tasks.size() + urgent.size() >= capacity) {
                 return false;
             }
-            (priority ? urgent : tasks).push_back({std::move(task), std::chrono::steady_clock::now()});
+            uint64_t operation = 0;
+            if (trace.enqueued) { try { operation = trace.enqueued(priority,tasks.size()+urgent.size()); } catch (...) {} }
+            (priority ? urgent : tasks).push_back({std::move(task), std::chrono::steady_clock::now(),operation});
         }
         cv.notify_one();
         return true;
@@ -91,11 +104,13 @@ private:
     struct Task {
         std::function<void()> function;
         std::chrono::steady_clock::time_point enqueued;
+        uint64_t operation = 0;
     };
     std::deque<Task> tasks, urgent;
     static inline thread_local unsigned worker_index = 0;
     std::atomic<uint64_t> queue_wait_ns{};
     bool stopping = false;
+    TraceHooks trace;
     std::vector<std::thread> workers;
 };
 
@@ -124,6 +139,11 @@ public:
         if (future.valid()) {
             future.wait();
         }
+    }
+    /// True when the job has finished (or there is none) within `timeout`.
+    template <typename Rep, typename Period>
+    bool WaitFor(std::chrono::duration<Rep, Period> timeout) const {
+        return !future.valid() || future.wait_for(timeout) == std::future_status::ready;
     }
     std::optional<T> Poll() {
         if (!future.valid() || future.wait_for(std::chrono::seconds{0}) != std::future_status::ready) {

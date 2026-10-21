@@ -16,6 +16,7 @@ std::optional<Extent3D> GetAliasCopyExtent(const ImageInfo& src, const ImageInfo
         src.guest_address == dst.guest_address && src.num_bits == dst.num_bits &&
         src.num_samples == dst.num_samples && !src.props.is_depth && !dst.props.is_depth &&
         src.props.is_block == dst.props.is_block && src.props.is_pow2 == dst.props.is_pow2 &&
+        src.props.is_bc_decoded == dst.props.is_bc_decoded &&
         src.type == dst.type && src.pitch == dst.pitch && src.tile_mode == dst.tile_mode &&
         src.array_mode == dst.array_mode && src.bank_swizzle == dst.bank_swizzle &&
         src.alt_tile == dst.alt_tile;

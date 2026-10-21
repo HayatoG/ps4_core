@@ -22,8 +22,9 @@ from struct import unpack_from
 import sys
 
 SERIAL = re.compile(r'^[A-Z]{4}[0-9]{5}$')
-# The port's keyed folder name: <serial>-<first 12 hex digits of TLG_SHADER_CACHE_KEY>.
-KEYED = re.compile(r'^([A-Z]{4}[0-9]{5})-[0-9a-f]{12}$')
+# The port's keyed folder name: <serial>-<first 12 hex digits of TLG_SHADER_CACHE_KEY>, with -dma
+# when direct memory access is on (TLG_DIRECT_MEMORY_ACCESS).
+KEYED = re.compile(r'^([A-Z]{4}[0-9]{5})-[0-9a-f]{12}(-dma)?$')
 
 
 def title_id(game_dir):
@@ -75,20 +76,29 @@ def entries(serials, gpu_user_dir, env=None):
 
 
 def size_of(path):
-    """Bytes in a file or a directory tree (symbolic links are not followed)."""
+    """Bytes in a file or a directory tree (symbolic links are not followed). os.scandir: on Windows
+    the sizes come with the directory listing, while a stat per file opens each one (tens of thousands
+    of cache files, each scanned by the antivirus, took long enough to freeze the launcher)."""
     path = Path(path)
     try:
         if path.is_symlink() or not path.is_dir():
             return 0 if path.is_symlink() else path.stat().st_size
     except OSError:
         return 0
-    total = 0
-    for folder, _, files in os.walk(path):
-        for name in files:
-            try:
-                total += os.lstat(os.path.join(folder, name)).st_size
-            except OSError:
-                pass
+    total, folders = 0, [str(path)]
+    while folders:
+        try:
+            with os.scandir(folders.pop()) as listing:
+                for entry in listing:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            folders.append(entry.path)
+                        elif not entry.is_symlink():
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        pass
+        except OSError:
+            pass
     return total
 
 

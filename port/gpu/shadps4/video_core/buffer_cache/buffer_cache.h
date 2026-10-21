@@ -50,7 +50,7 @@ class BufferCache {
     // tlg: arena pages are 4 GiB unless the driver's buffer size limit is lower (AMD's
     // Windows driver: 2 GiB); an arena spans up to two pages, so they shrink to half the limit.
     static constexpr u64 MAX_ARENA_PAGE_BITS = 32;
-    static constexpr u64 MIN_ARENA_PAGE_BITS = 30;
+    static constexpr u64 MIN_ARENA_PAGE_BITS = 29;
     static constexpr u64 MAX_ARENA_PAGES = u64{1} << (ADDRESS_SPACE_BITS - MIN_ARENA_PAGE_BITS);
     static constexpr u64 MIN_BLOCK_SIZE = 16_KB;
 
@@ -223,7 +223,8 @@ private:
     /// applied marks it stale (before the memory is marked GPU modified again, see
     /// MemoryTracker::ApplyGpuCopyIf), and so does a CPU write without a fault (CpuWriteMerge):
     /// then the guest falls back to the old download. From shadPS4-Infamous-FixBuild ee423726
-    /// and 2d2511fe.
+    /// and 2d2511fe. With TLG_READBACK_LOCAL_JOIN=1 a faulting guest thread that finds a copy
+    /// covering its window applies it itself (see PendingDeferredReadback).
     struct DeferredReadback {
         Vulkan::StagingBufferRef staging;
         /// Source offsets into the arena, destination offsets into the staging buffer.
@@ -243,6 +244,12 @@ private:
         }
     };
     static bool DeferredReadbackEnabled();
+    /// tlg: TLG_READBACK_LOCAL_JOIN=1: a faulting guest thread applies a pending copy that
+    /// covers its window itself instead of asking the GPU command thread for one.
+    static bool LocalReadbackJoin();
+    /// tlg: waits for a readback copy tick with the readback wait counters (TLG_READBACK_STATS)
+    /// and the scheduler's submit-if-needed fallback; the scheduler's tick_wait_ns misses these.
+    void WaitReadbackTick(u64 tick);
     /// The arena and the window around a range that is read back with it.
     std::tuple<const Buffer*, VAddr, VAddr> GetReadbackWindow(VAddr device_addr, u64 size);
     /// Takes the GPU modified ranges of a range out of gpu_modified_ranges, adding copies of
@@ -251,6 +258,9 @@ private:
                          boost::container::small_vector<vk::BufferCopy, 8>& copies);
     /// Records and submits a copy back, or joins one in flight covering it. GPU-side threads.
     std::shared_ptr<DeferredReadback> StartDeferredReadback(VAddr device_addr, u64 size);
+    /// tlg: a copy in flight that is not stale and covers the readback window of the range, or
+    /// nothing. Any thread; the caller applies it with FinishDeferredReadback.
+    std::shared_ptr<DeferredReadback> PendingDeferredReadback(VAddr device_addr, u64 size);
     /// Waits for the copy (if `wait`) and applies it. False when it is stale. Any thread.
     bool FinishDeferredReadback(DeferredReadback& readback, bool wait);
     /// Puts the ranges of a copy that won't be applied back into gpu_modified_ranges.
@@ -308,6 +318,8 @@ private:
 
     std::array<const Buffer*, MAX_ARENA_PAGES> address_space{};
     u64 arena_page_bits{MAX_ARENA_PAGE_BITS};
+    /// tlg: pages one arena may join (the driver's buffer size limit / the page size, >= 2).
+    u64 max_arena_pages{2};
     u64 arena_page_size{u64{1} << MAX_ARENA_PAGE_BITS};
     u64 num_arena_pages{u64{1} << (ADDRESS_SPACE_BITS - MAX_ARENA_PAGE_BITS)};
     std::deque<Buffer> arenas;

@@ -1,7 +1,8 @@
 /* Guest threads on host pthreads. Each guest thread owns a FreeBSD-style TCB
  * (variant II: static TLS below the TCB). The loader rewrites the eboot's
  * `mov rax, fs:[0]` into `mov rax, gs:[0]`, so GS base = guest TCB while glibc
- * keeps FS. Priorities/affinity are recorded, not enforced by a PS4 scheduler.
+ * keeps FS. Priorities/affinity are recorded, not enforced by a PS4 scheduler; TLG_THREAD_PRIO=1
+ * additionally carries the priority over to the host scheduler (see apply_prio).
  * Windows: GS is the TEB and cannot be moved. The guest TCB lives in a TLS slot of the TEB
  * instead, and the loader rewrites the load to `mov rax, gs:[0x1480+8*slot]` (TlsSlots),
  * the same 9-byte instruction with another displacement. */
@@ -21,6 +22,7 @@
 #else
 #include <sys/syscall.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <asm/prctl.h>
 #endif
 #define ERR(n) ((int32_t)(UINT32_C(0x80020000)|(n)))
@@ -48,6 +50,7 @@ typedef struct GuestThread {
     char name[32];
     int detached, finished, joined, host_owned;
     uint64_t os_tid;  /* freeze report: matches the OS thread list */
+    uint32_t fp_mxcsr; uint16_t fp_x87cw; /* the creator's FP control: see host_start */
     RuntimeWait wait; /* freeze report: what the thread is blocked on */
 #ifdef _WIN32
     tlg_jmp_buf exit_jump; /* no SEH unwinding through guest frames */
@@ -65,6 +68,8 @@ static _Thread_local int32_t guest_errno;
 static const unsigned char *tls_template;
 static uint64_t tls_filesz, tls_memsz, tls_align=16;
 static size_t created, joined_count, exited;
+static int wait_stats(void);        /* TLG_WAIT_STATS: per-thread wait accounting, further down */
+static void wait_stats_start(void); /* its monitor thread, started with the main thread */
 
 void runtime_set_main_tls(const void *data,uint64_t filesz,uint64_t memsz,uint64_t align) {
     tls_template=data; tls_filesz=filesz; tls_memsz=memsz; tls_align=align ? align : 16;
@@ -96,6 +101,44 @@ static uint64_t os_thread_id(void) {
     return GetCurrentThreadId();
 #else
     return (uint64_t)gettid();
+#endif
+}
+/* ---- Guest priority (TLG_THREAD_PRIO=1) ----
+ * PS4 priorities run 0x100 (highest) .. 0x2FF (lowest) with 0x2BC (700, the game's default) the
+ * normal value (OpenOrbis UserService). Only a value above it lowers the host priority: nice
+ * 0..19 (Linux) / BELOW_NORMAL..LOWEST (Windows), one step per 4 guest points. Raising the host
+ * priority needs privileges and a wrong guess could starve the frame path, so it is never done;
+ * a host that refuses the change keeps the recorded value. Off by default: the value is recorded
+ * only, as it is on PS4. */
+#define GUEST_PRIO_NORMAL 700
+static int thread_prio_enabled(void) {
+    static int value=-1;
+    if (value<0) { const char *e=getenv("TLG_THREAD_PRIO"); value=e && e[0]=='1'; }
+    return value;
+}
+static int host_nice(int prio) {
+    if (prio<=GUEST_PRIO_NORMAL) return 0;
+    int nice=(prio-GUEST_PRIO_NORMAL+3)/4;
+    return nice>19 ? 19 : nice;
+}
+/* Applied on the thread itself at start (the creator does not know the host thread id yet) and on
+ * the target thread for scePthreadSetprio. */
+static void apply_prio(uint64_t os_tid,int prio) {
+    if (!thread_prio_enabled() || !os_tid) return;
+    int nice=host_nice(prio);
+    if (!nice) return; /* the normal band and above: leave the host priority alone */
+#ifdef _WIN32
+    int level=nice<=5 ? THREAD_PRIORITY_BELOW_NORMAL : THREAD_PRIORITY_LOWEST;
+    HANDLE thread=os_tid==os_thread_id() ? GetCurrentThread()
+                                         : OpenThread(THREAD_SET_INFORMATION,FALSE,(DWORD)os_tid);
+    if (!thread) return;
+    if (!SetThreadPriority(thread,level) && runtime_verbose())
+        fprintf(stderr,"Verbose: SetThreadPriority(%llu, %d) failed (%lu)\n",
+                (unsigned long long)os_tid,level,GetLastError());
+    if (thread!=GetCurrentThread()) CloseHandle(thread);
+#else
+    if (setpriority(PRIO_PROCESS,(id_t)os_tid,nice) && runtime_verbose())
+        fprintf(stderr,"Verbose: setpriority(%llu, %d) failed (%d)\n",(unsigned long long)os_tid,nice,errno);
 #endif
 }
 /* Build TCB/static TLS for the calling host thread and point GS at it. */
@@ -145,6 +188,7 @@ void runtime_thread_attach_host(const char *name) {
 void runtime_thread_attach_main(void) {
     GuestThread *t=runtime_thread_current();
     snprintf(t->name,sizeof(t->name),"main");
+    if (wait_stats()) wait_stats_start();
 }
 static GuestThread *find_thread(void *handle) {
     GuestThread *found=NULL;
@@ -168,11 +212,28 @@ void *runtime_thread_self(void) { return current; }
 /* ---- Wait slots (freeze report) ----
  * Guest threads keep theirs in the thread record; host threads (GPU library, decoders) that
  * block in a marked wait get one of a fixed set on first use, matched by OS thread id (a
- * thread that reuses the id of a finished one takes its slot over). */
+ * thread that reuses the id of a finished one takes its slot over). When the set runs out, the
+ * first slot whose owner has exited is handed over instead of leaving the thread unrecorded
+ * (long sessions create and destroy host threads): the new owner starts with empty
+ * TLG_WAIT_STATS accounting. */
 #define HOST_WAIT_SLOTS 64
 static struct { uint64_t os_tid; RuntimeWait wait; } host_waits[HOST_WAIT_SLOTS];
 static unsigned host_wait_count;
 static _Thread_local RuntimeWait *host_wait;
+#define HOST_WAIT_CLAIMING UINT64_MAX /* os_tid of a slot being handed over */
+/* 0 for a thread that never existed and for one that exited; a tid reused by a live thread only
+ * makes the check pessimistic (that slot is left alone). */
+static int thread_alive(uint64_t tid) {
+#ifdef _WIN32
+    HANDLE thread=OpenThread(SYNCHRONIZE,FALSE,(DWORD)tid);
+    if (!thread) return 0;
+    int alive=WaitForSingleObject(thread,0)==WAIT_TIMEOUT;
+    CloseHandle(thread);
+    return alive;
+#else
+    return syscall(SYS_tgkill,(pid_t)getpid(),(pid_t)tid,0)==0 || errno!=ESRCH;
+#endif
+}
 uint64_t runtime_wait_now_ms(void) {
 #ifdef _WIN32
     return GetTickCount64();
@@ -181,6 +242,19 @@ uint64_t runtime_wait_now_ms(void) {
     clock_gettime(CLOCK_MONOTONIC_COARSE,&t);
     return (uint64_t)t.tv_sec*1000+(uint64_t)t.tv_nsec/1000000;
 #endif
+}
+/* TLG_WAIT_STATS=1: per-thread wait accounting (runtime_wait_slot_begin/end) and a summary of it
+ * every 5 s from a monitor thread started with the main thread. Off by default: marking a wait
+ * costs one store then, no clock read. */
+static int wait_stats(void) {
+    static int value=-1;
+    if (value<0) { const char *e=getenv("TLG_WAIT_STATS"); value=e && e[0]=='1'; }
+    return value;
+}
+static uint64_t wait_now_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC,&t);
+    return (uint64_t)t.tv_sec*1000000000+(uint64_t)t.tv_nsec;
 }
 RuntimeWait *runtime_wait_slot(void) {
     if (current) return &current->wait;
@@ -192,7 +266,30 @@ RuntimeWait *runtime_wait_slot(void) {
         if (__atomic_load_n(&host_waits[i].os_tid,__ATOMIC_ACQUIRE)==tid) host_wait=&host_waits[i].wait;
     if (!host_wait) {
         unsigned i=__atomic_fetch_add(&host_wait_count,1,__ATOMIC_ACQ_REL);
-        if (i>=HOST_WAIT_SLOTS) return NULL;
+        if (i>=HOST_WAIT_SLOTS) {
+            i=HOST_WAIT_SLOTS;
+            for (unsigned j=0;j<HOST_WAIT_SLOTS;++j) {
+                uint64_t owner=__atomic_load_n(&host_waits[j].os_tid,__ATOMIC_ACQUIRE);
+                /* 0: a first-use claim is about to store its tid; HOST_WAIT_CLAIMING: another
+                 * thread is taking this slot over. */
+                if (!owner || owner==HOST_WAIT_CLAIMING || thread_alive(owner)) continue;
+                /* Two threads may find the same dead owner: only the one that swaps it out
+                 * resets the slot. */
+                if (!__atomic_compare_exchange_n(&host_waits[j].os_tid,&owner,HOST_WAIT_CLAIMING,0,
+                                                 __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) continue;
+                /* The generation stays odd while the slot is cleared, so a report reading it
+                 * (runtime_wait_copy) retries instead of taking a torn copy. */
+                RuntimeWait *w=&host_waits[j].wait;
+                const uint32_t generation=__atomic_load_n(&w->generation,__ATOMIC_ACQUIRE)|1u;
+                __atomic_store_n(&w->generation,generation,__ATOMIC_RELEASE);
+                RuntimeWait empty={0};
+                empty.generation=generation;
+                memcpy(w,&empty,sizeof(empty));
+                __atomic_store_n(&w->generation,generation+1,__ATOMIC_RELEASE);
+                i=j; break;
+            }
+            if (i>=HOST_WAIT_SLOTS) return NULL; /* every slot is held by a live thread */
+        }
         __atomic_store_n(&host_waits[i].os_tid,tid,__ATOMIC_RELEASE);
         host_wait=&host_waits[i].wait;
     }
@@ -211,6 +308,8 @@ void runtime_wait_slot_begin(RuntimeWait *w,const char *kind,const void *object,
                              const void *const *owner,uintptr_t frame,uint64_t now_ms) {
     if (!w) return;
     unsigned depth=w->depth++;
+    /* The outermost wait is the time the thread is blocked (nested waits happen inside it). */
+    if (!depth && wait_stats()) { w->wait_start_ns=wait_now_ns(); ++w->wait_count; }
     if (depth>=RUNTIME_WAIT_LEVELS) return;
     RuntimeWaitLevel *l=&w->level[depth];
     __atomic_add_fetch(&w->generation,1,__ATOMIC_ACQ_REL); /* odd: being written */
@@ -222,6 +321,16 @@ void runtime_wait_slot_begin(RuntimeWait *w,const char *kind,const void *object,
 void runtime_wait_slot_end(RuntimeWait *w) {
     if (!w || !w->depth) return;
     unsigned depth=--w->depth;
+    if (!depth && w->wait_start_ns) { /* wait_start_ns is set only for a counted begin */
+        uint64_t spent=wait_now_ns()-w->wait_start_ns;
+        w->wait_start_ns=0;
+        w->wait_ns+=spent;
+        if (spent>w->wait_max_ns) {
+            w->wait_max_ns=spent; w->wait_max_end_ms=runtime_wait_now_ms();
+            w->wait_max_kind=w->level[0].kind;
+            copy_wait_name(w->wait_max_name,sizeof(w->wait_max_name),w->level[0].name);
+        }
+    }
     if (depth>=RUNTIME_WAIT_LEVELS) return;
     __atomic_add_fetch(&w->generation,1,__ATOMIC_ACQ_REL);
     __atomic_store_n(&w->level[depth].kind,NULL,__ATOMIC_RELEASE);
@@ -252,7 +361,8 @@ size_t runtime_thread_snapshot(RuntimeThreadInfo *out,size_t max) {
     }
     unsigned hosts=__atomic_load_n(&host_wait_count,__ATOMIC_ACQUIRE);
     for (unsigned i=0;i<hosts && i<HOST_WAIT_SLOTS && n<max;++i,++n) {
-        out[n]=(RuntimeThreadInfo){.os_tid=__atomic_load_n(&host_waits[i].os_tid,__ATOMIC_ACQUIRE)};
+        const uint64_t tid=__atomic_load_n(&host_waits[i].os_tid,__ATOMIC_ACQUIRE);
+        out[n]=(RuntimeThreadInfo){.os_tid=tid==HOST_WAIT_CLAIMING ? 0 : tid};
         runtime_wait_copy(&host_waits[i].wait,&out[n].wait);
     }
     pthread_mutex_unlock(&lock);
@@ -260,6 +370,58 @@ size_t runtime_thread_snapshot(RuntimeThreadInfo *out,size_t max) {
 }
 static ABI int32_t *guest_error(void) { return &guest_errno; }
 int32_t *runtime_errno(void) { return &guest_errno; }
+
+/* ---- Wait statistics monitor (TLG_WAIT_STATS=1) ----
+ * Every 5 s: one line per thread whose longest wait ended in the window, so a 30-150 ms stutter
+ * can be attributed to a thread and to the object it waited for. Threads that waited nothing new
+ * stay quiet, and the report is off unless the toggle is set. */
+#define WAIT_STATS_PERIOD_MS 5000
+#define WAIT_STATS_THREADS 256
+static void *wait_stats_monitor(void *argument) {
+    (void)argument;
+    static RuntimeThreadInfo infos[WAIT_STATS_THREADS];
+    for (;;) {
+#ifdef _WIN32
+        compat_sleep_ns((uint64_t)WAIT_STATS_PERIOD_MS*1000000);
+#else
+        struct timespec nap={WAIT_STATS_PERIOD_MS/1000,(long)(WAIT_STATS_PERIOD_MS%1000)*1000000};
+        while (nanosleep(&nap,&nap) && errno==EINTR) {}
+#endif
+        const uint64_t now=runtime_wait_now_ms();
+        const size_t count=runtime_thread_snapshot(infos,WAIT_STATS_THREADS);
+        int printed=0;
+        for (size_t i=0;i<count;++i) {
+            const RuntimeWait *w=&infos[i].wait;
+            if (!w->wait_count || w->wait_max_end_ms+WAIT_STATS_PERIOD_MS<now) continue;
+            if (!printed) {
+                printf("Runtime: wait stats (last %u s, TLG_WAIT_STATS)\n",WAIT_STATS_PERIOD_MS/1000);
+                printed=1;
+            }
+            printf("  %s (tid %llu): %u waits, %.1f ms blocked, longest %.1f ms in '%s'",
+                   infos[i].record ? infos[i].name : "host thread",(unsigned long long)infos[i].os_tid,
+                   w->wait_count,(double)w->wait_ns/1e6,(double)w->wait_max_ns/1e6,
+                   w->wait_max_kind ? w->wait_max_kind : "wait");
+            if (w->wait_max_name[0]) printf(" '%s'",w->wait_max_name);
+            printf(" (%llu ms ago)\n",(unsigned long long)(now>=w->wait_max_end_ms ? now-w->wait_max_end_ms : 0));
+        }
+        if (printed) fflush(stdout);
+    }
+    return NULL;
+}
+static void wait_stats_start(void) {
+    static int started;
+    if (__atomic_exchange_n(&started,1,__ATOMIC_ACQ_REL)) return;
+    pthread_t thread;
+    if (pthread_create(&thread,NULL,wait_stats_monitor,NULL)) {
+        fputs("Runtime: wait stats thread not started\n",stderr);
+        return;
+    }
+#ifndef _WIN32
+    pthread_setname_np(thread,"tlg:waitstats");
+#endif
+    pthread_detach(thread);
+    printf("Runtime: wait stats every %u ms (TLG_WAIT_STATS)\n",WAIT_STATS_PERIOD_MS);
+}
 
 static ABI int32_t attr_init(ThreadAttr **out) {
     if (!out) return ERR(22);
@@ -364,7 +526,14 @@ static void *host_start(void *p) {
     GuestThread *t=p;
     attach(t);
     if (thread_start_hook) thread_start_hook();
+    /* The creator's SSE (MXCSR) and x87 control words, as FreeBSD's libthr gives a new thread
+     * and as Linux happens to copy them on clone. Windows starts every thread at its defaults:
+     * inFAMOUS turns on flush-to-zero (MXCSR bit 15) in a thread, then creates its job workers
+     * from it; without the bit there, denormals reach divisions in the particle/light code
+     * (overexposed fire and smoke, flickering headlights, Windows only). */
+    __asm__ volatile("ldmxcsr %0\n\tfldcw %1" : : "m"(t->fp_mxcsr), "m"(t->fp_x87cw));
     set_host_name(t->name);
+    apply_prio(t->os_tid,t->attr.prio); /* the priority is ours now; the creator had no host tid */
     if (!exit_setjmp(t)) t->result=t->entry(t->argument);
     runtime_thread_keys_cleanup();
     pthread_mutex_lock(&lock); t->finished=1; ++exited; pthread_mutex_unlock(&lock);
@@ -378,6 +547,7 @@ static int32_t create(GuestThread **out,ThreadAttr **attr_slot,GuestEntry entry,
     if (!t) return ERR(12);
     if (a) { t->attr=*a; t->attr.next=NULL; }
     t->entry=entry; t->argument=argument; t->detached=t->attr.detached;
+    __asm__ volatile("stmxcsr %0\n\tfnstcw %1" : "=m"(t->fp_mxcsr), "=m"(t->fp_x87cw));
     snprintf(t->name,sizeof(t->name),"%s",name ? name : "guest");
     pthread_attr_t host;
     pthread_attr_init(&host);
@@ -441,7 +611,9 @@ static ABI int32_t thread_get_prio(GuestThread *t,int *prio) {
 }
 static ABI int32_t thread_set_prio(GuestThread *t,int prio) {
     if (!find_thread(t)) return ERR(3);
-    t->attr.prio=prio; return 0;
+    t->attr.prio=prio;
+    apply_prio(t->os_tid,prio); /* 0 until the thread has started: it applies its own then */
+    return 0;
 }
 static ABI int32_t thread_set_affinity(GuestThread *t,uint64_t mask) {
     if (!find_thread(t)) return ERR(3);

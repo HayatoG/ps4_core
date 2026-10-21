@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "vulkan_test_driver.h"
 
 // Keep the dispatcher's ABI consistent with the renderer library.
 #undef NDEBUG
@@ -80,8 +81,13 @@ void TestFallbacks() {
     assert(!Vulkan::InitializePipelineBinaryCache(device, true, key));
     assert(key_queries == 3 && key.keySize == 0);
 
+    // Unset means off: the driver cache path crashed NVIDIA 595 (opt in with TLG_PIPELINE_BINARIES=1).
     SetCache("");
     key_size = VK_MAX_PIPELINE_BINARY_KEY_SIZE_KHR;
+    assert(!Vulkan::InitializePipelineBinaryCache(device, true, key));
+    assert(key_queries == 3 && key.keySize == 0);
+
+    SetCache("1");
     assert(Vulkan::InitializePipelineBinaryCache(device, true, key));
     assert(key_queries == 4 && key.keySize == key_size && key.key[0] == 7);
     dispatch = original;
@@ -91,13 +97,16 @@ void TestFallbacks() {
 int main(int argc, char**) {
     const bool enabled = argc > 1;
     SetCache(enabled ? "1" : "0");
-    Vulkan::Instance instance{s32{-1}, false};
-    if (!enabled && instance.GetPipelineBinaryGlobalKey().keySize != 0) {
-        std::fputs("FAIL: disabled binary cache initialized a global key\n", stderr);
-        return 1;
+    // The fallbacks use a fake device; only the real one needs a driver.
+    if (!SkipWithoutVulkanDriver()) {
+        Vulkan::Instance instance{s32{-1}, false};
+        if (!enabled && instance.GetPipelineBinaryGlobalKey().keySize != 0) {
+            std::fputs("FAIL: disabled binary cache initialized a global key\n", stderr);
+            return 1;
+        }
+        std::printf("Real device: binary cache %s, global key size %u\n",
+                    enabled ? "requested" : "disabled", instance.GetPipelineBinaryGlobalKey().keySize);
     }
-    std::printf("Real device: binary cache %s, global key size %u\n",
-                enabled ? "requested" : "disabled", instance.GetPipelineBinaryGlobalKey().keySize);
     TestFallbacks();
     std::puts("pipeline-binary-initialization-test: passed");
 }

@@ -18,6 +18,8 @@ typedef struct {
 void tlggpu_register_kernel(void);
 /* Creates window, Vulkan device, presenter and GPU command processor. */
 int tlggpu_init(const TlgGpuConfig *config);
+/* The settings and game identity of tlggpu_init, without a window (shader precompiler). */
+void tlggpu_init_headless(const TlgGpuConfig *config);
 /* Function for an imported NID ("NID#lib#mod"), or 0 when the GPU library does not provide it. */
 uintptr_t tlggpu_resolve(const char *scoped_nid);
 /* Called first by the loader's SIGSEGV handler: 1 when a GPU page-tracking fault was handled. */
@@ -89,6 +91,12 @@ void tlggpu_set_wait_hooks(TlgGpuWaitBegin begin, TlgGpuWaitEnd end);
  * page-protection faults being handled now and handled so far. */
 typedef struct { uint64_t submitted, shown, presented, vblanks, faults_in_progress, faults_handled; } TlgGpuFrameCounters;
 void tlggpu_frame_counters(TlgGpuFrameCounters *out);
+/* The game opened a file (guest path): feeds the region trace (TLG_REGION_TRACE=1, gpu/shim/tlg_region.h). */
+void tlggpu_note_open(const char *guest_path);
+/* Touchpad mode of the mouse (runtime_pad.c): while active, a small touchpad with the virtual
+ * finger is drawn in the corner (x, y: 0..1 over the pad; touching: the game sees the finger;
+ * clicking: the pad is pressed). */
+void tlggpu_mouse_pad_hud(int active, float x, float y, int touching, int clicking);
 /* Number of symbols registered by the vendored libraries (diagnostics). */
 unsigned tlggpu_symbol_count(void);
 #ifdef __cplusplus

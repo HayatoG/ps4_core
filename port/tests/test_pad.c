@@ -7,6 +7,8 @@
 #endif
 
 static int capture;
+/* The GPU library (not linked here): the mouse and the input settings. */
+void tlggpu_mouse_pad_hud(int a, float x, float y, int t, int c) { (void)a; (void)x; (void)y; (void)t; (void)c; }
 int tlggpu_overlay_captures_input(void) { return capture; }
 void tlggpu_overlay_notice(const char *text, float seconds) { (void)text; (void)seconds; }
 /* The window's mouse (gpu/shim/window.cpp), driven by the test. */

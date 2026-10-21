@@ -9,6 +9,7 @@
 #include "../../src/cheat_hook.h"
 
 #include <atomic>
+#include <string>
 #include <cstdint>
 #include <string>
 
@@ -29,14 +30,24 @@ inline constexpr int OutputHeights[] = {720, 1080, 1440, 2160};
 inline constexpr int OutputCount = 4;
 inline constexpr int OutputDefault = 1; ///< 1920x1080, the game's own size
 
+inline constexpr int kBackportPrefs = 32;
+/// A/B switches read once at start (recompiler_toggles.h, device creation); tlg.ini keys.
+inline constexpr const char* kExtraKeys[] = {"wqm", "lds_small", "lds_multi", "lds_readlane",
+                                             "lane_divergence", "rfl_all", "block1d", "bc_tiny",
+                                             "no_msaa"};
+inline constexpr int kExtraPrefs = sizeof(kExtraKeys) / sizeof(kExtraKeys[0]);
+
 struct Values {
-    std::atomic<int> upscaler{UpscalerFsr3};
+    /// Off / no object motion, as the launcher's ISS_UPSCALER=off and ISS_OBJECT_MOTION=0 set
+    /// them: a direct run (run.sh, the probe) must not pay the native-AA FSR 3 render and the
+    /// ~10% object motion cost (jitter only matters while an upscaler runs).
+    std::atomic<int> upscaler{UpscalerOff};
     std::atomic<int> preset{NativeAA};
     std::atomic<bool> sharpen{true};
     std::atomic<float> sharpness{0.3f};
     std::atomic<bool> jitter{true};
     std::atomic<bool> reactive{false};
-    std::atomic<bool> object_motion{true};
+    std::atomic<bool> object_motion{false};
     std::atomic<float> reactive_scale{1.0f};
     std::atomic<float> reactive_threshold{0.2f};
     std::atomic<float> reactive_max{0.9f};
@@ -64,7 +75,10 @@ struct Values {
     std::atomic<int> display_mode{0};
     std::atomic<bool> vsync{true};
     std::atomic<int> fps_limit{0};
-    std::atomic<bool> async_shaders{true};
+    /// Off by default (2026-10-16): a draw whose pipeline was still compiling was skipped, and the
+    /// object vanished for a frame (grey flashes when the camera turns). Measured in the city with the
+    /// first-run cache: 0 skipped draws against 85, same FPS, better worst frame (67 ms against 117).
+    std::atomic<bool> async_shaders{false};
     std::atomic<bool> fsr1{false};
     std::atomic<bool> rcas{true};
     std::atomic<int> rcas_strength{75};
@@ -85,7 +99,7 @@ struct Values {
     std::atomic<int> render_resolution{0};
     std::atomic<int> engine_fps{120};
     std::atomic<bool> deferred_readback{true};
-    std::atomic<bool> stale_readback{true};
+    std::atomic<bool> stale_readback{false};
     /// Set before an "Apply and restart"; cleared once the new launch shows the game. run.py
     /// restores the previous startup options when a launch never cleared it.
     std::atomic<bool> restart_unconfirmed{false};
@@ -93,7 +107,7 @@ struct Values {
     /// The engine rate this launch really runs at (run.py's TLG_ENGINE_FPS): 60 when the frame
     /// rate patch does not apply to this game build.
     std::atomic<int> applied_engine_fps{120};
-    bool startup_deferred_readback = true, startup_stale_readback = true;
+    bool startup_deferred_readback = true, startup_stale_readback = false;
     // FSR 4 checks (menu): the provider's auto exposure, the jitter sign it is given.
     std::atomic<bool> fsr4_auto_exposure{true};
     std::atomic<bool> fsr4_invert_jitter{false};
@@ -115,6 +129,15 @@ struct Values {
     std::atomic<float> mouse_sensitivity{1.0f}, mouse_smoothing{0.5f}, mouse_accel{0.0f}, mouse_deadzone{0.1f};
     /// Keyboard and mouse button remap (TLG_KEY_MAP syntax); written by Load only, read once.
     std::string key_map;
+    /// Fix switches that apply on the next start (the launcher turns them into TLG_BPnn /
+    /// TLG_<NAME> variables): bp01..bp32 and the A/B keys of ExtraKeys(). -1 = not in tlg.ini
+    /// (the built-in default), 0 / 1 = chosen. Kept so Save() does not drop what the launcher wrote.
+    std::atomic<int> backport_pref[kBackportPrefs];
+    std::atomic<int> extra_pref[kExtraPrefs];
+    Values() {
+        for (auto& p : backport_pref) p = -1;
+        for (auto& p : extra_pref) p = -1;
+    }
 
     /// Startup settings for the explicit TLG_RENDER_RES compatibility patch only.
     int startup_preset = NativeAA;
@@ -122,6 +145,10 @@ struct Values {
     bool startup_object_motion = true;
     int startup_output_res = OutputDefault;
     int startup_live_resolution = 0;
+
+    /// Extra texture LOD bias of the game's draws (vk_rasterizer.cpp), any game.
+    std::atomic<float> mip_lod_bias{0.0f};
+
 };
 
 Values& Get();

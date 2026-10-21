@@ -1,3 +1,4 @@
+#include "tlg_perf_trace.h"
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -8,6 +9,7 @@
 #include "tlg_toggles.h"
 #include "tlg_freeze.h"
 #include "common/assert.h"
+#include "common/backports.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
 #include "common/hash.h"
@@ -24,6 +26,7 @@
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/texture_cache/tile_manager.h"
+#include <vulkan/vulkan_format_traits.hpp>
 
 namespace VideoCore {
 
@@ -38,9 +41,14 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
       tile_manager{instance, scheduler, runtime, buffer_cache.GetStreamBuffer()},
       readback_linear_images{EmulatorSettings.IsReadbackLinearImagesEnabled()} {
 
-    std::printf("GPU: deferred image readback %s (64 copies, 64 MiB pending limit)%s\n",
+    std::printf("GPU: deferred image readback %s (TLG_READBACK_QUEUE_ENTRIES copies, "
+                "TLG_READBACK_QUEUE_MB pending limit; 64/64 by default)%s\n",
                 deferred_readbacks ? "enabled" : "disabled",
                 stale_readbacks ? "; CPU reads use the previous frame's copy" : "");
+    if (gc_batch_downloads) {
+        std::printf("GPU: collector write-backs batched, one GPU wait per collection "
+                    "(TLG_GC_BATCH_DOWNLOAD)\n");
+    }
 
     u32 max_samplers = instance.GetMaxSamplerAllocationCount();
     trigger_gc_samplers = max_samplers * 3 / 4;
@@ -122,12 +130,18 @@ void TextureCache::RetireReadbacks() {
             }
             runtime.GetStagingPool().FreeDeferred(entry.payload);
         });
-    has_pending_readbacks.store(pending_readbacks.Bytes() != 0, std::memory_order_release);
+    has_pending_readbacks.store(!pending_readbacks.Empty(), std::memory_order_release);
 }
 
 bool TextureCache::ResolveReadbacks(VAddr address, u64 size, bool assume_locks,
                                     ReadbackSource source) {
     if (!deferred_readbacks || !has_pending_readbacks.load(std::memory_order_acquire)) return false;
+    // tlg (gow3_pc #386): image uploads read, and frees drop, exactly the image's bytes. A copy of
+    // a neighboring image that only shares a page is published later over other bytes. Only with
+    // stale readbacks: otherwise pending pages are read-protected and the copy threads fault.
+    const bool exact = ExactReadbackWaits() &&
+        (source == ReadbackSource::ImageRefresh || source == ReadbackSource::BufferForImage ||
+         source == ReadbackSource::ImageFree);
     {
         std::scoped_lock lock{readback_mutex};
         // Stale mode, byte rule: God of War III writes every frame to the page that holds a
@@ -137,9 +151,12 @@ bool TextureCache::ResolveReadbacks(VAddr address, u64 size, bool assume_locks,
             readbacks_released += pending_readbacks.ReleaseOutside(address, size, 64_KB,
                 [this](auto& entry) { WatchReadback<false>(entry.address, entry.size); });
         }
-        if (!pending_readbacks.RequiredTick(address, size)) return false;
+        if (!pending_readbacks.RequiredTick(address, size, exact)) {
+            if (exact && pending_readbacks.RequiredTick(address, size)) ++readbacks_neighbors;
+            return false;
+        }
     }
-    const auto resolve = [this, address, size, source] {
+    const auto resolve = [this, address, size, source, exact] {
         const bool diag = Vulkan::WaitDiagnostics::Enabled();
         std::scoped_lock lock{readback_mutex};
         bool waited = false;
@@ -153,7 +170,7 @@ bool TextureCache::ResolveReadbacks(VAddr address, u64 size, bool assume_locks,
             }
         }
         TlgStats::Timer readback_timer{TlgStats::t_readback_wait};
-        if (const u64 tick = pending_readbacks.RequiredTick(address, size)) {
+        if (const u64 tick = pending_readbacks.RequiredTick(address, size, exact)) {
             ++readbacks_waited;
             waited = !scheduler.IsFree(tick);
             const auto start = diag ? std::chrono::steady_clock::now()
@@ -169,22 +186,100 @@ bool TextureCache::ResolveReadbacks(VAddr address, u64 size, bool assume_locks,
     };
     TlgFreeze::WaitScope wait{"GPU readback", reinterpret_cast<const void*>(address)}; // tlg
     if (assume_locks) resolve();
-    else liverpool->SendCommand<true>(resolve);
+    else liverpool->SendCommand<true, true>(resolve);
     return true;
 }
 
-void TextureCache::CancelReadbacks(VAddr address, u64 size) {
+void TextureCache::CancelReadbacks(VAddr address, u64 size, bool exact) {
     if (!deferred_readbacks) return;
     std::scoped_lock lock{readback_mutex};
     pending_readbacks.Cancel(address, size, [this](auto& entry) {
         if (entry.watched) WatchReadback<false>(entry.address, entry.size);
         ++readbacks_canceled;
-    });
+    }, exact);
 }
 
 // tlg: every copy is recorded first and the GPU is waited for once. A wait per image (as
 // before) left the GPU mostly idle in God of War III's gameplay, at about 2 FPS.
+// tlg (TLG_PERF_DIAG, from gow3_pc #348): a request PartialHeightViews answered with a taller
+// cached image.
+void TextureCache::NotePartialView(const ImageInfo& request, const ImageInfo& used,
+                                   BindingType binding) {
+    ++partial_views;
+    const auto same = [&](const PartialViewStat& s) {
+        return s.address == request.guest_address && s.format == request.pixel_format &&
+               s.used_format == used.pixel_format && s.used_height == used.size.height &&
+               s.binding == binding;
+    };
+    auto slot = std::ranges::find_if(partial_view_stats, same);
+    if (slot == partial_view_stats.end()) {
+        slot = std::ranges::min_element(partial_view_stats, {}, &PartialViewStat::count);
+        *slot = {request.guest_address, request.pixel_format, used.pixel_format, used.size.width,
+                 used.size.height, request.size.height, request.size.height, 0, binding};
+    }
+    slot->min_height = std::min(slot->min_height, request.size.height);
+    slot->max_height = std::max(slot->max_height, request.size.height);
+    ++slot->count;
+}
+
+// tlg (TLG_PERF_DIAG, from gow3_pc #348): every 5 s, the images FindImage created most often.
+// Takes `mutex` (held by FindImage), so it runs before ProcessDownloadImages takes readback_mutex.
+void TextureCache::ReportImageCreates() {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - create_report < std::chrono::seconds(5)) {
+        return;
+    }
+    create_report = now;
+    std::scoped_lock lock{mutex};
+    static constexpr const char* bindings[] = {"texture", "storage", "render target",
+                                               "depth target", "video out"};
+    std::printf("Image creates: %llu in 5 s\n", static_cast<unsigned long long>(images_created));
+    std::ranges::sort(create_stats, std::greater{}, &CreateStat::count);
+    for (u32 i = 0; i < 8 && create_stats[i].count; ++i) {
+        const auto& s = create_stats[i];
+        std::printf("  %u x %#llx %ux%u %s pitch %u tile %u as %s%s: %s", s.count,
+                    static_cast<unsigned long long>(s.address), s.width, s.height,
+                    vk::to_string(s.format).c_str(), s.pitch, s.tile,
+                    bindings[std::min<u32>(u32(s.binding), 4)], s.needs_native ? "" : " (sampled)",
+                    s.reason);
+        if (s.overlaps) {
+            std::printf(" (%u cached; was %#llx %ux%u %s pitch %u tile %u)", s.overlaps,
+                        static_cast<unsigned long long>(s.prev_address), s.prev_width,
+                        s.prev_height, vk::to_string(s.prev_format).c_str(), s.prev_pitch,
+                        s.prev_tile);
+        }
+        std::printf("\n");
+    }
+    create_stats = {};
+    images_created = 0;
+    std::printf("Partial height views: %llu in 5 s\n",
+                static_cast<unsigned long long>(partial_views));
+    std::ranges::sort(partial_view_stats, std::greater{}, &PartialViewStat::count);
+    for (u32 i = 0; i < 8 && partial_view_stats[i].count; ++i) {
+        const auto& s = partial_view_stats[i];
+        std::printf("  %u x %#llx %s rows %u-%u as %s, on %ux%u %s\n", s.count,
+                    static_cast<unsigned long long>(s.address), vk::to_string(s.format).c_str(),
+                    s.min_height, s.max_height, bindings[std::min<u32>(u32(s.binding), 4)],
+                    s.used_width, s.used_height, vk::to_string(s.used_format).c_str());
+    }
+    partial_view_stats = {};
+    partial_views = 0;
+}
+
 void TextureCache::ProcessDownloadImages() {
+    if (Vulkan::WaitDiagnostics::Enabled()) {
+        ReportImageCreates();
+    }
+    // tlg: this runs at every fence (~1200 compute RELEASE_MEMs a frame). With no image queued
+    // and no copy pending there is nothing to record or retire: copies are only queued here, on
+    // the GPU side, so a false has_pending_readbacks stays false until this thread pushes one.
+    // The readback profile still prints when due.
+    if (!has_download_images.load(std::memory_order_acquire) &&
+        !has_pending_readbacks.load(std::memory_order_acquire) &&
+        !(deferred_readbacks && Vulkan::WaitDiagnostics::Enabled() &&
+          std::chrono::steady_clock::now() - readback_report >= std::chrono::seconds(5))) {
+        return;
+    }
     if (deferred_readbacks) {
         // Upload workers must finish reading RAM before these pages become inaccessible.
         scheduler.WaitHostCopies();
@@ -232,6 +327,7 @@ void TextureCache::ProcessDownloadImages() {
             }
         }
         download_images.clear();
+        has_download_images.store(false, std::memory_order_release);
         if (Vulkan::WaitDiagnostics::Enabled()) {
             const auto now = std::chrono::steady_clock::now();
             if (now - readback_report >= std::chrono::seconds(5)) {
@@ -247,7 +343,10 @@ void TextureCache::ProcessDownloadImages() {
                 if (stale_readbacks) {
                     std::printf("Readback byte rule: %llu CPU writes went on without waiting\n",
                                 static_cast<unsigned long long>(readbacks_released));
-                    readbacks_released = 0;
+                    std::printf("Readback exact waits: %llu image uploads/frees skipped a copy "
+                                "on a shared page\n",
+                                static_cast<unsigned long long>(readbacks_neighbors));
+                    readbacks_released = readbacks_neighbors = 0;
                 }
                 std::ranges::sort(readback_images, std::greater{}, &ReadbackImageStat::copies);
                 for (u32 i = 0; i < 4 && readback_images[i].copies; ++i) {
@@ -271,6 +370,7 @@ void TextureCache::ProcessDownloadImages() {
         }
     }
     download_images.clear();
+    has_download_images.store(false, std::memory_order_release);
     if (pending.empty()) {
         return;
     }
@@ -285,7 +385,8 @@ void TextureCache::ProcessDownloadImages() {
 
 std::optional<TextureCache::PendingDownload> TextureCache::RecordImageDownload(ImageId image_id) {
     Image& image = slot_images[image_id];
-    if (False(image.flags & ImageFlagBits::GpuModified)) {
+    // tlg: decoded texels (TLG_BC_TINY) must never reach guest memory.
+    if (False(image.flags & ImageFlagBits::GpuModified) || image.info.props.is_bc_decoded) {
         return std::nullopt;
     }
     const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
@@ -316,7 +417,7 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     Image& image = slot_images[image_id];
     ResolveReadbacks(image.info.guest_address, image.info.guest_size, true,
                      ReadbackSource::ImageDownload);
-    if (False(image.flags & ImageFlagBits::GpuModified)) {
+    if (False(image.flags & ImageFlagBits::GpuModified) || image.info.props.is_bc_decoded) {
         return;
     }
     const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
@@ -568,6 +669,40 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
     });
 }
 
+void TextureCache::NoteBackingWrite(VAddr address, u64 size) {
+    if (!BackingInvalidateEnabled()) {
+        return;
+    }
+    std::scoped_lock lock{backing_writes_mutex};
+    backing_writes.emplace_back(address, size);
+    has_backing_writes.store(true, std::memory_order_release);
+}
+
+void TextureCache::ApplyBackingWrites() {
+    if (!has_backing_writes.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::vector<std::pair<VAddr, u64>> writes;
+    {
+        std::scoped_lock lock{backing_writes_mutex};
+        writes.swap(backing_writes);
+        has_backing_writes.store(false, std::memory_order_release);
+    }
+    // God of War III streams textures with GPU copies through large storage images over the
+    // texture pool; their readbacks put the new texels in memory without a fault, and textures
+    // there kept the old contents until a restart.
+    for (const auto& [address, size] : writes) {
+        ForEachImageInRegion(address, size, [&](ImageId image_id, Image& image) {
+            // Images sharing memory with a GPU writer are synchronized by SynchronizeAlias.
+            if (True(image.flags & (ImageFlagBits::GpuModified | ImageFlagBits::Aliased))) {
+                return;
+            }
+            image.flags |= ImageFlagBits::CpuDirty;
+            UntrackImage(image_id);
+        });
+    }
+}
+
 void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
     // Partial buffer writes still need the image's untouched bytes in guest memory.
     ResolveReadbacks(address, max_size, true, ReadbackSource::GpuPartialWrite);
@@ -668,15 +803,62 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
 std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& image_info,
                                                            BindingType binding,
                                                            ImageId cache_image_id,
-                                                           ImageId merged_image_id) {
+                                                           ImageId merged_image_id,
+                                                           bool native_reads) {
     auto& cache_image = slot_images[cache_image_id];
     const bool safe_to_delete =
         scheduler.CurrentTick() - cache_image.tick_accessed_last > NumFramesBeforeRemoval;
+
+    // tlg: a TLG_BC_TINY image holds decoded texels, nothing another image can copy from or
+    // into: treat the overlap as a chance one, like an allocation from a pool.
+    if (image_info.props.is_bc_decoded != cache_image.info.props.is_bc_decoded) {
+        if (safe_to_delete) {
+            FreeImage(cache_image_id);
+        }
+        return {merged_image_id, -1, -1};
+    }
 
     // Equal address
     if (image_info.guest_address == cache_image.info.guest_address) {
         const u32 lhs_block_size = image_info.num_bits * image_info.guest_samples;
         const u32 rhs_block_size = cache_image.info.num_bits * cache_image.info.guest_samples;
+        // tlg (gow3_pc #348): the top rows of a cached image with the same layout. God of War III
+        // reads its frame buffers as R8G8B8A8Uint with a height that changes every frame; as a
+        // "pool allocation" below, each read created and uploaded a new ~8 MB image (FPS 120 -> 40).
+        // - Only an integer view of another format: same-format requests here are real pool reuse
+        //   (with them, normalized sampling read the wrong rows and blew out exposure).
+        // - Only for shaders that read with integer coordinates (ImageResource::needs_native).
+        // - Known limit: the view keeps the cached size, so accesses past the requested extent but
+        //   inside the cached one reach the frame buffer instead of being dropped.
+        // Off unless TLG_PARTIAL_HEIGHT_VIEWS=1: not measured in inFAMOUS yet (TLG_PERF_DIAG=1
+        // prints 'Image creates' and 'Partial height views' every 5 s to check the pattern).
+        static const bool partial_views_enabled = [] {
+            const char* value = std::getenv("TLG_PARTIAL_HEIGHT_VIEWS");
+            return value && value[0] == '1';
+        }();
+        if (partial_views_enabled && !TlgToggle::Disabled(TlgToggle::PartialHeightViews) &&
+            native_reads && (binding == BindingType::Texture || binding == BindingType::Storage)) {
+            const auto& a = image_info;
+            const auto& b = cache_image.info;
+            const auto is_integer = [](vk::Format format) {
+                const std::string_view numeric = vk::componentNumericFormat(format, 0);
+                return numeric == "UINT" || numeric == "SINT";
+            };
+            if (a.pixel_format != b.pixel_format && is_integer(a.pixel_format) &&
+                lhs_block_size == rhs_block_size && a.pitch == b.pitch &&
+                a.tile_mode == b.tile_mode && a.type == b.type && a.size.width <= b.size.width &&
+                a.size.height < b.size.height && a.size.depth == 1 && b.size.depth == 1 &&
+                a.resources.levels == 1 && a.resources.layers == 1 && b.resources.levels == 1 &&
+                b.resources.layers == 1 && !a.props.is_block && !b.props.is_block &&
+                !a.props.is_depth && !b.props.is_depth &&
+                IsVulkanFormatCompatible(b.pixel_format, a.pixel_format)) {
+                // Counted only on the request's own comparison (a is the merged image afterwards).
+                if (Vulkan::WaitDiagnostics::Enabled() && !merged_image_id) {
+                    NotePartialView(a, b, binding);
+                }
+                return {cache_image_id, -1, -1};
+            }
+        }
         if (image_info.BlockDim() != cache_image.info.BlockDim() ||
             lhs_block_size != rhs_block_size) {
             // Very likely this kind of overlap is caused by allocation from a pool.
@@ -922,7 +1104,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 
     u64 key_hash = info.guest_address ^ info.guest_size << 17 ^ u64(info.pixel_format) << 40 ^
                    u64(info.size.width) << 24 ^ info.size.height ^ u64(desc.type) << 58 ^
-                   u64(exact_fmt) << 63;
+                   u64(exact_fmt) << 63 ^ u64(desc.needs_native) << 62;
     key_hash = (key_hash ^ key_hash >> 33) * 0xFF51AFD7ED558CCDull;
     key_hash = (key_hash ^ key_hash >> 33) * 0xC4CEB9FE1A85EC53ull;
     key_hash ^= key_hash >> 33;
@@ -944,6 +1126,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         cached.size == info.guest_size && cached.extent == info.size &&
         cached.format == info.pixel_format && cached.type == info.type &&
         cached.exact_fmt == exact_fmt && cached.binding == desc.type &&
+        cached.needs_native == desc.needs_native &&
         cached.levels == info.resources.levels && cached.layers == info.resources.layers &&
         !TlgToggle::Disabled(TlgToggle::FindImageCache)) {
         Image& image = slot_images[cached.image_id];
@@ -976,6 +1159,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         if (cache_image.info.size != info.size) {
             continue;
         }
+        if (cache_image.info.props.is_bc_decoded != info.props.is_bc_decoded) {
+            continue;
+        }
         if (!IsVulkanFormatCompatible(cache_image.info.pixel_format, info.pixel_format) ||
             (cache_image.info.type != info.type && info.size != Extent3D{1, 1, 1})) {
             continue;
@@ -984,6 +1170,32 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             continue;
         }
         image_id = cache_id;
+    }
+
+    // tlg (TLG_PERF_DIAG, from gow3_pc #348): what was cached here, read before overlap
+    // resolution may free it.
+    const bool diag = Vulkan::WaitDiagnostics::Enabled();
+    CreateStat created{};
+    if (diag) {
+        created = {info.guest_address, info.size.width, info.size.height, 1, info.pixel_format,
+                   desc.type, image_ids.empty() ? "nothing cached" : "overlap unresolved"};
+        if (!image_id && !image_ids.empty()) {
+            const auto same = std::ranges::find_if(image_ids, [&](ImageId id) {
+                return slot_images[id].info.guest_address == info.guest_address;
+            });
+            const auto& prev =
+                slot_images[same != image_ids.end() ? *same : image_ids.front()].info;
+            created.prev_address = prev.guest_address;
+            created.prev_width = prev.size.width;
+            created.prev_height = prev.size.height;
+            created.prev_format = prev.pixel_format;
+            created.overlaps = static_cast<u32>(image_ids.size());
+            created.prev_pitch = prev.pitch;
+            created.prev_tile = static_cast<u32>(prev.tile_mode);
+        }
+        created.pitch = info.pitch;
+        created.needs_native = desc.needs_native;
+        created.tile = static_cast<u32>(info.tile_mode);
     }
 
     // Try to resolve overlaps (if any)
@@ -996,7 +1208,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 
             const auto& merged_info = image_id ? slot_images[image_id].info : info;
             auto [overlap_image_id, overlap_view_mip, overlap_view_slice] =
-                ResolveOverlap(merged_info, desc.type, cache_id, image_id);
+                ResolveOverlap(merged_info, desc.type, cache_id, image_id, desc.needs_native);
             if (overlap_image_id) {
                 image_id = overlap_image_id;
                 view_mip = overlap_view_mip;
@@ -1010,17 +1222,35 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         if (exact_fmt && info.pixel_format != image_resolved.info.pixel_format) {
             // Cannot reuse this image as we need the exact requested format.
             image_id = {};
+            created.reason = "exact format";
         } else if (image_resolved.info.resources < info.resources) {
             // The image was clearly picked up wrong.
             FreeImage(image_id);
             image_id = {};
             LOG_WARNING(Render_Vulkan, "Image overlap resolve failed");
+            created.reason = "fewer resources";
         }
     }
     // Create and register a new image
     if (!image_id) {
         image_id = slot_images.insert(instance, runtime, slot_image_views, info);
         RegisterImage(image_id);
+        if (diag) {
+            ++images_created;
+            const auto same = [&](const CreateStat& s) {
+                return s.address == created.address && s.width == created.width &&
+                       s.height == created.height && s.format == created.format &&
+                       s.binding == created.binding;
+            };
+            auto slot = std::ranges::find_if(create_stats, same);
+            if (slot != create_stats.end()) {
+                created.count = slot->count + 1;
+            } else {
+                // A free slot, else the least seen one.
+                slot = std::ranges::min_element(create_stats, {}, &CreateStat::count);
+            }
+            *slot = created;
+        }
     }
 
     Image& image = slot_images[image_id];
@@ -1043,6 +1273,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         .type = info.type,
         .exact_fmt = exact_fmt,
         .binding = desc.type,
+        .needs_native = desc.needs_native,
         .levels = info.resources.levels,
         .layers = info.resources.layers,
         .generation = registry_generation.load(std::memory_order_relaxed),
@@ -1055,7 +1286,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 
 ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure_valid) {
     ImageIds image_ids;
-    ForEachImageInRegion(address, size, [&](ImageId image_id, Image& image) {
+    // tlg: BP02 (shadPS4 145932bf, #5240) only the bucket of the first page can hold a match.
+    const bool first_page_only =
+        Common::Backports::On(Common::Backports::Id::ImageFromRangeFirst);
+    const auto collect = [&](ImageId image_id, Image& image) {
         if (image.info.guest_address != address) {
             return;
         }
@@ -1063,7 +1297,13 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
             return;
         }
         image_ids.push_back(image_id);
-    });
+    };
+    if (first_page_only) {
+        Common::Backports::Hit(Common::Backports::Id::ImageFromRangeFirst);
+        ForEachImageWithAddress(address, collect);
+    } else {
+        ForEachImageInRegion(address, size, collect);
+    }
     if (image_ids.size() == 1) {
         // Sometimes image size might not exactly match with requested buffer size
         // If we only found 1 candidate image use it without too many questions.
@@ -1092,6 +1332,7 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, Vi
             image.info.guest_address != 0) {
             std::unique_lock lk{download_images_mutex};
             download_images.emplace(image_id);
+            has_download_images.store(true, std::memory_order_release);
         }
     }
     if (refresh) {
@@ -1122,6 +1363,7 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
     if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
         std::unique_lock lk{download_images_mutex};
         download_images.emplace(image_id);
+        has_download_images.store(true, std::memory_order_release);
     }
     image.usage.render_target = 1u;
     UpdateImage(image_id);
@@ -1186,6 +1428,8 @@ void TextureCache::RefreshImage(Image& image) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.guest_samples > 1) {
         return;
     }
+    TlgPerf::Span perf_upload{TlgPerf::Kind::WaitBegin, TlgPerf::Kind::WaitEnd,
+                             TlgPerf::Label("image_refresh"), image.perf_generation};
     ResolveReadbacks(image.info.guest_address, image.info.guest_size, true,
                      ReadbackSource::ImageRefresh);
     TlgStats::Timer timer{TlgStats::t_refresh};
@@ -1219,6 +1463,10 @@ void TextureCache::RefreshImage(Image& image) {
     const bool is_gpu_dirty = True(image.flags & ImageFlagBits::GpuDirty);
 
     TlgStats::image_upload_bytes.fetch_add(image.info.guest_size, std::memory_order_relaxed);
+    if (image.info.props.is_bc_decoded) {
+        UploadDecodedImage(image);
+        return;
+    }
     boost::container::small_vector<vk::BufferImageCopy, 14> image_copies;
     for (u32 m = 0; m < num_mips; m++) {
         const u32 width = std::max(image.info.size.width >> m, 1u);
@@ -1268,12 +1516,97 @@ void TextureCache::RefreshImage(Image& image) {
         copy.bufferOffset += offset;
     }
 
+    if (TlgPerf::Enabled()) {
+        TlgPerf::Event e; e.kind = TlgPerf::Kind::ResourceUpload;
+        e.object = TlgPerf::Hash(image.info.guest_address); e.generation = image.perf_generation;
+        e.a = image.info.guest_size; TlgPerf::Emit(e);
+    }
     runtime.UploadImage(&image, buffer, image_copies);
+}
+
+void TextureCache::UploadDecodedImage(Image& image) {
+    // tlg: TLG_BC_TINY (video_core/amdgpu/tlg_bc_tiny.h). The blocks are read from guest memory
+    // with the layout the GPU detiler and the BC upload copies use (mips_layout pitch and height
+    // in texels; micro tiling as host_shaders/tiling.comp), decoded and uploaded as texels.
+    const ImageInfo& info = image.info;
+    const auto kind = BcTinyDecodeKind(info.bc_format);
+    ASSERT_MSG(kind.has_value(), "TLG_BC_TINY image without a decodable BC format");
+    const u32 block_bytes = BcDecode::BlockBytes(*kind);
+    const u32 texel_bytes = BcDecode::TexelBytes(*kind);
+    const u32 num_layers = info.resources.layers;
+    const u32 micro_mode = u32(AmdGpu::GetMicroTileMode(info.tile_mode));
+    const u32 thickness = AmdGpu::GetMicroTileThickness(info.array_mode);
+
+    std::vector<u8> guest(info.guest_size);
+    Core::Memory::Instance()->CopySparseMemory(info.guest_address, guest.data(), guest.size());
+
+    boost::container::small_vector<vk::BufferImageCopy, 14> copies;
+    u64 total = 0;
+    for (u32 m = 0; m < info.resources.levels; ++m) {
+        const u32 width = std::max(info.size.width >> m, 1u);
+        const u32 height = std::max(info.size.height >> m, 1u);
+        copies.push_back({
+            .bufferOffset = total,
+            .bufferRowLength = 0,
+            .bufferImageHeight = 0,
+            .imageSubresource{
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .mipLevel = m,
+                .baseArrayLayer = 0,
+                .layerCount = num_layers,
+            },
+            .imageOffset = {0, 0, 0},
+            .imageExtent = {width, height, 1},
+        });
+        total += Common::AlignUp(u64(width) * height * num_layers * texel_bytes, 16);
+    }
+
+    const auto staging = runtime.GetStagingPool().Request(total, MemoryType::HostUncached, 16);
+    u8 texels[16 * 4];
+    for (u32 m = 0; m < info.resources.levels; ++m) {
+        const auto& mip = info.mips_layout[m];
+        const u32 width = copies[m].imageExtent.width;
+        const u32 height = copies[m].imageExtent.height;
+        const u32 pitch_blocks = std::max((mip.pitch + 3) / 4, 1u);
+        const u32 height_blocks = std::max((mip.height + 3) / 4, 1u);
+        u8* const dst = staging.mapped + copies[m].bufferOffset;
+        for (u32 layer = 0; layer < num_layers; ++layer) {
+            for (u32 by = 0; by < Common::DivCeil(height, 4u); ++by) {
+                for (u32 bx = 0; bx < Common::DivCeil(width, 4u); ++bx) {
+                    const u64 offset =
+                        mip.offset +
+                        (info.props.is_tiled
+                             ? BcDecode::MicroTiledOffset(bx, by, layer, pitch_blocks,
+                                                          height_blocks, micro_mode, thickness,
+                                                          info.num_bits)
+                             : ((u64(layer) * height_blocks + by) * pitch_blocks + bx) *
+                                   block_bytes);
+                    if (offset + block_bytes <= guest.size()) {
+                        BcDecode::DecodeBlock(*kind, guest.data() + offset, texels);
+                    } else {
+                        std::memset(texels, 0, sizeof(texels));
+                    }
+                    for (u32 ty = 0; ty < 4 && by * 4 + ty < height; ++ty) {
+                        const u32 y = by * 4 + ty;
+                        const u32 x = bx * 4;
+                        const u32 count = std::min(4u, width - x);
+                        std::memcpy(dst + ((u64(layer) * height + y) * width + x) * texel_bytes,
+                                    texels + ty * 4 * texel_bytes, count * texel_bytes);
+                    }
+                }
+            }
+        }
+        copies[m].bufferOffset += staging.offset;
+    }
+    staging.Flush();
+
+    scheduler.EndRendering();
+    runtime.UploadImage(&image, staging.buffer, copies);
 }
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
                                      AmdGpu::BorderColorBuffer border_color_base,
-                                     const bool is_depth, float extra_lod_bias) {
+                                     const bool is_depth, float extra_lod_bias, u64* lru_id) {
     // Compare and plain uses of one S# need separate samplers; so do extra LOD biases.
     const u64 hash = HashCombine(HashCombine(XXH3_64bits(&sampler, sizeof(sampler)), is_depth),
                                  u64(std::bit_cast<u32>(extra_lod_bias)));
@@ -1286,13 +1619,33 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
     } else {
         sampler_lru_cache.Touch(it->second.lru_id, gc_tick);
     }
+    if (lru_id) {
+        *lru_id = it->second.lru_id;
+    }
 
     return it->second.Handle();
+}
+
+bool TextureCache::TouchSamplers(const u64* lru_ids, u32 count, u64 generation) {
+    std::scoped_lock lock{samplers_mutex};
+    if (sampler_generation.load(std::memory_order_relaxed) != generation) {
+        return false;
+    }
+    for (u32 i = 0; i < count; ++i) {
+        sampler_lru_cache.Touch(static_cast<size_t>(lru_ids[i]), gc_tick);
+    }
+    return true;
 }
 
 void TextureCache::RegisterImage(ImageId image_id) {
     TlgStats::images_registered.fetch_add(1, std::memory_order_relaxed);
     Image& image = slot_images[image_id];
+    if (TlgPerf::Enabled()) {
+        image.perf_generation = TlgPerf::NextOperation();
+        TlgPerf::Event e; e.kind = TlgPerf::Kind::ResourceCreate;
+        e.object = TlgPerf::Hash(image.info.guest_address); e.generation = image.perf_generation;
+        e.a = image.info.guest_size; TlgPerf::Emit(e);
+    }
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
@@ -1326,7 +1679,14 @@ void TextureCache::RegisterImage(ImageId image_id) {
                 [this, image_id](u64 page) { page_table[page].push_back(image_id); });
 }
 
-void TextureCache::UnregisterImage(ImageId image_id) {
+void TextureCache::UnregisterImage(ImageId image_id,unsigned perf_reason) {
+    if (TlgPerf::Enabled()) {
+        const auto& image = slot_images[image_id];
+        TlgPerf::Event e; e.kind = TlgPerf::Kind::ResourceEvict;
+        e.object = TlgPerf::Hash(image.info.guest_address); e.generation = image.perf_generation;
+        e.a = image.info.guest_size; e.b = perf_reason; // 1 pressure, 2 GC, 0 unknown
+        TlgPerf::Emit(e);
+    }
     Image& image = slot_images[image_id];
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
@@ -1473,7 +1833,14 @@ void TextureCache::GarbageCollectImages() {
             return env ? std::strtoull(env, nullptr, 10) << 20 : 0;
         }();
         if (instance.IsIntegrated() || forced_budget) {
-            const u64 budget = forced_budget ? forced_budget : instance.GetDeviceMemoryBudgetNow();
+            // An integrated GPU keeps following the driver's current budget under a forced one:
+            // the launcher always forces 3500 MB, more than most integrated GPUs are given, and
+            // the collector then aimed above what the driver allowed (#72, #75, #199).
+            u64 budget = forced_budget;
+            if (instance.IsIntegrated()) {
+                const u64 now = instance.GetDeviceMemoryBudgetNow();
+                budget = budget && now ? std::min(budget, now) : (budget ? budget : now);
+            }
             if (budget != 0) {
                 trigger_gc_memory = budget / 10 * 7;
                 pressure_gc_memory = budget / 100 * 85;
@@ -1493,46 +1860,106 @@ void TextureCache::GarbageCollectImages() {
     u64 ticks_to_destroy = 0;
     size_t num_deletions = 0;
 
+    // tlg: TLG_GC_BATCH_DOWNLOAD=1: selected images are only recorded (their copies too) and
+    // freed by evict(): one GPU wait, then per image, in selection order, the write-back while it
+    // still protects its pages and FreeImage. Their memory counts as freed from the selection on.
+    // Everything runs under `mutex` on the GPU side, so nothing else frees or changes them.
+    struct Eviction {
+        ImageId image_id;
+        std::optional<PendingDownload> download;
+        unsigned perf_reason;
+    };
+    boost::container::small_vector<Eviction, 64> evictions;
+    u64 evicting_bytes = 0;
+    u64 evicting_downloads = 0;
+    const auto used_memory = [&] { return total_used_memory - evicting_bytes; };
+    const auto evict = [&] {
+        if (evicting_downloads != 0) {
+            scheduler.Finish();
+        }
+        for (const Eviction& eviction : evictions) {
+            if (const auto& download = eviction.download) {
+                download->staging.Invalidate();
+                Core::Memory::Instance()->TryWriteBacking(
+                    std::bit_cast<u8*>(download->guest_address), download->staging.mapped,
+                    download->size);
+                runtime.GetStagingPool().FreeDeferred(download->staging);
+            }
+            FreeImage(eviction.image_id, eviction.perf_reason);
+        }
+        evictions.clear();
+        evicting_bytes = evicting_downloads = 0;
+    };
+
     const auto configure = [&](bool allow_aggressive) {
-        pressured = total_used_memory >= pressure_gc_memory;
-        aggresive = allow_aggressive && total_used_memory >= critical_gc_memory;
+        pressured = used_memory() >= pressure_gc_memory;
+        aggresive = allow_aggressive && used_memory() >= critical_gc_memory;
         ticks_to_destroy = aggresive ? 160 : pressured ? 80 : 16;
         ticks_to_destroy = std::min(ticks_to_destroy, gc_tick);
         num_deletions = aggresive ? 40 : pressured ? 20 : 10;
     };
+    // tlg (bloodborne_pc 0.3): an image that cannot go now moves to the back of the queue and
+    // costs no deletion. Before, it used up the pass's budget and stayed at the front: with the
+    // oldest images all GPU-written tiled targets, nothing was ever freed again and VRAM grew
+    // with every area visited. A pass also stops after looking at 256 images.
+    u32 visited = 0;
     const auto clean_up = [&](ImageId image_id) {
         if (num_deletions == 0) {
             return true;
         }
-        --num_deletions;
+        if (std::ranges::find(evictions, image_id, &Eviction::image_id) != evictions.end()) {
+            // Selected by the first pass, freed by evict().
+            return false;
+        }
+        if (++visited > 256) {
+            return true;
+        }
         auto& image = slot_images[image_id];
         ResolveReadbacks(image.info.guest_address, image.info.guest_size, true,
                          ReadbackSource::CacheCleanup);
         const bool download = image.SafeToDownload();
         const bool tiled = image.info.IsTiled();
-        if (tiled && download) {
-            // This is a workaround for now. We can't handle non-linear image downloads.
+        if ((tiled && download) || (download && !pressured)) {
+            // Tiled: we can't handle non-linear image downloads yet. Otherwise a download
+            // waits for memory pressure.
+            lru_cache.Touch(image.lru_id, gc_tick);
             return false;
         }
-        if (download && !pressured) {
-            return false;
+        --num_deletions;
+        if (gc_batch_downloads) {
+            evictions.push_back(Eviction{image_id, std::nullopt, pressured ? 1U : 2U});
+            if (download) {
+                // Recorded now, written back by evict() before FreeImage (see below).
+                evictions.back().download = RecordImageDownload(image_id);
+                if (evictions.back().download) {
+                    evicting_downloads += evictions.back().download->size;
+                }
+                ++gc_downloads;
+            }
+            ++gc_evictions;
+            evicting_bytes += Common::AlignUp(image.info.guest_size, 1024);
+            // Bounds the staging memory held at once.
+            if (evicting_downloads >= 256_MB) {
+                evict();
+            }
+        } else {
+            if (download) {
+                // tlg: synchronously, while the image still protects its pages. A deferred
+                // write-back landed after FreeImage had unprotected them, over whatever the game
+                // had meanwhile stored there (e.g. its heap after unloading an area).
+                DownloadImageMemory(image_id, true);
+                ++gc_downloads;
+            }
+            ++gc_evictions;
+            FreeImage(image_id, pressured ? 1U : 2U);
         }
-        if (download) {
-            // tlg: synchronously, while the image still protects its pages. A deferred
-            // write-back landed after FreeImage had unprotected them, over whatever the game
-            // had meanwhile stored there (e.g. its heap after unloading an area).
-            DownloadImageMemory(image_id, true);
-            ++gc_downloads;
-        }
-        ++gc_evictions;
-        FreeImage(image_id);
-        if (total_used_memory < critical_gc_memory) {
+        if (used_memory() < critical_gc_memory) {
             if (aggresive) {
                 num_deletions >>= 2;
                 aggresive = false;
                 return false;
             }
-            if (pressured && total_used_memory < pressure_gc_memory) {
+            if (pressured && used_memory() < pressure_gc_memory) {
                 num_deletions >>= 1;
                 pressured = false;
             }
@@ -1544,15 +1971,22 @@ void TextureCache::GarbageCollectImages() {
     configure(false);
     lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
 
-    if (total_used_memory >= critical_gc_memory) {
+    if (used_memory() >= critical_gc_memory) {
         // If we are still over the critical limit, run an aggressive GC
         configure(true);
+        visited = 0;
         lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
     }
+    evict();
     // tlg: evictions under memory pressure, at most every 5 s (TLG_FRAME_STATS or not).
     if (pressured || gc_downloads != 0) {
         const auto now = std::chrono::steady_clock::now();
         if (now - gc_report_time >= std::chrono::seconds(5)) {
+            if (TlgPerf::Enabled()) {
+                TlgPerf::Event e; e.kind = TlgPerf::Kind::MemoryPressure;
+                e.a = total_used_memory; e.b = pressure_gc_memory; e.generation = critical_gc_memory;
+                TlgPerf::Emit(e);
+            }
             std::printf("Texture cache: memory pressure, %llu of %llu MiB (critical %llu): "
                         "%llu images evicted, %llu written back since the last report\n",
                         (unsigned long long)(total_used_memory >> 20),
@@ -1591,6 +2025,7 @@ void TextureCache::GarbageCollectSamplers() {
         const size_t lru_id = samplers.at(hash).lru_id;
         samplers.erase(hash);
         sampler_lru_cache.Free(lru_id);
+        sampler_generation.fetch_add(1, std::memory_order_release);
         return false;
     };
 
@@ -1609,6 +2044,10 @@ void TextureCache::RunGarbageCollector() {
     SCOPE_EXIT {
         ++gc_tick;
     };
+    if (has_backing_writes.load(std::memory_order_acquire)) {
+        std::scoped_lock lock{mutex};
+        ApplyBackingWrites();
+    }
 
     GarbageCollectImages();
     GarbageCollectSamplers();
@@ -1656,7 +2095,10 @@ void TextureCache::TouchImage(const Image& image) {
 
 void TextureCache::DeleteImage(ImageId image_id) {
     Image& image = slot_images[image_id];
-    CancelReadbacks(image.info.guest_address, image.info.guest_size);
+    // tlg (gow3_pc #386): only this image's bytes. FreeImage resolved its own copies; with
+    // ExactReadbackWaits, copies of neighbors that only share a page are still pending and must
+    // reach RAM.
+    CancelReadbacks(image.info.guest_address, image.info.guest_size, ExactReadbackWaits());
     ASSERT_MSG(!image.IsTracked(), "Image was not untracked");
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered), "Image was not unregistered");
 
@@ -1697,6 +2139,7 @@ void TextureCache::DeleteImage(ImageId image_id) {
         std::unique_lock lk{download_images_mutex};
         if (download_images.contains(image_id)) {
             download_images.erase(image_id);
+            has_download_images.store(!download_images.empty(), std::memory_order_release);
         }
     }
 

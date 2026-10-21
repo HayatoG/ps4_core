@@ -256,6 +256,38 @@ public:
         return vk13_features.subgroupSizeControl && vk13_props.maxSubgroupSize >= 64;
     }
 
+    /// tlg: the stages the driver accepts a required subgroup size on
+    /// (VkPhysicalDeviceSubgroupSizeControlProperties::requiredSubgroupSizeStages).
+    vk::ShaderStageFlags RequiredSubgroupSizeStages() const {
+        return vk13_props.requiredSubgroupSizeStages;
+    }
+
+    /// tlg: subgroup size control bounds, for the start-up line.
+    u32 MinSubgroupSize() const {
+        return vk13_props.minSubgroupSize;
+    }
+    u32 MaxSubgroupSize() const {
+        return vk13_props.maxSubgroupSize;
+    }
+
+    /// tlg: true when this stage may be created with a required subgroup size of 64: the feature
+    /// must be on, the device must support 64 lanes, and the stage must be listed in
+    /// requiredSubgroupSizeStages (VUID-VkPipelineShaderStageCreateInfo-pNext-02755: otherwise
+    /// attaching the pNext chain is invalid).
+    bool IsRequiredSubgroupSize64ValidFor(vk::ShaderStageFlagBits stage) const {
+        return IsSubgroupSize64Supported() && bool(vk13_props.requiredSubgroupSizeStages & stage);
+    }
+
+    /// tlg: the subgroup size a compute pipeline runs at: 64 when the driver takes a required size
+    /// for compute (vk_compute_pipeline.cpp), else the device default. The wave64 lowering reads
+    /// this size (lower_wave64_pass.cpp, shared_memory_barrier_pass.cpp: both compute-only), so it
+    /// must be the size the pipeline is created with, not the device's default one.
+    u32 ComputeSubgroupSize() const {
+        return IsRequiredSubgroupSize64ValidFor(vk::ShaderStageFlagBits::eCompute)
+                   ? 64u
+                   : vk11_props.subgroupSize;
+    }
+
     /// tlg: true if creating a pipeline can be told to fail instead of compiling it
     /// (VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT).
     bool IsPipelineCreationCacheControlSupported() const {
@@ -489,6 +521,11 @@ public:
                image_2d_view_of_3d_features.sampler2DViewOf3D;
     }
 
+    /// tlg: BP06. True only when the backport is on and the device enabled the extension + feature.
+    bool IsMaximalReconvergenceSupported() const {
+        return maximal_reconvergence;
+    }
+
     /// Returns whether VK_EXT_image_view_min_lod is supported.
     bool IsImageViewMinLodSupported() const {
         return image_view_min_lod;
@@ -590,6 +627,7 @@ private:
     bool attachment_feedback_loop{};
     bool image_2d_view_of_3d{};
     bool image_view_min_lod{};
+    bool maximal_reconvergence{};
     bool shader_clock{};
     bool pipeline_executable_properties{}; // tlg: TLG_WAVE_STATS=1 (vk_wave_stats.h)
     bool amd_shader_info{};                // tlg: with it, VK_AMD_shader_info when present

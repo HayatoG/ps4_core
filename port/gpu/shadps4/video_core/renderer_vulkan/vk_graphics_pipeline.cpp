@@ -9,9 +9,11 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/assert.h"
+#include "common/scope_exit.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_discard_frag.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_async_compiler.h"
 #include "video_core/renderer_vulkan/vk_blend_rewrite.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -45,13 +47,103 @@ static constexpr std::array LogicalStageToStageBit = {
     vk::ShaderStageFlagBits::eCompute,
 };
 
+// Required by spec unless VK_EXT_extended_dynamic_state3 is supported.
+// In practice, we use dynamic state for all of it.
+// tlg: not a constructor local: TLG_GFX_DEFERRED_BIND builds the pipeline after it returned.
+constexpr vk::PipelineDepthStencilStateCreateInfo depth_stencil_info = {};
+
+// tlg: TLG_GFX_DEFERRED_BIND: every structure the create-info of one graphics pipeline points at.
+// The constructor fills it; when the pipeline is built on a compiler thread, that thread reads it
+// after the constructor returned, where the caller's SerializationSupport is gone.
+struct PipelineCreateInfoBlock {
+    VertexInputs<vk::VertexInputAttributeDescription> vertex_attributes;
+    VertexInputs<vk::VertexInputBindingDescription> vertex_bindings;
+    VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
+    vk::PipelineVertexInputDivisorStateCreateInfo divisor_state{};
+    vk::PipelineVertexInputStateCreateInfo vertex_input_info{};
+    vk::PipelineInputAssemblyStateCreateInfo input_assembly{};
+    vk::PipelineTessellationStateCreateInfo tessellation_state{};
+    vk::StructureChain<vk::PipelineRasterizationStateCreateInfo,
+                       vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT,
+                       vk::PipelineRasterizationDepthClipStateCreateInfoEXT>
+        raster_chain;
+    vk::PipelineMultisampleStateCreateInfo multisampling{};
+    vk::PipelineViewportDepthClipControlCreateInfoEXT clip_control{};
+    vk::PipelineViewportStateCreateInfo viewport_info{};
+    boost::container::static_vector<vk::DynamicState, 32> dynamic_states;
+    vk::PipelineDynamicStateCreateInfo dynamic_info{};
+    boost::container::static_vector<vk::PipelineShaderStageCreateInfo, MaxShaderStages>
+        shader_stages;
+    vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci{};
+    std::array<vk::Format, Shader::IR::NumRenderTargets> color_formats{};
+    std::array<vk::SampleCountFlagBits, AmdGpu::NUM_COLOR_BUFFERS> color_samples{};
+    vk::AttachmentSampleCountInfoAMD mixed_samples{};
+    vk::PipelineRenderingCreateInfo pipeline_rendering_ci{};
+    std::array<vk::PipelineColorBlendAttachmentState, AmdGpu::NUM_COLOR_BUFFERS> attachments{};
+    std::array<vk::PipelineColorBlendAttachmentState, AmdGpu::NUM_COLOR_BUFFERS> square_attachments{};
+    vk::PipelineColorBlendStateCreateInfo color_blending{};
+    vk::PipelineColorBlendStateCreateInfo square_blending{};
+    vk::GraphicsPipelineCreateInfo pipeline_info{};
+    vk::GraphicsPipelineCreateInfo square_info{};
+};
+
+namespace {
+// tlg: one graphics pipeline creation, with the driver time in the profile count
+// CreateCachedGraphicsPipeline keeps. `flags` carries eFailOnPipelineCompileRequired for the
+// probe: the driver then returns no pipeline instead of compiling it here.
+vk::ResultValue<vk::UniquePipeline> CreateGraphicsPipelineNow(vk::Device device,
+                                                             vk::PipelineCache cache,
+                                                             vk::GraphicsPipelineCreateInfo info,
+                                                             vk::PipelineCreateFlags flags,
+                                                             std::string_view debug_str) {
+    info.flags = flags;
+    const auto started = Clock::now();
+    auto created = device.createGraphicsPipelineUnique(cache, info);
+    for (u32 attempt = 1; RetryPipelineCreation(created.result, attempt, "graphics", debug_str);
+         ++attempt) {
+        created = device.createGraphicsPipelineUnique(cache, info);
+    }
+    g_tlg_pipeline_driver_ns += NsSince(started);
+    if (created.result == vk::Result::eSuccess) {
+        g_tlg_driver_pipelines_created.fetch_add(1, std::memory_order_relaxed);
+    }
+    return created;
+}
+
+void NameGraphicsPipeline(vk::Device device, vk::Pipeline pipeline, bool square,
+                          std::string_view debug_str) {
+    if (square) {
+        SetObjectName(device, pipeline, "Graphics Pipeline {} squaring pass", debug_str);
+    } else {
+        SetObjectName(device, pipeline, "Graphics Pipeline {}", debug_str);
+    }
+}
+} // namespace
+
+bool GraphicsDeferredBindEnabled(const Instance& instance, const Scheduler& scheduler) {
+    // tlg: off by default, until it is measured (the driver's cache probe alone must find the
+    // pipeline for this to pay off). The once-per-process message is the toggle's startup line.
+    static const bool requested = [] {
+        const char* v = std::getenv("TLG_GFX_DEFERRED_BIND");
+        if (v && *v == '1') {
+            std::printf("GPU: a pipeline the driver's cache misses builds on a compiler thread "
+                        "(TLG_GFX_DEFERRED_BIND); the draw waits for it at the bind\n");
+            return true;
+        }
+        return false;
+    }();
+    return requested && scheduler.RecordsOnThread() &&
+           instance.IsPipelineCreationCacheControlSupported();
+}
+
 GraphicsPipeline::GraphicsPipeline(
     const Instance& instance, Scheduler& scheduler, DescriptorHeap& desc_heap,
     const Shader::Profile& profile, const GraphicsPipelineKey& key_,
     vk::PipelineCache pipeline_cache, std::span<const Shader::Info*, MaxShaderStages> infos,
     std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
     std::optional<const Shader::Gcn::FetchShaderData> fetch_shader_,
-    std::span<const vk::ShaderModule> modules, SerializationSupport& sdata, bool preloading)
+    std::span<const vk::ShaderModule> modules, SerializationSupport& sdata, bool preloading,
+    const GraphicsBuilder* builder)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache}, key{key_},
       fetch_shader{std::move(fetch_shader_)} {
     const auto started = Clock::now();
@@ -59,6 +151,20 @@ GraphicsPipeline::GraphicsPipeline(
     std::ranges::copy(infos, stages.begin());
     BuildDescSetLayout(preloading);
     const auto debug_str = GetDebugString();
+    // tlg: TLG_GFX_DEFERRED_BIND=1: a pipeline the driver's cache does not hold is built on a
+    // compiler thread and the recording thread waits for it at the bind (Handle()), so a burst
+    // of new pipelines costs about one build instead of their sum (as vk_compute_pipeline.cpp
+    // does for compute). The create-info then has to outlive this constructor.
+    // Wave stats read the pipeline of this object (Pipeline::RecordWaveSizes): left inline.
+    const bool defer = GraphicsDeferredBindEnabled(instance, scheduler) && builder && !preloading &&
+                       !instance.IsPipelineExecutableInfoEnabled();
+    PipelineCreateInfoBlock stack_block;
+    std::shared_ptr<PipelineCreateInfoBlock> heap_block;
+    PipelineCreateInfoBlock* c = &stack_block;
+    if (defer) {
+        heap_block = std::make_shared<PipelineCreateInfoBlock>();
+        c = heap_block.get();
+    }
 
     const vk::PushConstantRange push_constants = {
         .stageFlags = AllGraphicsStageBits,
@@ -87,18 +193,24 @@ GraphicsPipeline::GraphicsPipeline(
                             guest_buffers, vs_info.step_rate_0, vs_info.step_rate_1);
         }
     }
+    // tlg: the block owns the vertex input data: a compiler thread reads it after this returned.
+    c->divisors = sdata.divisors;
+    c->vertex_bindings = sdata.vertex_bindings;
+    c->vertex_attributes = sdata.vertex_attributes;
 
-    const vk::PipelineVertexInputDivisorStateCreateInfo divisor_state = {
-        .vertexBindingDivisorCount = static_cast<u32>(sdata.divisors.size()),
-        .pVertexBindingDivisors = sdata.divisors.data(),
+    auto& divisor_state = c->divisor_state;
+    divisor_state = {
+        .vertexBindingDivisorCount = static_cast<u32>(c->divisors.size()),
+        .pVertexBindingDivisors = c->divisors.data(),
     };
 
-    const vk::PipelineVertexInputStateCreateInfo vertex_input_info = {
-        .pNext = sdata.divisors.empty() ? nullptr : &divisor_state,
-        .vertexBindingDescriptionCount = static_cast<u32>(sdata.vertex_bindings.size()),
-        .pVertexBindingDescriptions = sdata.vertex_bindings.data(),
-        .vertexAttributeDescriptionCount = static_cast<u32>(sdata.vertex_attributes.size()),
-        .pVertexAttributeDescriptions = sdata.vertex_attributes.data(),
+    auto& vertex_input_info = c->vertex_input_info;
+    vertex_input_info = {
+        .pNext = c->divisors.empty() ? nullptr : &divisor_state,
+        .vertexBindingDescriptionCount = static_cast<u32>(c->vertex_bindings.size()),
+        .pVertexBindingDescriptions = c->vertex_bindings.data(),
+        .vertexAttributeDescriptionCount = static_cast<u32>(c->vertex_attributes.size()),
+        .pVertexAttributeDescriptions = c->vertex_attributes.data(),
     };
 
     const auto topology = LiverpoolToVK::PrimitiveType(key.prim_type);
@@ -118,17 +230,20 @@ GraphicsPipeline::GraphicsPipeline(
                      unsigned(key.prim_type), unsigned(key.polygon_mode), key.num_color_attachments,
                      unsigned(key.z_format), hashes.c_str(), formats.c_str());
     }
-    const vk::PipelineInputAssemblyStateCreateInfo input_assembly = {
+    auto& input_assembly = c->input_assembly;
+    input_assembly = {
         .topology = topology,
     };
 
     const bool is_rect_list = key.prim_type == AmdGpu::PrimitiveType::RectList;
     const bool is_quad_list = key.prim_type == AmdGpu::PrimitiveType::QuadList;
-    const vk::PipelineTessellationStateCreateInfo tessellation_state = {
+    auto& tessellation_state = c->tessellation_state;
+    tessellation_state = vk::PipelineTessellationStateCreateInfo{
         .patchControlPoints = is_rect_list ? 3U : (is_quad_list ? 4U : key.patch_control_points),
     };
 
-    vk::StructureChain raster_chain = {
+    auto& raster_chain = c->raster_chain;
+    raster_chain = {
         vk::PipelineRasterizationStateCreateInfo{
             .depthClampEnable = key.depth_clamp_enable &&
                                 (!key.depth_clip_enable || instance.IsDepthClipEnableSupported()),
@@ -164,16 +279,21 @@ GraphicsPipeline::GraphicsPipeline(
                                     fs_info.addr_flags.linear_sample_ena),
         };
     }
+    c->multisampling = sdata.multisampling;
+    auto& multisampling = c->multisampling;
 
-    const vk::PipelineViewportDepthClipControlCreateInfoEXT clip_control = {
+    auto& clip_control = c->clip_control;
+    clip_control = vk::PipelineViewportDepthClipControlCreateInfoEXT{
         .negativeOneToOne = key.clip_space == AmdGpu::ClipSpace::MinusWToW,
     };
 
-    const vk::PipelineViewportStateCreateInfo viewport_info = {
+    auto& viewport_info = c->viewport_info;
+    viewport_info = vk::PipelineViewportStateCreateInfo{
         .pNext = instance.IsDepthClipControlSupported() ? &clip_control : nullptr,
     };
 
-    boost::container::static_vector<vk::DynamicState, 32> dynamic_states = {
+    auto& dynamic_states = c->dynamic_states;
+    dynamic_states = {
         vk::DynamicState::eViewportWithCount,  vk::DynamicState::eScissorWithCount,
         vk::DynamicState::eBlendConstants,     vk::DynamicState::eDepthTestEnable,
         vk::DynamicState::eDepthWriteEnable,   vk::DynamicState::eDepthCompareOp,
@@ -198,13 +318,13 @@ GraphicsPipeline::GraphicsPipeline(
         dynamic_states.push_back(vk::DynamicState::eVertexInputBindingStride);
     }
 
-    const vk::PipelineDynamicStateCreateInfo dynamic_info = {
+    auto& dynamic_info = c->dynamic_info;
+    dynamic_info = {
         .dynamicStateCount = static_cast<u32>(dynamic_states.size()),
         .pDynamicStates = dynamic_states.data(),
     };
 
-    boost::container::static_vector<vk::PipelineShaderStageCreateInfo, MaxShaderStages>
-        shader_stages;
+    auto& shader_stages = c->shader_stages;
     auto stage = u32(Shader::SwStage::Vertex);
     if (infos[stage]) {
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
@@ -266,7 +386,9 @@ GraphicsPipeline::GraphicsPipeline(
             .module = modules[stage],
             .pName = "main",
         });
-    } else if (runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs.clip_distance_emulation) {
+    } else if (preloading ? !sdata.fragment.empty()
+                          : runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs.clip_distance_emulation) {
+        // tlg: a preloaded pipeline has no runtime infos; its .key carries the discard shader.
         if (!preloading) {
             const auto& vs = runtime_infos[static_cast<u32>(Shader::SwStage::Vertex)].hw.vs;
 
@@ -279,17 +401,23 @@ GraphicsPipeline::GraphicsPipeline(
         });
     }
 
-    const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {
+    auto& subgroup_size_ci = c->subgroup_size_ci;
+    subgroup_size_ci = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo{
         .requiredSubgroupSize = 64,
     };
     for (auto& stage : shader_stages) {
-        stage.pNext = instance.IsSubgroupSize64Supported() ? &subgroup_size_ci : nullptr;
+        // tlg: a required subgroup size is only valid on the stages the driver lists in
+        // requiredSubgroupSizeStages; attaching it elsewhere is a spec violation (the driver may
+        // reject the pipeline or clamp the size, either way the shader runs at a size the wave64
+        // lowering did not assume).
+        stage.pNext = instance.IsRequiredSubgroupSize64ValidFor(stage.stage) ? &subgroup_size_ci
+                                                                            : nullptr;
     }
 
     const auto depth_format =
         instance.GetSupportedFormat(LiverpoolToVK::DepthFormat(key.z_format, key.stencil_format),
                                     vk::FormatFeatureFlagBits2::eDepthStencilAttachment);
-    std::array<vk::Format, Shader::IR::NumRenderTargets> color_formats;
+    auto& color_formats = c->color_formats;
     for (s32 i = 0; i < key.num_color_attachments; ++i) {
         const auto& col_buf = key.color_buffers[i];
         const auto format = LiverpoolToVK::SurfaceFormat(col_buf.data_format, col_buf.num_format);
@@ -304,19 +432,21 @@ GraphicsPipeline::GraphicsPipeline(
         color_formats[i] = color_format;
     }
 
-    std::array<vk::SampleCountFlagBits, AmdGpu::NUM_COLOR_BUFFERS> color_samples;
+    auto& color_samples = c->color_samples;
     std::ranges::transform(key.color_samples, color_samples.begin(), [&instance](u8 num_samples) {
         return num_samples ? LiverpoolToVK::NumSamples(num_samples, instance.GetColorSampleCounts())
                            : vk::SampleCountFlagBits::e1;
     });
-    const vk::AttachmentSampleCountInfoAMD mixed_samples = {
+    auto& mixed_samples = c->mixed_samples;
+    mixed_samples = {
         .colorAttachmentCount = key.num_color_attachments,
         .pColorAttachmentSamples = color_samples.data(),
         .depthStencilAttachmentSamples =
             LiverpoolToVK::NumSamples(key.depth_samples, instance.GetDepthSampleCounts()),
     };
 
-    const vk::PipelineRenderingCreateInfo pipeline_rendering_ci = {
+    auto& pipeline_rendering_ci = c->pipeline_rendering_ci;
+    pipeline_rendering_ci = {
         .pNext = instance.IsMixedDepthSamplesSupported() ? &mixed_samples : nullptr,
         .colorAttachmentCount = key.num_color_attachments,
         .pColorAttachmentFormats = color_formats.data(),
@@ -328,10 +458,10 @@ GraphicsPipeline::GraphicsPipeline(
                                        : vk::Format::eUndefined,
     };
 
-    std::array<vk::PipelineColorBlendAttachmentState, AmdGpu::NUM_COLOR_BUFFERS> attachments;
+    auto& attachments = c->attachments;
     // tlg: GNM scales MIN/MAX operands, Vulkan does not (vk_blend_rewrite.h). A self-scaled
     // MIN/MAX is drawn twice: native, then this pipeline squares the destination.
-    std::array<vk::PipelineColorBlendAttachmentState, AmdGpu::NUM_COLOR_BUFFERS> square_attachments;
+    auto& square_attachments = c->square_attachments;
     bool needs_square_pass = false;
     for (u32 i = 0; i < key.num_color_attachments; i++) {
         const auto& control = key.blend_controls[i];
@@ -419,7 +549,8 @@ GraphicsPipeline::GraphicsPipeline(
         }
     }
 
-    const vk::PipelineColorBlendStateCreateInfo color_blending = {
+    auto& color_blending = c->color_blending;
+    color_blending = {
         .logicOpEnable =
             instance.IsLogicOpSupported() && key.logic_op != AmdGpu::ColorControl::LogicOp::Copy,
         .logicOp = LiverpoolToVK::LogicOp(key.logic_op),
@@ -428,11 +559,8 @@ GraphicsPipeline::GraphicsPipeline(
         .blendConstants = std::array{1.0f, 1.0f, 1.0f, 1.0f},
     };
 
-    // Required by spec unless VK_EXT_extended_dynamic_state3 is supported.
-    // In practice, we use dynamic state for all of it.
-    constexpr vk::PipelineDepthStencilStateCreateInfo depth_stencil_info = {};
-
-    const vk::GraphicsPipelineCreateInfo pipeline_info = {
+    auto& pipeline_info = c->pipeline_info;
+    pipeline_info = {
         .pNext = &pipeline_rendering_ci,
         .stageCount = static_cast<u32>(shader_stages.size()),
         .pStages = shader_stages.data(),
@@ -441,7 +569,7 @@ GraphicsPipeline::GraphicsPipeline(
         .pTessellationState = &tessellation_state,
         .pViewportState = &viewport_info,
         .pRasterizationState = &raster_chain.get(),
-        .pMultisampleState = &sdata.multisampling,
+        .pMultisampleState = &multisampling,
         .pDepthStencilState =
             !instance.IsExtendedDynamicState3Supported() ? &depth_stencil_info : nullptr,
         .pColorBlendState = &color_blending,
@@ -451,34 +579,134 @@ GraphicsPipeline::GraphicsPipeline(
 
     // tlg: in the game's keyed cache folder, so a new recompiler or "clear cache" drops them too.
     const auto binary_directory = Storage::GameCacheDir() / "pipeline-binaries";
-    auto [pipeline_result, pipe] =
-        CreateCachedGraphicsPipeline(device, pipeline_cache, pipeline_info, key,
-                                     instance.GetPipelineBinaryGlobalKey(), binary_directory);
-    ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create graphics pipeline: {}",
-               vk::to_string(pipeline_result));
-    pipeline = std::move(pipe);
-    SetObjectName(device, *pipeline, "Graphics Pipeline {}", debug_str);
-    RecordWaveSizes();
+    if (!defer) {
+        auto [pipeline_result, pipe] =
+            CreateCachedGraphicsPipeline(device, pipeline_cache, pipeline_info, key,
+                                         instance.GetPipelineBinaryGlobalKey(), binary_directory);
+        ASSERT_MSG(pipeline_result == vk::Result::eSuccess,
+                   "Failed to create graphics pipeline: {}", vk::to_string(pipeline_result));
+        pipeline = std::move(pipe);
+        SetObjectName(device, *pipeline, "Graphics Pipeline {}", debug_str);
+        RecordWaveSizes();
+    } else {
+        CreatePipeline(heap_block, pipeline_cache, pipeline_info, pipeline, builder, build,
+                       false);
+    }
 
     if (needs_square_pass) {
-        auto square_blending = color_blending;
+        auto& square_blending = c->square_blending;
+        square_blending = color_blending;
         square_blending.logicOpEnable = false;
         square_blending.pAttachments = square_attachments.data();
-        auto square_info = pipeline_info;
+        auto& square_info = c->square_info;
+        square_info = pipeline_info;
         square_info.pColorBlendState = &square_blending;
-        auto [square_result, square] =
-            CreateCachedGraphicsPipeline(device, pipeline_cache, square_info, key,
-                                         instance.GetPipelineBinaryGlobalKey(), binary_directory);
-        ASSERT_MSG(square_result == vk::Result::eSuccess,
-                   "Failed to create the squaring pipeline: {}", vk::to_string(square_result));
-        square_pipeline = std::move(square);
-        SetObjectName(device, *square_pipeline, "Graphics Pipeline {} squaring pass", debug_str);
+        if (!defer) {
+            auto [square_result, square] = CreateCachedGraphicsPipeline(
+                device, pipeline_cache, square_info, key, instance.GetPipelineBinaryGlobalKey(),
+                binary_directory);
+            ASSERT_MSG(square_result == vk::Result::eSuccess,
+                       "Failed to create the squaring pipeline: {}", vk::to_string(square_result));
+            square_pipeline = std::move(square);
+            SetObjectName(device, *square_pipeline, "Graphics Pipeline {} squaring pass",
+                          debug_str);
+        } else {
+            CreatePipeline(heap_block, pipeline_cache, square_info, square_pipeline, builder,
+                           square_build, true);
+        }
     }
     g_tlg_pipeline_total_ns += NsSince(started);
     ++g_tlg_pipelines_built;
 }
 
-GraphicsPipeline::~GraphicsPipeline() = default;
+GraphicsPipeline::~GraphicsPipeline() {
+    // A build still queued uses the layout, the descriptor set layout and the create-info block.
+    WaitForBuild(build);
+    WaitForBuild(square_build);
+}
+
+vk::Pipeline GraphicsPipeline::SquarePassHandle() const {
+    if (square_build) {
+        WaitForBuild(square_build);
+        return vk::Pipeline{square_build->handle.load(std::memory_order_acquire)};
+    }
+    return *square_pipeline;
+}
+
+void GraphicsPipeline::WaitForBuild(const std::shared_ptr<Build>& state) {
+    if (!state) {
+        return;
+    }
+    std::unique_lock lock{state->mutex};
+    state->cv.wait(lock, [&state] { return state->done.load(std::memory_order_acquire); });
+}
+
+void GraphicsPipeline::CreatePipeline(const std::shared_ptr<PipelineCreateInfoBlock>& block,
+                                      vk::PipelineCache cache,
+                                      const vk::GraphicsPipelineCreateInfo& info,
+                                      vk::UniquePipeline& out, const GraphicsBuilder* builder,
+                                      std::shared_ptr<Build>& state, bool square) {
+    const vk::Device device = instance.GetDevice();
+    const auto debug_str = GetDebugString();
+    // One the driver built in an earlier session (its own cache) comes at once: the probe asks
+    // for the pipeline alone, so the caller learns it would have to be compiled here.
+    // CreateCachedGraphicsPipeline is not used for these: the pipeline-binary capture it adds is
+    // incompatible with the probe's flag (and with a build on another thread).
+    auto created =
+        CreateGraphicsPipelineNow(device, cache, info,
+                                  vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired,
+                                  debug_str);
+    if (created.result != vk::Result::ePipelineCompileRequired) {
+        ASSERT_MSG(created.result == vk::Result::eSuccess,
+                   "Failed to create graphics pipeline: {}", vk::to_string(created.result));
+        out = std::move(created.value);
+        NameGraphicsPipeline(device, *out, square, debug_str);
+        return;
+    }
+    // tlg: built on a compiler thread, in that thread's cache (the driver blob the saver writes
+    // keeps it). The recording thread waits for it at the bind, never the GPU thread, so a burst
+    // of new pipelines goes on instead of paying for each of them where it is drawn. The pending
+    // builds also hold back the piled-up draw submissions (vk_rasterizer.cpp): those wait for the
+    // recording thread, which waits for this.
+    auto build_state = std::make_shared<Build>();
+    const auto caches = builder->caches;
+    Pipeline::deferred_binds.fetch_add(1, std::memory_order_relaxed);
+    const bool queued = builder->compiler->Submit(
+        [this, block, state = build_state, caches, square, debug_str] {
+            const auto job_started = Clock::now();
+            SCOPE_EXIT {
+                g_tlg_pipeline_total_ns += NsSince(job_started);
+                Pipeline::deferred_binds.fetch_sub(1, std::memory_order_relaxed);
+            };
+            const vk::Device device = instance.GetDevice();
+            const auto& create_info = square ? block->square_info : block->pipeline_info;
+            auto built = CreateGraphicsPipelineNow(device, *caches[AsyncCompiler::WorkerIndex()],
+                                                  create_info, {}, debug_str);
+            ASSERT_MSG(built.result == vk::Result::eSuccess,
+                       "Failed to create graphics pipeline: {}", vk::to_string(built.result));
+            NameGraphicsPipeline(device, *built.value, square, debug_str);
+            {
+                std::scoped_lock lock{state->mutex};
+                state->handle.store(static_cast<VkPipeline>(*built.value),
+                                    std::memory_order_release);
+                state->result = std::move(built.value);
+                state->done.store(true, std::memory_order_release);
+            }
+            state->cv.notify_all();
+        },
+        true);
+    if (queued) {
+        state = std::move(build_state);
+        return;
+    }
+    // The compiler queue is full: built here, as before.
+    Pipeline::deferred_binds.fetch_sub(1, std::memory_order_relaxed);
+    created = CreateGraphicsPipelineNow(device, cache, info, {}, debug_str);
+    ASSERT_MSG(created.result == vk::Result::eSuccess, "Failed to create graphics pipeline: {}",
+               vk::to_string(created.result));
+    out = std::move(created.value);
+    NameGraphicsPipeline(device, *out, square, debug_str);
+}
 
 template <typename Attribute, typename Binding>
 void GraphicsPipeline::GetVertexInputs(

@@ -84,6 +84,7 @@ public:
 };
 
 struct Image {
+    u64 perf_generation = 0;
     explicit Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime,
                    Common::SlotVector<ImageView>& slot_image_views, const ImageInfo& info);
     ~Image();

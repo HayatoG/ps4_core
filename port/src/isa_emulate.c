@@ -118,7 +118,7 @@ void ABI isa_emulate(const IsaSite *site, IsaRegs *regs) {
         result = source & (source - 1) & mask;
         flags = zf_sf(site, result) | (source == 0 ? ISA_CF : 0);
         break;
-    default:   /* F16C sites are never applied */
+    default:   /* F16C goes through isa_emulate_f16c, SSE4A through isa_emulate_sse4a */
         return;
     }
     write_dst(site, regs, result);
@@ -146,4 +146,97 @@ void ABI isa_emulate_sse4a(const IsaSite *site, uint64_t xmm[4]) {
         xmm[0] = (xmm[0] & ~mask) | (xmm[2] << index & mask);
     }
     xmm[1] = 0;
+}
+
+/* ---- F16C (VCVTPH2PS, VCVTPS2PH) in software: no XMM register is used ---- */
+
+int isa_kind_is_f16c(uint8_t kind) { return kind == ISA_VCVTPH2PS || kind == ISA_VCVTPS2PH; }
+
+/* stmxcsr only stores the control word: no XMM/YMM register is read or written. */
+static uint32_t read_mxcsr(void) {
+    uint32_t value;
+    __asm__ volatile("stmxcsr %0" : "=m"(value));
+    return value;
+}
+
+uint32_t isa_half_to_float(uint16_t half) {
+    const uint32_t sign = (uint32_t)(half & 0x8000) << 16, exponent = half >> 10 & 31, mantissa = half & 0x3ff;
+    if (exponent == 31)   /* Inf; a NaN keeps its payload and is quieted */
+        return sign | 0x7f800000u | (mantissa ? 0x400000u | mantissa << 13 : 0);
+    if (exponent != 0) return sign | (exponent + 112) << 23 | mantissa << 13;
+    if (mantissa == 0) return sign;
+    /* Denormal half: always a normal float (MXCSR.DAZ does not apply to this instruction). */
+    int shift = __builtin_clz(mantissa) - 21;            /* moves the leading 1 to bit 10 */
+    return sign | (uint32_t)(113 - shift) << 23 | (mantissa << shift & 0x3ff) << 13;
+}
+
+uint16_t isa_float_to_half(uint32_t single, unsigned rounding, int daz) {
+    const uint16_t sign = (uint16_t)(single >> 16 & 0x8000);
+    const uint32_t exponent = single >> 23 & 0xff, mantissa = single & 0x7fffff;
+    if (exponent == 255)  /* Inf; a NaN keeps the top 10 payload bits and is quieted */
+        return (uint16_t)(sign | 0x7c00 | (mantissa ? 0x200 | mantissa >> 13 : 0));
+    if (exponent == 0 && (mantissa == 0 || daz)) return sign;   /* DAZ: a denormal input is zero */
+    /* value = full * 2^e; the half's unit is 2^unit: 2^-24 for denormals, 2^(E - 10) for normals. */
+    const uint32_t full = exponent ? mantissa | 0x800000 : mantissa;
+    const int e = (exponent ? (int)exponent : 1) - 150;
+    const int top = e + 31 - __builtin_clz(full);         /* floor(log2 value) */
+    const int unit = top - 10 > -24 ? top - 10 : -24;
+    const int shift = unit - e;                           /* >= 13: every float has 24 bits */
+    uint32_t q = 0, round = 0, sticky = 1;                /* past 24 bits: below half a unit, inexact */
+    if (shift <= 24) {
+        q = full >> shift;
+        round = full >> (shift - 1) & 1;
+        sticky = (full & ((1u << (shift - 1)) - 1)) != 0;
+    }
+    switch (rounding & 3) {
+    case 0: q += round & (sticky | (q & 1)); break;       /* nearest, ties to even */
+    case 1: q += sign && (round | sticky); break;         /* toward -Inf */
+    case 2: q += !sign && (round | sticky); break;        /* toward +Inf */
+    default: break;                                       /* toward zero */
+    }
+    const uint32_t bits = (uint32_t)(unit + 24) * 0x400 + q;   /* a carry out of the mantissa bumps the exponent */
+    if (bits >= 0x7c00) {                                 /* overflow: Inf or the largest finite half */
+        const int to_inf = (rounding & 3) == 0 || ((rounding & 3) == 1 && sign) || ((rounding & 3) == 2 && !sign);
+        return (uint16_t)(sign | (to_inf ? 0x7c00 : 0x7bff));
+    }
+    return (uint16_t)(sign | bits);
+}
+
+/* Fixed-size copies only: a variable length could become a libc memcpy call, which may use XMM. */
+static void copy_halves(void *to, const void *from, int wide) {
+    if (wide) __builtin_memcpy(to, from, 16);
+    else __builtin_memcpy(to, from, 8);
+}
+
+void ABI isa_emulate_f16c(const IsaSite *site, const IsaRegs *regs, uint8_t ymm[64]) {
+    const int wide = site->width == 32;   /* VEX.256: 8 lanes */
+    const unsigned lanes = wide ? 8 : 4;
+    uint64_t result[4] = {0, 0, 0, 0};                   /* the destination register: VEX zeroes the bits above */
+    uint16_t half[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    if (site->kind == ISA_VCVTPH2PS) {
+        copy_halves(half, site->src1 == ISA_NO_REG ? effective_address(site, regs) : ymm + 32, wide);
+        for (unsigned i = 0; i < lanes; i++) {
+            const uint32_t single = isa_half_to_float(half[i]);
+            result[i / 2] |= (uint64_t)single << 32 * (i & 1);
+        }
+    } else if (site->kind == ISA_VCVTPS2PH) {
+        const uint32_t mxcsr = read_mxcsr();
+        /* imm8[2] = 1: MXCSR.RC, else imm8[1:0]; imm8[3] only masks the precision exception. MXCSR.DAZ
+         * applies (denormal inputs become zero), MXCSR.FTZ does not (tiny results stay denormal). */
+        const unsigned rounding = site->imm & 4 ? mxcsr >> 13 & 3 : site->imm & 3;
+        const int daz = mxcsr >> 6 & 1;
+        for (unsigned i = 0; i < lanes; i++) {
+            uint32_t single;
+            __builtin_memcpy(&single, ymm + 32 + 4 * i, 4);
+            half[i] = isa_float_to_half(single, rounding, daz);
+        }
+        if (site->dst == ISA_NO_REG) {
+            copy_halves(effective_address(site, regs), half, wide);
+            return;
+        }
+        copy_halves(result, half, wide);
+    } else {
+        return;
+    }
+    __builtin_memcpy(ymm, result, 32);
 }

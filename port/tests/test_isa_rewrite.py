@@ -60,10 +60,30 @@ class ScanSegmentTests(unittest.TestCase):
 
     def test_unsupported_encodings(self):
         for code, why in ((b'\x64' + BEXTR_RIP, 'segment prefix'), (b'\x67' + MOVBE_STORE, '32-bit address'),
-                          (bytes.fromhex('c4e2791310'), 'vcvtph2ps xmm2, [rax]')):
+                          (bytes.fromhex('62f27d0813d1'), 'EVEX vcvtph2ps xmm2, xmm1'),
+                          (bytes.fromhex('67c4e2791310'), 'vcvtph2ps xmm2, [eax]'),
+                          (bytes.fromhex('64c4e2791310'), 'vcvtph2ps xmm2, fs:[rax]')):
             s, = isa_rewrite.scan_segment(code + RET, 0)
             self.assertEqual(s.mode, isa_rewrite.MODE_UNSUPPORTED, why)
-        self.assertEqual(isa_rewrite.scan_segment(bytes.fromhex('c4e2791310') + RET, 0)[0].kind, isa_rewrite.KIND_VCVTPH2PS)
+
+    def test_f16c_forms(self):
+        """The 13 inFAMOUS 1.07 sites use the first three forms; the others are emulated as well."""
+        K1, K2, NO = isa_rewrite.KIND_VCVTPH2PS, isa_rewrite.KIND_VCVTPS2PH, isa_rewrite.NO_REG
+        cases = (('c4e27913c0', K1, 16, 0, 0, 0, NO, 0),            # vcvtph2ps xmm0, xmm0
+                 ('c4e2791307', K1, 16, 0, NO, 2, 7, 0),            # vcvtph2ps xmm0, [rdi]
+                 ('c4e3791dc908', K2, 16, 1, 1, 0, NO, 8),          # vcvtps2ph xmm1, xmm1, 8
+                 ('c4627d13c1', K1, 32, 8, 1, 0, NO, 0),            # vcvtph2ps ymm8, xmm1
+                 ('c4c37d1d4c240804', K2, 32, NO, 1, 1, 12, 4),     # vcvtps2ph [r12+8], ymm1, 4
+                 ('c4e3791d0c2403', K2, 16, NO, 1, 1, 4, 3))        # vcvtps2ph [rsp], xmm1, 3
+        for code, kind, width, dst, src1, mem_slot, base, imm in cases:
+            s, = isa_rewrite.scan_segment(bytes.fromhex(code) + RET, 0)
+            self.assertEqual((s.kind, s.width, s.mode, s.dst, s.src1, s.mem_slot, s.base, s.imm),
+                             (kind, width, isa_rewrite.MODE_JMP, dst, src1, mem_slot, base, imm), code)
+        s, = isa_rewrite.scan_segment(bytes.fromhex('c4e279130d10000000') + RET, 0x1000)   # vcvtph2ps xmm1, [rip+16]
+        self.assertEqual((s.mem_flags, s.disp, s.src1), (1, 0x1019, NO))
+        record = isa_rewrite.RECORD.unpack_from(isa_rewrite.encode_table(b'', isa_rewrite.scan_segment(
+            bytes.fromhex('c4e3791dc908'), 0)), 64)
+        self.assertEqual((record[2], record[3], record[13]), (K2, 16, 8))   # kind, width, imm
 
     def test_negative_displacement_is_signed(self):
         s, = isa_rewrite.scan_segment(bytes.fromhex('0f38f048f8'), 0)   # movbe ecx, [rax-8]
@@ -154,7 +174,7 @@ class TableTests(unittest.TestCase):
         self.assertEqual((magic, size, sha, count, unsupported, red_zone_bytes),
                          (b'G3ISA1\0\0', len(image), hashlib.sha256(image).digest(), 2, 0, 0))
         self.assertEqual(len(table), 64 + 2 * 64)
-        offset, length, kind, width, mode, dst, src1, src2, mem_slot, base, index, scale, flags, disp, original, rl, relocated = \
+        offset, length, kind, width, mode, dst, src1, src2, mem_slot, base, index, scale, flags, imm, disp, original, rl, relocated = \
             isa_rewrite.RECORD.unpack_from(table, 64 + 64)
         self.assertEqual((offset, length, kind, mode, mem_slot, base, rl, relocated[:rl]),
                          (0x2005, 4, isa_rewrite.KIND_MOVBE_STORE, isa_rewrite.MODE_JMP_RELOCATE, 1, 0, 1, NOP))
@@ -163,7 +183,7 @@ class TableTests(unittest.TestCase):
     def test_encode_table_keeps_negative_displacement(self):
         sites = isa_rewrite.scan_segment(bytes.fromhex('0f38f048f8') + RET, 0)   # movbe ecx, [rax-8]
         record = isa_rewrite.RECORD.unpack_from(isa_rewrite.encode_table(b'', sites), 64)
-        self.assertEqual(record[13], -8)
+        self.assertEqual(record[14], -8)
 
     def test_encode_table_sorts_records_by_offset(self):
         late, early = isa_rewrite.scan_segment(BLSR_ECX, 0x2000) + isa_rewrite.scan_segment(BLSR_ECX, 0x1000)
@@ -174,7 +194,7 @@ class TableTests(unittest.TestCase):
     def test_summary_line(self):
         sites = isa_rewrite.scan_segment(BLSR_ECX + MOVBE_STORE + NOP + bytes.fromhex('c4e2791310') + RET, 0)
         self.assertEqual(isa_rewrite.summary(sites),
-                         'ISA: 3 sites (MOVBE 1, BMI1 1, LZCNT 0, F16C 1, SSE4A 0); 1 relocated, 0 int3, 1 unsupported')
+                         'ISA: 3 sites (MOVBE 1, BMI1 1, LZCNT 0, F16C 1, SSE4A 0); 1 relocated, 0 int3, 0 unsupported')
         sites = isa_rewrite.scan_segment(EXTRQ_X8_X1 + EXTRQ_X4_X7 + RET, 0)
         self.assertEqual(isa_rewrite.summary(sites),
                          'ISA: 2 sites (MOVBE 0, BMI1 0, LZCNT 0, F16C 0, SSE4A 2); 0 relocated, 1 int3, 0 unsupported')

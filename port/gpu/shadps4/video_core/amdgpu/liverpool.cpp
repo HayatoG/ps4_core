@@ -13,6 +13,7 @@
 #include <boost/preprocessor/stringize.hpp>
 
 #include "common/assert.h"
+#include "common/backports.h"
 #include "common/debug.h"
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
@@ -87,19 +88,27 @@ Liverpool::~Liverpool() {
 }
 
 void Liverpool::ProcessCommands() {
-    if (num_commands && rasterizer) {
-        rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCommands); // tlg: commands touch the caches
-    }
     // Process incoming commands with high priority
+    bool drained = false;
     while (num_commands) {
-        Common::UniqueFunction<void> callback{};
+        Command command{};
         {
             std::scoped_lock lk{submit_mutex};
-            callback = std::move(command_queue.front());
+            command = std::move(command_queue.front());
             command_queue.pop();
             --num_commands;
         }
-        callback();
+        // tlg: a readback runs in order on the draw recording thread; anything else touches the
+        // caches from this thread, so the pipe is drained first (which also runs the readbacks
+        // handed over before it: the order between the two kinds holds).
+        if (command.in_order && rasterizer && rasterizer->RunCommandInOrder(std::move(command.func))) {
+            continue;
+        }
+        if (!drained && rasterizer) {
+            rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCommands);
+            drained = true;
+        }
+        command.func();
     }
 }
 
@@ -342,6 +351,50 @@ void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
                 (header->type3.count.Value() - 2) * sizeof(u32));
 }
 
+/// tlg: compute queue packets that need no drain of the draw pipe when PipelinedCompute is on:
+/// register state, nested buffers, dispatches (handed over like the graphics queue's), and the
+/// fences and memory writes that run in order on the draw recording thread (RunInOrder).
+bool PipelinedComputeOpcode(PM4ItOpcode opcode) {
+    switch (opcode) {
+    case PM4ItOpcode::Nop:
+    case PM4ItOpcode::IndirectBuffer:
+    case PM4ItOpcode::AcquireMem:
+    case PM4ItOpcode::SetShReg:
+    case PM4ItOpcode::SetQueueReg:
+    case PM4ItOpcode::DispatchDirect:
+    case PM4ItOpcode::DispatchIndirect:
+    case PM4ItOpcode::WriteData:
+    case PM4ItOpcode::DmaData:
+    case PM4ItOpcode::ReleaseMem:
+    case PM4ItOpcode::EventWrite:
+    case PM4ItOpcode::WaitRegMem: // waits for the recording thread only while unmet
+        return true;
+    default:
+        return false;
+    }
+}
+
+struct ComputeReleaseMem {
+    u32 packet[sizeof(PM4CmdReleaseMem) / sizeof(u32)];
+    u32 pipe_id;
+};
+
+// tlg: a compute queue's end-of-pipe fence, after the draws and dispatches handed over before it.
+void RunComputeReleaseMem(Vulkan::Rasterizer& rasterizer, const u8* data) {
+    const auto& task = *reinterpret_cast<const ComputeReleaseMem*>(data);
+    rasterizer.WaitHostCopies();
+    rasterizer.WaitDeferredSignals();
+    rasterizer.ProcessDownloadImages();
+    rasterizer.EagerCopyAtFence();
+    reinterpret_cast<const PM4CmdReleaseMem*>(task.packet)->SignalFence(
+        [pipe_id = task.pipe_id] {
+            Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
+        },
+        [&rasterizer](VAddr dst, u16 gds_index, u16 num_dwords) {
+            rasterizer.CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false, true);
+        });
+}
+
 void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const auto& event_eos = *reinterpret_cast<const PM4CmdEventWriteEos*>(data);
     // Copies deferred to the recording thread precede writes the guest sees.
@@ -464,6 +517,11 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
             while (!task.handle.done()) {
                 YIELD_CE();
                 RESUME_CE(task);
+            }
+            // tlg: BP01 (shadPS4 #5258) free the finished nested task frame
+            if (Common::Backports::On(Common::Backports::Id::IndirectFrameLeak)) {
+                Common::Backports::Hit(Common::Backports::Id::IndirectFrameLeak);
+                task.handle.destroy();
             }
             break;
         }
@@ -1138,8 +1196,35 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
                         static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
                         u64* results = event->Address<u64*>();
-                        for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
-                            *results = pixel_counter | OcclusionCounterValidMask;
+                        // tlg: occlusion probe (TLG_OCCLUSION_LOG=1 logs the events; TLG_OCCLUSION_MODE
+                        // 0 = fake counter as before, 1 = both slots equal (nothing visible), 2 = end far
+                        // above begin (everything visible), 3 = zero counts: the default).
+                        const int occ_mode = Common::Backports::OcclusionMode();
+                        static const bool occ_log = [] {
+                            const char* v = std::getenv("TLG_OCCLUSION_LOG");
+                            return v && *v && std::atoi(v) != 0;
+                        }();
+                        static std::atomic<u64> occ_events{0};
+                        const u64 occ_n = occ_events.fetch_add(1, std::memory_order_relaxed);
+                        if (occ_log && (occ_n < 48 || occ_n % 2000 == 0)) {
+                            std::printf("Occlusion: event %llu addr %p pairs %d before: %016llx %016llx %016llx %016llx\n",
+                                        static_cast<unsigned long long>(occ_n), static_cast<void*>(results),
+                                        num_counter_pairs, static_cast<unsigned long long>(results[0]),
+                                        static_cast<unsigned long long>(results[1]),
+                                        static_cast<unsigned long long>(results[2]),
+                                        static_cast<unsigned long long>(results[3]));
+                        }
+                        if (occ_mode == 0) {
+                            for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
+                                *results = pixel_counter | OcclusionCounterValidMask;
+                            }
+                        } else {
+                            for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
+                                const u64 v = pixel_counter | OcclusionCounterValidMask;
+                                results[0] = occ_mode == 3 ? OcclusionCounterValidMask : v;
+                                results[1] = occ_mode == 1 ? v : occ_mode == 2 ? v + (OcclusionCounterStep << 8) :
+                                             OcclusionCounterValidMask;
+                            }
                         }
                         pixel_counter += OcclusionCounterStep;
                     }
@@ -1284,6 +1369,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     YIELD_GFX();
                     RESUME_GFX(task);
                 }
+                // tlg: BP01 (shadPS4 #5258) free the finished nested task frame
+                if (Common::Backports::On(Common::Backports::Id::IndirectFrameLeak)) {
+                    Common::Backports::Hit(Common::Backports::Id::IndirectFrameLeak);
+                    task.handle.destroy();
+                }
                 break;
             }
             case PM4ItOpcode::IncrementDeCounter: {
@@ -1381,9 +1471,6 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     size_t acb_size = acb.size_bytes();
     while (!acb.empty()) {
         ProcessCommands();
-        if (rasterizer) {
-            rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCompute); // tlg: compute work uses the caches
-        }
 
         auto* header = reinterpret_cast<const PM4Header*>(acb.data());
         u32 next_dw_off = header->type3.NumWords() + 1;
@@ -1425,6 +1512,16 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
 
         const PM4ItOpcode opcode = header->type3.opcode;
+        // tlg: compute work uses the caches: without PipelinedCompute every packet first waits
+        // for the draw recording thread to run dry.
+        const bool pipelined = rasterizer && !TlgToggle::Disabled(TlgToggle::PipelinedCompute);
+        if (!pipelined) {
+            if (rasterizer) {
+                rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonCompute);
+            }
+        } else if (!PipelinedComputeOpcode(opcode)) {
+            rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
+        }
 
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         if (Vulkan::FrameRecord::Active()) [[unlikely]] {
@@ -1445,6 +1542,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 YIELD_ASC(vqid);
                 RESUME_ASC(task, vqid);
             }
+            // tlg: BP01 (shadPS4 #5258) free the finished nested task frame
+            if (Common::Backports::On(Common::Backports::Id::IndirectFrameLeak)) {
+                Common::Backports::Hit(Common::Backports::Id::IndirectFrameLeak);
+                task.handle.destroy();
+            }
             break;
         }
         case PM4ItOpcode::DmaData: {
@@ -1453,6 +1555,29 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 break;
             }
             ASSERT(dma_data->command.das == 0);
+            if (pipelined) {
+                const bool to_memory = dma_data->dst_sel == DmaDataDst::Memory ||
+                                       dma_data->dst_sel == DmaDataDst::MemoryUsingL2;
+                const bool from_memory = dma_data->src_sel == DmaDataSrc::Memory ||
+                                         dma_data->src_sel == DmaDataSrc::MemoryUsingL2;
+                const VAddr dst_addr = dma_data->DstAddress<VAddr>();
+                const auto* patched =
+                    reinterpret_cast<const PM4Header*>(dst_addr - sizeof(PM4Header));
+                if (from_memory && to_memory && dst_addr >= base_addr &&
+                    dst_addr < base_addr + acb_size &&
+                    dma_data->NumBytes() == sizeof(PM4CmdDispatchIndirect::GroupDimensions) &&
+                    patched->type == 3 && patched->type3.opcode == PM4ItOpcode::DispatchDirect) {
+                    indirect_patches.emplace_back(patched, dma_data->SrcAddress<VAddr>());
+                    break;
+                }
+                // In order with the draws and dispatches (on the draw recording thread).
+                if (rasterizer->RunInOrder(&RunDmaData, dma_data, sizeof(PM4DmaData),
+                                           TlgToggle::PipelinedMemoryWrites) &&
+                    to_memory) {
+                    rasterizer->NotePendingGpuWrite(dst_addr, dma_data->NumBytes());
+                }
+                break;
+            }
             if (dma_data->src_sel == DmaDataSrc::Data && dma_data->dst_sel == DmaDataDst::Gds) {
                 rasterizer->FillBuffer(dma_data->dst_addr_lo, dma_data->NumBytes(), dma_data->data,
                                        true);
@@ -1579,20 +1704,26 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             break;
         }
         case PM4ItOpcode::WriteData: {
+            const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
+            ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
+            ASSERT(!write_data->wr_one_addr.Value());
+            const u32 data_size = (header->type3.count.Value() - 2) * 4;
+            if (pipelined) {
+                // In order with the draws and dispatches (on the draw recording thread).
+                if (rasterizer->RunInOrder(&RunWriteData, header,
+                                           (header->type3.count.Value() + 1) * sizeof(u32),
+                                           TlgToggle::PipelinedMemoryWrites)) {
+                    rasterizer->NotePendingGpuWrite(write_data->Address<VAddr>(), data_size);
+                }
+                break;
+            }
             // tlg: copies deferred to the recording thread precede writes the guest sees, and
             // so do graphics fences deferred to it (the pipe was drained before this packet).
             if (rasterizer) {
                 rasterizer->WaitHostCopies();
                 rasterizer->WaitDeferredSignals();
             }
-            const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
-            ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
-            const u32 data_size = (header->type3.count.Value() - 2) * 4;
-            if (!write_data->wr_one_addr.Value()) {
-                std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
-            } else {
-                UNREACHABLE();
-            }
+            std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
             break;
         }
         case PM4ItOpcode::MemSemaphore: {
@@ -1611,11 +1742,23 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
             while (!wait_reg_mem->Test(regs.reg_array)) {
+                // tlg: the value may come from a fence the recording thread has yet to write.
+                if (pipelined && !rasterizer->DrawPipeIdle()) {
+                    rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
+                    continue;
+                }
                 YIELD_ASC(vqid);
             }
             break;
         }
         case PM4ItOpcode::ReleaseMem: {
+            if (pipelined) {
+                ComputeReleaseMem task;
+                std::memcpy(task.packet, header, sizeof(task.packet));
+                task.pipe_id = queue.pipe_id;
+                rasterizer->RunInOrder(&RunComputeReleaseMem, &task, sizeof(task));
+                break;
+            }
             // tlg: copies deferred to the recording thread precede writes the guest sees, and
             // so do graphics fences deferred to it (the pipe was drained before this packet).
             if (rasterizer) {

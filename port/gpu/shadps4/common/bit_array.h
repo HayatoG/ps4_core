@@ -221,6 +221,17 @@ public:
                 return true;
             }
             size_t i = first_word + 1;
+#ifdef BIT_ARRAY_USE_AVX
+            // tlg: four words per step; this ran for every buffer of every draw (3.3% of all
+            // CPU samples in inFAMOUS were the scalar loop below).
+            for (; i + WORDS_PER_AVX <= last_word; i += WORDS_PER_AVX) {
+                const __m256i words =
+                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&data[i]));
+                if (!_mm256_testz_si256(words, words)) {
+                    return true;
+                }
+            }
+#endif
             for (; i < last_word; ++i) {
                 if (data[i]) {
                     return true;

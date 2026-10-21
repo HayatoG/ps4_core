@@ -577,6 +577,33 @@ now reads guest memory for the constant ring, is not treated as a GPU-side threa
 prints which logged write landed near the corrupted block; bisect the pipeline toggles
 (38 tasks, 39 pending fence waits, 41 recorder fences, 42 memory writes, 36 constant ring).
 
+## Asynchronous compute queue in the draw pipeline (2026-10-16)
+
+inFAMOUS submits about 1200 small asynchronous compute jobs per frame (a `NOP` and an indirect
+buffer of register packets, `DISPATCH_DIRECT`, `DMA_DATA`, `RELEASE_MEM`). `ProcessCompute`
+drained the draw pipe before every packet, so each job made stage A wait for stage B to finish
+all the draws handed over before it: ~43k drains/s that waited, nearly all on the job's first
+packet (`NOP`). Skipping the drain for register-only packets alone changed nothing: the wait
+moved to the next packet.
+
+The compute queue now uses the graphics queue's tools (toggle 1 << 56 switches it off live):
+register packets, nested buffers and dispatches are handed over without a drain (dispatches
+were already pipelined by `Rasterizer::DispatchDirect`); `WRITE_DATA`, `DMA_DATA` and
+`RELEASE_MEM` run in order on stage B (`RunInOrder`; the indirect-dispatch patch of `DMA_DATA`
+is still recorded on stage A); `WAIT_REG_MEM` drains only while unmet. Other packets
+(`MEM_SEMAPHORE`, `REWIND`) still drain first.
+
+Measured headless (gamescope) in a static outdoor scene, 1080p, `TLG_VBLANK_HZ=0`,
+`TLG_FPS_LIMIT=240`, alternating the toggle every 60 s (two rounds each, RX 9070 XT / RADV):
+
+| | FPS | drains/s that waited | stage A waited | stage B busy |
+|---|---|---|---|---|
+| drain before every packet | 35.45 | ~43,300 | ~29% | ~44% |
+| pipelined compute queue | 39.27 | ~870 | ~22.6% | ~51.5% |
+
+The remaining stage A waits are `WAIT_REG_MEM` (13%) and rasterizer tasks (9%). Frames dumped in
+both modes (`TLG_FRAME_DUMP_TRIGGER`, fire and smoke in view) look the same.
+
 ## Freeze report (TLG_FREEZE_REPORT_SECONDS)
 
 `src/runtime_freeze.c`: a monitor thread watches the flips shown (`tlggpu_frame_counters`). After
@@ -596,14 +623,127 @@ FREEZE: end of report (N threads; the game keeps running)
 
 - `+s > 0, +p = 0`: the game still submits flips, the present path is stuck; `+v = 0`: the
   present thread itself is stuck. `+s = 0`: the game stopped submitting (look at its threads).
-- Marked waits: guest mutexes (with holder), condition variables, semaphores, event flags,
+- Marked waits: guest mutexes (with holder), rwlocks (blocking read/write acquires, with the
+  lock's name), condition variables, semaphores, event flags,
   sleeps, file open/read/write/sync, `sceKernelWaitEqueue` (queue name), `sceGnmSubmitDone`
   (GPU idle), `sceVideoOutWaitVblank`, Liverpool `SendCommand<true>` ("GPU thread (command)"),
   texture readbacks, and the page-fault handler (`GPU page fault handler`, a thread stuck in
-  `tlggpu_handle_fault`). Host threads get a wait slot on their first marked wait.
+  `tlggpu_handle_fault`). Host threads get one of 64 wait slots on their first marked wait; when
+  they run out, a slot whose owner thread has exited is handed over (claimed with a CAS and cleared
+  under an odd generation, so a report never copies a half-cleared slot), so long sessions that
+  create and end host threads keep every live thread in the report.
 - Guest offsets are relative to the loaded image (same as the crash report); host addresses are
   `module+offset` (Linux adds the dynamic symbol). Windows: resolve `tlg-probe.exe+0x...` with
   `llvm-symbolizer --obj=tlg-probe.exe 0x<image base + offset>` on the same build.
 - Registers: Linux sends SIGURG to each thread (handler copies registers and the frame chain);
   Windows suspends each thread for `GetThreadContext`. Memory is read with
   `process_vm_readv` / `ReadProcessMemory`.
+
+## Diagnostic toggles and log lines (2026-10-17)
+
+All off by default unless noted; players set them as `ISS_<name>` (copied to `TLG_<name>` at
+start). None of the toggles changes the image.
+
+Statistics (every 5 s unless noted):
+- `TLG_FRAME_STATS=1` (on in the launcher) adds a `Frame waits:` line next to `Frame stats:` and
+  `Frame pacing:`: time the GPU thread waited for frames in flight (`GPU frames`) and for a free
+  frame, the average flip queue wait per flip, submissions per frame, and the CPU time of the
+  draw recording thread (stage B) and the Vulkan recorder thread (with the recorder's idle spin,
+  bounded by `TLG_PIPE_SPIN_US`). The `Draw pipe:` line also counts stage B's idle spin and
+  sleeps, the ring-full waits and the share of time stage A waited for room in the ring.
+- `TLG_WAIT_STATS=1` (`src/runtime_thread.c`): per-thread accounting of the marked waits (the
+  same ones the freeze report shows) and a `Runtime: wait stats` block: one line per thread whose
+  longest wait ended in the window, with the number of waits, the time blocked and the longest
+  wait with its kind and object name, to tie a 30-150 ms stutter to a thread and a lock. Off,
+  marking a wait reads no clock.
+- `TLG_READBACK_STATS=1` now also prints `waits for a readback copy: N, X ms`: guest threads
+  (faults, write merge) waiting for an eager or deferred buffer readback copy, which the
+  scheduler's own wait counters do not see.
+- In the runtime report at exit: with `TLG_AUDIO_STATS=1`, the average and longest Ajm decode
+  time per batch; the file line (`Runtime: files opened=...`) counts the read chunks that went
+  through the bounce buffer and the direct ones (`TLG_FILE_DIRECT`).
+
+Behavior switches (A-B tests, not measured as wins yet):
+- `TLG_READBACK_QUEUE_MB` / `TLG_READBACK_QUEUE_ENTRIES` (default 64 / 64): pending limit of the
+  deferred image readback queue; a full queue makes the GPU command thread wait for the GPU.
+- `TLG_PIPE_RING_SLEEP=1`: stage A sleeps when the draw ring is full instead of spinning, then
+  yielding.
+- `TLG_FILE_DIRECT=1`: file reads go straight into the guest buffer and fall back to the bounce
+  buffer on `EFAULT` (a page the GPU tracker protected) or a short read. The bounce path stays
+  the default: it is the one that survived precise readbacks.
+- `TLG_THREAD_PRIO=1`: guest priorities below normal (above 700) lower the host priority (nice
+  1-19 on Linux, below normal / lowest on Windows); the host priority is never raised.
+- `TLG_FOREIGN_SERIALIZE=1`: the texture cache work of `UnmapMemory` on a guest or fault thread
+  runs in order with the draws already handed to stage B, on the draw recording thread, instead
+  of beside them. A candidate for the guest heap corruption above; adds a wait to that path.
+- `TLG_OWNER_ABORT=1`: aborts (for a core dump) when a thread other than the GPU threads reaches
+  the scheduler while draws are in flight, instead of only logging it.
+- `TLG_GC_BATCH_DOWNLOAD=1`: the texture collector records the copies of all the GPU-written
+  images it evicts in a collection and waits for the GPU once (every 256 MiB of copies at most),
+  then writes each one back and frees it in order, while it still protects its pages. Before,
+  and by default, one full GPU wait per evicted image. Start-up line: `GPU: collector
+  write-backs batched, one GPU wait per collection (TLG_GC_BATCH_DOWNLOAD)`.
+- `TLG_SPLIT_SUBMIT_LOCK=1`: each Vulkan scheduler serializes only its own submissions, and the
+  global queue lock is held just around the queue calls (submit, sparse bind, present) instead of
+  across a whole submission, including the recorder drain and the host copy wait. The present
+  thread then no longer waits for the draw scheduler's submission to finish recording. Lock
+  order: scheduler, then queue. Prints `GPU: split submit lock on` at start.
+
+Always on: `ProcessDownloadImages`, which runs at every graphics and compute fence, returns at
+once when no image is queued for download and no image readback is pending (before, it took two
+locks and walked the readback queue every time).
+
+Shaders:
+- Start-up line (always): `GPU: host subgroup size N (device default D, min A, max B,
+  required-size stages 0x...)`. N is the size the wave64 lowering targets: compute pipelines that
+  may require a subgroup size of 64 run with 64 lanes, so a GPU that defaults to 32 but supports
+  64 is now lowered for 64 (before, it ran 64 lanes with the 32-lane lowering).
+- With `TLG_VERBOSE_LOG=1/2` (the launcher's detailed log): `tlg: compiled <stage> shader 0x...
+  perm N in X ms` and `tlg: compiled graphics pipeline 0x... (...) in X ms` tie a stutter to a
+  compile; a census of the lane operations in vertex/pixel shaders (those stay on 32-lane waves);
+  pipeline-binary failures log the `VkResult` and the call.
+- The shader cache key now also covers `tlg_block1d.h`, `tlg_bc_tiny.h` and
+  `vk_graphics_pipeline.cpp`, so every player's shader cache is rebuilt once after this update.
+
+## Frame time and stutter pass (2026-10-17)
+
+From a code read, not yet measured in game; players report 30-40 FPS with drops on RTX 2060-class
+PCs. Default-on changes don't change the image; the risky ones are opt-in for A/B.
+
+On by default:
+- `IsRegionGpuModified` has the same atomic early-out as the CPU bits (`gpu_any` in
+  `region_manager.h`): every guest `memcpy`/`memset` that the write merge checks and every read
+  fault used to scan the page bits even when the region held no GPU-written page.
+- The write merge fills a `memset` with one walk of the backing mappings
+  (`runtime_memory_fill_backing`, `MemoryManager::FillBacking`) instead of 4 KiB chunks, each
+  with its own lock, lookup and texture-cache probe.
+- Texture-set hits reuse the samplers the set resolved (toggle bit 31, `SamplerSetMemo`): one
+  lock to mark them used instead of a hash, the sampler map lookup and a lock per sampler. The
+  collector's sampler generation drops a memo whose samplers it destroyed.
+- The per-draw descriptor writes keep their storage between draws instead of clearing and
+  value-initialising ~25 entries per draw (`TLG_SET_WRITE_POOL=0` restores it).
+- Present: no full clear of the swapchain image when the frame covers it, and a nearest-filter
+  blit at 1:1 (`TLG_PRESENT_SKIP_CLEAR=0` restores both).
+- Cached SPIR-V is loaded on every start-up path (the on-demand one re-translated every shader
+  each session).
+- `TLG_PIPELINE_BINARIES` is off unless set to 1 (it crashed the NVIDIA 595 driver; the
+  launcher already set it off).
+- Bug fix: the swapchain's `waitIdle` and rebuilds (resize, VSync, HDR) take the queue lock
+  (`Scheduler::LockQueue`); they used the queue while other threads submitted.
+- Port defaults match the launcher's: upscaler off, object motion off (direct runs paid ~10%).
+
+Opt-in (A/B, then candidates for the default):
+- `TLG_GFX_DEFERRED_BIND=1`: a graphics pipeline the driver's cache misses is built on a
+  compiler thread and the draw recording thread waits for it at bind, like compute pipelines,
+  instead of the GPU command thread compiling it inline. No draw is skipped. The shader stutter
+  candidate with the largest expected effect.
+- `TLG_READBACK_LOCAL_JOIN=1` (with the deferred readbacks): a faulting guest thread whose
+  window is covered by a pending readback finishes it itself instead of a round trip through
+  the GPU command thread (counted as `local_joined` in the readback stats).
+- `TLG_WRITE_MERGE_MIN=16..4096` (default 64): the smallest guest copy the write merge takes.
+- `TLG_PHYS_CORES=1`: helper thread counts and spin budgets from physical cores instead of
+  hardware threads (6-core/12-thread CPUs spin less and run 3 draw preparation workers).
+- `TLG_WARMUP_BUILD_CACHED=1`: with a precompiled cache, the warm-up also builds its pipelines
+  in the background (covers a driver cache lost to an update, costs CPU time while playing).
+- `TLG_RESEED_WORKER_CACHES=1`: the compiler threads' pipeline caches are merged with the main
+  cache again after each burst (the merge runs on the GPU command thread).

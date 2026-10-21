@@ -60,6 +60,9 @@ enum : std::uint64_t {
     OrderedGuestWrites = 1ull << 49,
     SceneHalfRes = 1ull << 50, ///< live scaling also reduces the 960x540 post targets
     UpdateImageFastPath = 1u << 30,
+    /// A texture-set hit reuses the samplers it resolved (one lock to mark them used) instead of
+    /// hashing and looking up every sampler (vk_rasterizer.h).
+    SamplerSetMemo = 1ull << 31,
     // TAA A/B in one run: optional techniques, off by default (no measured gain, 2026-10-02).
     TaaTonemapBlend = 1ull << 51,
     TaaClip = 1ull << 52,
@@ -68,10 +71,31 @@ enum : std::uint64_t {
     // On by default (bit set: off): history of a thin feature this jitter phase missed is kept
     // when nothing moves. Static-camera flicker of railings/window bars p99.9 -45% (2026-10-03).
     TaaKeepNearerHistory = 1ull << 55,
+    /// The asynchronous compute queues hand their packets to the draw recording thread like the
+    /// graphics queue (dispatches, fences and memory writes in order) instead of draining it
+    /// before every packet; this bit switches it off live.
+    PipelinedCompute = 1ull << 56,
+    /// Commands other threads send to the GPU thread (deferred readbacks, texture readback
+    /// waits) run in order on the draw recording thread instead of draining the draw pipe
+    /// first; this bit switches it off live (they drain and run on the GPU thread, as before).
+    PipelinedCommands = 1ull << 63,
     SceneMipBias = 1ull << 57, ///< negative LOD bias of G-buffer samplers at reduced scene sizes
     /// Guest threads wait for their own readback copies (TLG_DEFERRED_READBACK=1 enables it;
     /// this bit switches it off live for A/B, see BufferCache::ReadMemory).
     DeferredReadback = 1ull << 58,
+    /// ResolveOverlap answers an integer read of the top rows of a cached image with that image
+    /// (gow3_pc #348, off unless TLG_PARTIAL_HEIGHT_VIEWS=1; this bit switches it off live).
+    PartialHeightViews = 1ull << 59,
+    /// Readbacks that write guest memory through the backing view invalidate the textures over it
+    /// (gow3_pc #331, off unless TLG_BACKING_INVALIDATE=1; this bit switches it off live).
+    BackingInvalidate = 1ull << 60,
+    /// Image uploads and frees wait only for readback copies that share bytes with the image, not
+    /// just a page (gow3_pc #386; only with stale readbacks; this bit switches it off live).
+    ExactReadbackWaits = 1ull << 61,
+    /// GetProgram takes the variant of the previous lookup without building the specialization
+    /// when its inputs are unchanged (i3-pc 0120115; only with TLG_VARIANT_REUSE=1 or =check; this
+    /// bit switches it off live).
+    VariantReuse = 1ull << 62,
     // Bits 20-29 are used as raw debug toggles by the camera/object motion and the upscaler.
 };
 inline bool Disabled(std::uint64_t bit) {

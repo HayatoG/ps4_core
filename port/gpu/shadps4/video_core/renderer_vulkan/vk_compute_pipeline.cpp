@@ -1,3 +1,4 @@
+#include "tlg_perf_trace.h"
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -102,15 +103,26 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     // the layout, which the destructor keeps alive until the build is done. Returns no pipeline
     // when one may only come from the driver's cache and it isn't there.
     const auto create = [&instance, module, layout = *pipeline_layout,
-                         debug_str](vk::PipelineCache cache,
+                         debug_str, trace_key = TlgPerf::Enabled() ? std::hash<ComputePipelineKey>{}(compute_key) : 0](vk::PipelineCache cache,
                                     vk::PipelineCreateFlags flags) -> vk::UniquePipeline {
         const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {
             .requiredSubgroupSize = 64,
         };
+        const bool trace = TlgPerf::Enabled(); // attach and read feedback under one decision
+        TlgPerf::Span trace_build{TlgPerf::Kind::CompileBegin, TlgPerf::Kind::CompileEnd, trace_key, 'c'};
+        vk::PipelineCreationFeedback feedback{};
+        const vk::PipelineCreationFeedbackCreateInfo feedback_info{.pPipelineCreationFeedback = &feedback};
+        // Pipeline creation feedback is core in Vulkan 1.3, required by this renderer.
         const vk::ComputePipelineCreateInfo compute_pipeline_ci = {
+            .pNext = trace ? &feedback_info : nullptr,
             .flags = flags,
             .stage{
-                .pNext = instance.IsSubgroupSize64Supported() ? &subgroup_size_ci : nullptr,
+                // tlg: the stage must be in requiredSubgroupSizeStages for this to be valid; the
+                // profile's subgroup size (vk_pipeline_cache.cpp) is picked to match.
+                .pNext = instance.IsRequiredSubgroupSize64ValidFor(
+                             vk::ShaderStageFlagBits::eCompute)
+                             ? &subgroup_size_ci
+                             : nullptr,
                 .stage = vk::ShaderStageFlagBits::eCompute,
                 .module = module,
                 .pName = "main",
@@ -123,9 +135,18 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
              RetryPipelineCreation(created.result, attempt, "compute", debug_str); ++attempt) {
             created = device.createComputePipelineUnique(cache, compute_pipeline_ci);
         }
+        if (trace) {
+            TlgPerf::Event e; e.kind = TlgPerf::Kind::PipelineFeedback; e.operation = trace_build.Id(); e.object = trace_key;
+            e.b = created.result == vk::Result::eSuccess ? TlgPerf::CacheFeedback(static_cast<unsigned>(feedback.flags)) : 0;
+            e.a = e.b ? feedback.duration : 0;
+            e.generation = 'c'; TlgPerf::Emit(e);
+        }
         if (created.result == vk::Result::ePipelineCompileRequired &&
             (flags & vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired)) {
             return {};
+        }
+        if (created.result == vk::Result::eSuccess) {
+            g_tlg_driver_pipelines_created.fetch_add(1, std::memory_order_relaxed);
         }
         ASSERT_MSG(created.result == vk::Result::eSuccess, "Failed to create compute pipeline: {}",
                    vk::to_string(created.result));

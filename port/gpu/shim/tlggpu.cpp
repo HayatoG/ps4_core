@@ -1,18 +1,24 @@
+#include "tlg_perf_trace.h"
 #include "tlg_write_log.h"
 // tlg: glue between the C loader and the vendored shadPS4 video core.
 #include "tlg_overlay.h"
 #include "tlg_png.h"
 #include "tlg_settings.h"
+#include <cstdlib>
+#include <cstdio>
+#include <fstream>
 #include "tlg_copy.h"
 #ifndef _WIN32
 #include <sys/resource.h>
 #endif
+#include "tlg_region.h"
 #include "tlg_toggles.h"
 #include "tlg_freeze.h"
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <boost/asio/io_context.hpp>
+#include "common/backports.h"
 #include "common/polyfill_thread.h"
 #include "video_core/renderdoc.h"
 #include <cstring>
@@ -36,6 +42,7 @@ extern "C" {
 // runtime_memory.c
 int runtime_memory_is_mapped(uintptr_t address, uint64_t size);
 int runtime_memory_write_backing(uintptr_t address, const void* data, uint64_t size);
+int runtime_memory_fill_backing(uintptr_t address, int value, uint64_t size);
 int runtime_memory_read_backing(uintptr_t address, void* data, uint64_t size);
 uint64_t runtime_memory_clamp(uintptr_t address, uint64_t size);
 int runtime_memory_region(uintptr_t address, uintptr_t* start, uintptr_t* end, int* mapped);
@@ -138,8 +145,32 @@ void MemoryManager::CopySparseMemory(VAddr source, u8* dest, u64 size) {
 }
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     TlgWriteLog::Note(reinterpret_cast<uintptr_t>(address), data, size, TlgWriteLog::Backing);
-    return runtime_memory_write_backing(reinterpret_cast<uintptr_t>(address), data, size) != 0;
+    const bool written =
+        runtime_memory_write_backing(reinterpret_cast<uintptr_t>(address), data, size) != 0;
+    // tlg (gow3_pc #331): the write skipped page tracking, so textures over it must reload.
+    // Fence and label writes (<= 8 bytes) never hold texels and are left out: each one would send
+    // every texture binding through the locked path.
+    if (written && rasterizer && size > 8) {
+        rasterizer->GetTextureCache().NoteBackingWrite(reinterpret_cast<VAddr>(address), size);
+    }
+    return written;
 }
+bool MemoryManager::FillBacking(void* address, int fill, u64 size) {
+    // The write log keeps only the first bytes of a write; the pattern stands in for the fill
+    // byte (Record reads at most the first 64 of them, and only 8 for writes over 64 bytes).
+    std::uint8_t pattern[64];
+    std::memset(pattern, fill, sizeof(pattern));
+    TlgWriteLog::Note(reinterpret_cast<uintptr_t>(address), pattern, size, TlgWriteLog::Backing);
+    const bool written =
+        runtime_memory_fill_backing(reinterpret_cast<uintptr_t>(address), fill, size) != 0;
+    // tlg (gow3_pc #331): the write skipped page tracking, so textures over it must reload; as
+    // in TryWriteBacking, small writes cannot hold texels and are left out.
+    if (written && rasterizer && size > 8) {
+        rasterizer->GetTextureCache().NoteBackingWrite(reinterpret_cast<VAddr>(address), size);
+    }
+    return written;
+}
+
 void AddressSpace::Protect(VAddr virtual_addr, u64 size, MemoryPermission perms) {
     TlgStats::Timer timer{TlgStats::t_protect};
     const u64 pages = (size + 4095) / 4096;
@@ -215,8 +246,82 @@ static void StartProfileWriter() {
 }
 #endif
 
+// tlg: what is switched on for this player, written at the top of every log: the tlg.ini keys (the
+// launcher's choices and the in-game menu's) and the TLG_/ISS_ variables set in the environment
+// (paths are left out: logs are posted in public issues).
+static void LogPlayerConfig() {
+    std::printf("Config: ---- player configuration ----\n");
+    const char* cfg = std::getenv("TLG_CONFIG");
+    std::ifstream ini(cfg && *cfg ? cfg : "tlg.ini");
+    std::string line;
+    int n = 0;
+    while (ini && std::getline(ini, line) && n < 300) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        if (line.empty() || line[0] == '#' || line.find('=') == std::string::npos) continue;
+        std::printf("Config ini: %s\n", line.c_str());
+        ++n;
+    }
+    if (n == 0) std::printf("Config ini: (empty or missing: every setting at its default)\n");
+    std::vector<std::string> vars;
+#ifdef _WIN32
+    char** envp = _environ;
+#else
+    extern char** environ;
+    char** envp = environ;
+#endif
+    for (char** e = envp; e && *e; ++e) {
+        const std::string entry = *e;
+        if (entry.rfind("TLG_", 0) != 0 && entry.rfind("ISS_", 0) != 0) continue;
+        const auto eq = entry.find('=');
+        if (eq == std::string::npos) continue;
+        const std::string value = entry.substr(eq + 1);
+        if (value.find('/') != std::string::npos || value.find('\\') != std::string::npos || value.size() > 40) continue;
+        vars.push_back(entry);
+    }
+    std::sort(vars.begin(), vars.end());
+    for (const auto& v : vars) std::printf("Config env: %s\n", v.c_str());
+    if (vars.empty()) std::printf("Config env: (no TLG_/ISS_ variable set)\n");
+    std::printf("Config: ----\n");
+}
+
+// tlg: the part of tlggpu_init that the shader precompiler needs without a window or the game:
+// the player's settings (the backports chosen there change the shader cache version) and the
+// game's identity (some recompiler switches are on by default for this serial).
+extern "C" void tlggpu_init_headless(const TlgGpuConfig* config) {
+    TlgSettings::Load();
+    {
+        const auto& settings = TlgSettings::Get();
+        for (int i = 0; i < TlgSettings::kBackportPrefs; ++i) {
+            const int pref = settings.backport_pref[i].load();
+            if (pref >= 0) {
+                Common::Backports::ApplyConfig(static_cast<std::size_t>(i), pref != 0);
+            }
+        }
+    }
+    g_sdk_version = config->sdk_version;
+#ifdef _WIN32
+    if (config->user_dir && !std::getenv("TLG_GPU_USER_DIR")) _putenv_s("TLG_GPU_USER_DIR", config->user_dir);
+#else
+    if (config->user_dir) setenv("TLG_GPU_USER_DIR", config->user_dir, 0);
+#endif
+    TlgPerf::InitFromEnvironment();
+    Core::Emulator::FillElfInfo(*config);
+}
+
 extern "C" int tlggpu_init(const TlgGpuConfig* config) {
     TlgSettings::Load();
+    // tlg: the fixes chosen in the launcher or the in-game menu (bpNN in tlg.ini); an environment
+    // variable TLG_BPnn / ISS_BPnn still wins.
+    {
+        const auto& settings = TlgSettings::Get();
+        for (int i = 0; i < TlgSettings::kBackportPrefs; ++i) {
+            const int pref = settings.backport_pref[i].load();
+            if (pref >= 0) {
+                Common::Backports::ApplyConfig(static_cast<std::size_t>(i), pref != 0);
+            }
+        }
+    }
+    LogPlayerConfig();
 #ifdef TLG_PGO_GENERATE
     StartProfileWriter();
 #endif
@@ -226,8 +331,9 @@ extern "C" int tlggpu_init(const TlgGpuConfig* config) {
 #else
     if (config->user_dir) setenv("TLG_GPU_USER_DIR", config->user_dir, 0);
 #endif
+    TlgPerf::InitFromEnvironment();
     Core::Emulator::FillElfInfo(*config);
-    const std::string title = config->title ? config->title : "God of War III";
+    const std::string title = config->title ? config->title : "inFAMOUS Second Son";
     const s32 width = config->width, height = config->height;
     g_window_thread = std::thread([title, width, height] {
         Common::SetCurrentThreadName("tlg:window");
@@ -244,6 +350,7 @@ extern "C" int tlggpu_init(const TlgGpuConfig* config) {
         LOG_INFO(Frontend, "Window closed by user");
         runtime_report();
         std::fflush(stdout);
+        TlgPerf::Stop(); // _Exit bypasses atexit; finish diagnostics on normal window close.
         std::_Exit(0);
     });
     g_window_thread.detach();
@@ -293,6 +400,10 @@ extern "C" int tlggpu_handle_fault(void* ucontext, void* address) {
 extern "C" void tlggpu_set_wait_hooks(TlgGpuWaitBegin begin, TlgGpuWaitEnd end) {
     TlgFreeze::end_hook.store(end);
     TlgFreeze::begin_hook.store(begin);
+}
+
+extern "C" void tlggpu_note_open(const char* guest_path) {
+    TlgRegion::NoteOpen(guest_path);
 }
 
 extern "C" void tlggpu_frame_counters(TlgGpuFrameCounters* out) {
@@ -384,6 +495,10 @@ extern "C" void tlggpu_input_settings(TlgGpuInputSettings* out) {
     out->accel = s.mouse_accel;
     out->deadzone = s.mouse_deadzone;
     std::snprintf(out->key_map, sizeof(out->key_map), "%s", s.key_map.c_str());
+}
+
+extern "C" void tlggpu_mouse_pad_hud(int active, float x, float y, int touching, int clicking) {
+    TlgOverlay::SetMousePad(active != 0, x, y, touching != 0, clicking != 0);
 }
 
 extern "C" int tlggpu_text_input_begin(const char* initial, const char* prompt) {

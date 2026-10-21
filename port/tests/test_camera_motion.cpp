@@ -9,8 +9,12 @@
 #include "video_core/texture_cache/image.h"
 #include "video_core/host_shaders/camera_motion_comp.h"
 #include <vk_mem_alloc.h>
+#include "vulkan_test_driver.h"
 
 int main() {
+    if (SkipWithoutVulkanDriver()) {
+        return 0;
+    }
     Vulkan::Instance instance(0, false);
     static vk::detail::DynamicLoader loader;
     vk::detail::DispatchLoaderDynamic d;

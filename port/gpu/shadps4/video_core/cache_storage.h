@@ -8,6 +8,8 @@
 #include "common/types.h"
 
 #include <functional>
+#include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -53,6 +55,10 @@ public:
     [[nodiscard]] bool ConcurrentReads() const;
     /// tlg: number of blobs ForEachBlob visits (the loading screen's total).
     size_t CountBlobs(BlobType type);
+    /// tlg: the name (no extension) of every blob of a type, without reading it.
+    void ForEachBlobName(BlobType type, const std::function<void(std::string_view name)>& func);
+    /// tlg: waits until every queued save is on disk.
+    void WaitIdle();
 
 private:
     std::jthread io_worker{};

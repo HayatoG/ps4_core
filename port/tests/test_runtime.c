@@ -309,6 +309,33 @@ static void rw_concurrency(void) {
     assert(atomic_load(&f.value)==1);
     fixture_destroy(&f);
 }
+/* scePthreadOnce: one caller runs the routine, the others wait for it (and back off instead of
+ * spinning: see runtime_kernel.c thread_once). */
+static int32_t once_state;
+static volatile int once_calls;
+static void ABI once_routine(void) {
+    ++once_calls;
+    struct timespec nap={0,50000000}; /* 50 ms: the other callers take the waiting path */
+    nanosleep(&nap,NULL);
+}
+typedef int32_t (ABI *Once)(int32_t *, void (ABI *)(void));
+static Once once_call;
+static void *once_caller(void *context) {
+    (void)context;
+    assert(once_call(&once_state,once_routine)==0);
+    return NULL;
+}
+static void pthread_once_calls(void) {
+    once_call=GET(Once,"14bOACANTBo#libkernel");
+    assert(once_call);
+    assert((uint32_t)once_call(NULL,once_routine)==0x80020016);
+    assert((uint32_t)once_call(&once_state,NULL)==0x80020016);
+    pthread_t threads[4];
+    for (unsigned i=0;i<4;++i) assert(!pthread_create(&threads[i],NULL,once_caller,NULL));
+    for (unsigned i=0;i<4;++i) assert(!pthread_join(threads[i],NULL));
+    assert(once_calls==1 && once_state==1);
+    assert(once_call(&once_state,once_routine)==0 && once_calls==1); /* done: returns at once */
+}
 static void rw_timeouts(void) {
     rw_setup();
     TimedLock read_timed=GET(TimedLock,"iPtZRWICjrM#libkernel"), write_timed=GET(TimedLock,"adh--6nIqTk#libkernel");
@@ -356,7 +383,7 @@ int main(int argc,char **argv) {
     if (argc>1 && !strcmp(argv[1],"--rwlock-concurrency")) { rw_concurrency(); return 0; }
     if (argc>1 && !strcmp(argv[1],"--rwlock-timeouts")) { rw_timeouts(); return 0; }
     libc_support(); posix_mutexes(); wall_time(); exit_handlers(); guards(); mutexes(); direct_memory(); memory_primitives();
-    rw_lifecycle(); rw_concurrency(); rw_timeouts();
+    rw_lifecycle(); rw_concurrency(); rw_timeouts(); pthread_once_calls();
     puts("PASS: callback lifecycle, guard ABI, mutex errors, shared direct memory, memory primitives, resolver scope");
     return 0;
 }

@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <algorithm>
 #include <span>
+#include <unordered_map>
 #include <vector>
 #include <boost/container/static_vector.hpp>
 #include "common/assert.h"
@@ -237,10 +239,22 @@ struct Info : InfoPersistent {
         bnd.user_data += ud_mask.NumRegs();
     }
 
+    /// tlg: the shader precompiler has no guest memory: per program hash, it gives the flattened
+    /// user data it rebuilt from the game files, and RefreshFlatBuf copies that instead of
+    /// walking the resource tables (the translation then sees the values a draw would have).
+    static inline thread_local const std::unordered_map<u64, std::vector<u32>>* replay_flats{};
+
     void RefreshFlatBuf() {
         flattened_ud_buf.resize(srt_info.flattened_bufsize_dw);
         ASSERT(user_data.size() <= NUM_USER_DATA_REGS);
         std::memcpy(flattened_ud_buf.data(), user_data.data(), user_data.size_bytes());
+        if (replay_flats) {
+            if (const auto it = replay_flats->find(pgm_hash); it != replay_flats->end()) {
+                const size_t n = std::min(it->second.size(), flattened_ud_buf.size());
+                std::memcpy(flattened_ud_buf.data(), it->second.data(), n * sizeof(u32));
+                return;
+            }
+        }
         if (srt_info.walker_func) {
             srt_info.walker_func(user_data.data(), flattened_ud_buf.data());
         }

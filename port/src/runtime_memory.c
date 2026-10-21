@@ -818,6 +818,21 @@ int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t s
     read_unlock();
     return ok;
 }
+/* Fills through the backing view (one walk of the VMAs, where a memset goes one chunk at a
+ * time); 0 when part of the range has no backing. */
+int runtime_memory_fill_backing(uintptr_t address, int value, uint64_t size) {
+    read_lock();
+    int ok=1;
+    for (uintptr_t at=address, end=address+size; at<end && ok;) {
+        size_t i=vma_index(at);
+        if (i==vma_count || vmas[i].start>at || vmas[i].kind==KIND_RESERVED) { ok=0; break; }
+        uint64_t n=(vmas[i].end<end ? vmas[i].end : end)-at;
+        memset(backing_base+vmas[i].phys+(at-vmas[i].start),value,n);
+        at+=n;
+    }
+    read_unlock();
+    return ok;
+}
 /* Reads through the backing view, bypassing GPU page protection; 0 when part of the range has no
  * backing (the caller then reads the guest address directly). GPU-internal threads use it so a
  * read of a page protected for readback (TLG_READBACKS=2) cannot fault into a readback that waits

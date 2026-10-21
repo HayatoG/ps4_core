@@ -18,6 +18,17 @@ import sys
 PORT = Path(__file__).resolve().parent
 
 
+def _data_dir(data):
+    """The saves folder when <PREFIX>USER_DIR is not set: the per-user pointer file of the launcher
+    (launcher/userdata.py), else <data>/user."""
+    try:
+        sys.path.insert(0, str(PORT / 'launcher'))
+        import userdata
+        return userdata.user_dir(data)
+    except ImportError:
+        return data / 'user'
+
+
 def fail(message):
     print(message, file=sys.stderr)
     sys.exit(1)
@@ -172,7 +183,7 @@ def main():
         sys.exit(20)
     missing = parse_cpu_features(features.stdout)
 
-    game = Path(env.get('TLG_GAME_DIR', PORT.parent / 'CUSA01623'))
+    game = Path(env.get('TLG_GAME_DIR', PORT.parent / 'game' / 'CUSA00223'))
     if not (game / 'eboot.bin').is_file():
         fail(f'No eboot.bin in {game} (set TLG_GAME_DIR).')
     original_game = game.resolve()
@@ -243,15 +254,22 @@ def main():
         # The in-game restart starts this script again once this process is gone.
         # GPU caches (shaders, pipelines) beside the saves (path_util.cpp reads it when
         # the GPU starts; set here too so the in-game restart and the tools agree).
-        user_dir = Path(env.get('TLG_USER_DIR', data / 'user')).resolve()
+        user_dir = Path(env.get(f'{port_env_prefix(env)}USER_DIR') or env.get('TLG_USER_DIR') or _data_dir(data)).resolve()
         user_dir.mkdir(parents=True, exist_ok=True)
         env.setdefault('TLG_GPU_USER_DIR', str(user_dir))
-        from save_backup import backup
         try:
-            if made := backup(user_dir):
-                print(f'Saves backed up to {made}', flush=True)
-        except OSError as error:
-            print(f'Save backup failed, starting anyway: {error}', flush=True)
+            sys.path.insert(0, str(PORT / 'launcher'))
+            import savemanager
+            note = savemanager.backup_before_play(user_dir)   # also copies to the extra backup folder
+            if note:
+                print(note, flush=True)
+        except ImportError:
+            from save_backup import backup
+            try:
+                if made := backup(user_dir):
+                    print(f'Saves backed up to {made}', flush=True)
+            except OSError as error:
+                print(f'Save backup failed, starting anyway: {error}', flush=True)
         this = ['--run'] if getattr(sys, 'frozen', False) else [str(Path(__file__).resolve())]
         restart = [sys.executable, *this, '--after', str(os.getpid()), *args]
         env['TLG_RESTART_COMMAND'] = subprocess.list2cmdline(restart)

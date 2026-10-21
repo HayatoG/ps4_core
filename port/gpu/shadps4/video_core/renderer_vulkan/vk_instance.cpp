@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <string_view>
 #include <cstdio>
 #include <cstdlib>
 #include <boost/container/static_vector.hpp>
@@ -8,10 +10,14 @@
 #include <fmt/ranges.h>
 
 #include "common/assert.h"
+#include "common/backports.h"
 #include "common/debug.h"
 #include "common/types.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
+#include "video_core/amdgpu/tlg_amd_1d.h"
+#include "video_core/amdgpu/tlg_bc_tiny.h"
+#include "video_core/amdgpu/tlg_block1d.h"
 #include "video_core/amdgpu/tlg_msaa.h"
 #include "video_core/amdgpu/tlg_msaa_default.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -224,8 +230,11 @@ std::string Instance::GetDriverVersionName() {
 
 namespace {
 bool PipelineBinaryCacheRequested() {
+    // tlg: off by default (2026-10-17): restoring a VK_KHR_pipeline_binary ends the game on the
+    // NVIDIA 595 driver, and the launcher already sets ISS_PIPELINE_BINARIES=0.
+    // TLG_PIPELINE_BINARIES=1 (ISS_PIPELINE_BINARIES in the launcher) turns it back on.
     const char* setting = std::getenv("TLG_PIPELINE_BINARIES");
-    return !setting || *setting != '0';
+    return setting && (*setting == '1' || *setting == 'y' || *setting == 't');
 }
 }
 
@@ -422,6 +431,24 @@ bool Instance::CreateDevice() {
                  image_2d_view_of_3d_features.sampler2DViewOf3D);
     }
     image_view_min_lod = add_extension(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
+    // tlg: BP06 (SotC 8d84cf7). Detected at run time: the extension is listed and the feature
+    // reports true; only then is it enabled. Off by default, so the device is created exactly as
+    // before unless TLG_BP06=1.
+    maximal_reconvergence = false;
+    if (Common::Backports::On(Common::Backports::Id::MaximalReconvergence) &&
+        std::ranges::find(available_extensions, std::string{VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME}) !=
+            available_extensions.end()) {
+        const auto reconvergence_features =
+            physical_device
+                .getFeatures2<vk::PhysicalDeviceFeatures2,
+                              vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR>()
+                .get<vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR>();
+        if (reconvergence_features.shaderMaximalReconvergence) {
+            maximal_reconvergence = add_extension(VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME);
+        } else {
+            LOG_WARNING(Render_Vulkan, "BP06: shaderMaximalReconvergence feature not supported");
+        }
+    }
     supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     // tlg: from shadPS4-Infamous-FixBuild e35e04dc. Lets the driver move device memory out to
     // system memory instead of failing an allocation when the card is full.
@@ -660,6 +687,9 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceImageViewMinLodFeaturesEXT{
             .minLod = true,
         },
+        vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR{
+            .shaderMaximalReconvergence = true,
+        },
         vk::PhysicalDeviceShaderClockFeaturesKHR{
             .shaderSubgroupClock = shader_clock_features.shaderSubgroupClock,
         },
@@ -734,6 +764,9 @@ bool Instance::CreateDevice() {
     }
     if (!image_view_min_lod) {
         device_chain.unlink<vk::PhysicalDeviceImageViewMinLodFeaturesEXT>();
+    }
+    if (!maximal_reconvergence) {
+        device_chain.unlink<vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR>();
     }
     if (!shader_clock) {
         device_chain.unlink<vk::PhysicalDeviceShaderClockFeaturesKHR>();
@@ -841,6 +874,67 @@ void Instance::CollectDeviceParameters() {
     AmdGpu::no_msaa.store(no_msaa, std::memory_order_relaxed);
     std::printf("GPU: guest multisampling %s\n",
                 no_msaa ? "off (single-sampled images; TLG_NO_MSAA=0 keeps it)" : "on");
+
+    // tlg: see video_core/amdgpu/tlg_block1d.h. The query uses the plainest usage the game's BC
+    // 1D textures need (sampled, filled by copies).
+    const char* block1d_env = std::getenv("TLG_BLOCK1D");
+    const bool bc1d_refused =
+        physical_device
+            .getImageFormatProperties(vk::Format::eBc1RgbaUnormBlock, vk::ImageType::e1D,
+                                      vk::ImageTiling::eOptimal,
+                                      vk::ImageUsageFlagBits::eSampled |
+                                          vk::ImageUsageFlagBits::eTransferDst)
+            .result != vk::Result::eSuccess;
+    const bool block1d_as_2d = block1d_env && *block1d_env
+                                   ? *block1d_env == '1'
+                                   : bc1d_refused && driver_id != vk::DriverId::eNvidiaProprietary;
+    AmdGpu::block1d_as_2d.store(block1d_as_2d, std::memory_order_relaxed);
+    if (bc1d_refused || block1d_as_2d) {
+        std::printf("GPU: block-compressed 1D textures %s\n",
+                    block1d_as_2d ? "as 2D images (the driver refuses BC 1D; TLG_BLOCK1D=0 keeps 1D)"
+                                  : "kept 1D although the driver refuses them (TLG_BLOCK1D=1 makes them 2D)");
+    }
+
+    // tlg: BP09 (CTR d26bcb2): every 1D image as 2D of height 1; read once, before any image or
+    // shader exists, so the shaders and the images of a session agree.
+    const bool all_1d_as_2d = Common::Backports::On(Common::Backports::Id::Image1DAs2D);
+    AmdGpu::all_1d_as_2d.store(all_1d_as_2d, std::memory_order_relaxed);
+    if (all_1d_as_2d) {
+        std::printf("GPU: every 1D texture as a 2D image of height 1 (TLG_BP09=1)\n");
+    }
+
+    // tlg: see video_core/amdgpu/tlg_bc_tiny.h. Set before any image or shader exists.
+    const char* bc_tiny_env = std::getenv("TLG_BC_TINY");
+    // TLG_BC_TINY=auto: also decode on any driver that refuses BC 1D and is not given the 2D
+    // promotion (NVIDIA), so the driver never sees a block-compressed 1D image (test branch).
+    const bool bc_tiny_auto = bc_tiny_env && std::string_view{bc_tiny_env} == "auto";
+    const bool bc_tiny = bc_tiny_auto ? (bc1d_refused && !block1d_as_2d)
+                         : bc_tiny_env && *bc_tiny_env
+                             ? *bc_tiny_env == '1'
+                             : driver_id == vk::DriverId::eAmdProprietary;
+    AmdGpu::bc_tiny_decode.store(bc_tiny, std::memory_order_relaxed);
+    std::printf("GPU: tiny block-compressed textures (BC1-BC5 1D, or under 4 texels) %s\n",
+                bc_tiny ? "decoded on the CPU to plain images, 1D kept 1D (TLG_BC_TINY=0 keeps BC)"
+                        : "kept block-compressed (TLG_BC_TINY=1 decodes them on the CPU)");
+
+    // tlg: see video_core/amdgpu/tlg_amd_1d.h. Set before any image exists.
+    auto env_flag = [](const char* name, bool fallback) {
+        const char* v = std::getenv(name);
+        return v && *v ? *v == '1' : fallback;
+    };
+    AmdGpu::img_trace.store(env_flag("TLG_IMG_TRACE", driver_id == vk::DriverId::eAmdProprietary));
+    if (const char* lines = std::getenv("TLG_IMG_TRACE_LINES")) {
+        const int limit = std::atoi(lines);
+        AmdGpu::img_trace_limit.store(limit > 0 ? static_cast<unsigned>(limit) : ~0u);
+    }
+    AmdGpu::img_1d_no_storage.store(env_flag("TLG_1D_NO_STORAGE", false));
+    AmdGpu::img_1d_no_mutable.store(env_flag("TLG_1D_NO_MUTABLE", false));
+    if (AmdGpu::ImgTrace() || AmdGpu::img_1d_no_storage || AmdGpu::img_1d_no_mutable) {
+        std::printf("GPU: 1D image switches: trace %d, no storage %d, no mutable %d "
+                    "(TLG_IMG_TRACE, TLG_1D_NO_STORAGE, TLG_1D_NO_MUTABLE); driver %s\n",
+                    AmdGpu::ImgTrace(), AmdGpu::img_1d_no_storage.load(),
+                    AmdGpu::img_1d_no_mutable.load(), GetDriverVersionName().c_str());
+    }
 
     const std::string model_name{GetModelName()};
     const std::string driver_version = GetDriverVersionName();

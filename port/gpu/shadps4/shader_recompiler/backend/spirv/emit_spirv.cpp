@@ -2,12 +2,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <span>
+#include "common/backports.h"
+#include <unordered_map>
 #include <type_traits>
 #include <utility>
 #include <vector>
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/assert.h"
+#include "common/backports.h"
 #include "common/func_traits.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
@@ -15,6 +18,7 @@
 #include "shader_recompiler/frontend/translate/translate.h"
 #include "shader_recompiler/ir/basic_block.h"
 #include "shader_recompiler/ir/program.h"
+#include "shader_recompiler/recompiler_toggles.h"
 #include "shader_recompiler/runtime_info.h"
 
 namespace Shader::Backend::SPIRV {
@@ -152,6 +156,35 @@ Id TypeId(const EmitContext& ctx, IR::Type type) {
 }
 
 void Traverse(EmitContext& ctx, const IR::Program& program) {
+    // tlg: loop budgets (recompiler_toggles.h, from the SotC native port). Each loop header
+    // charges one iteration to an invocation-wide counter and to the loop's own counter, which
+    // starts over when the loop exits; the back edge is only taken while both stay under their
+    // budgets. The counters are Private variables (registers), so the cost is an add and a
+    // compare per iteration.
+    const u32 loop_budget = Toggles::LoopBudget();
+    const u32 per_loop_budget = Toggles::PerLoopBudget();
+    std::unordered_map<const IR::Block*, Id> header_counters; // loop header -> own counter
+    std::unordered_map<const IR::Block*, Id> merge_counters;  // loop merge -> own counter
+    const auto new_counter = [&] {
+        const Id ptr_type{ctx.TypePointer(spv::StorageClass::Private, ctx.U32[1])};
+        const Id counter{
+            ctx.AddGlobalVariable(ptr_type, spv::StorageClass::Private, ctx.u32_zero_value)};
+        ctx.interfaces.push_back(counter); // SPIR-V 1.4+: every global used by the entry point
+        return counter;
+    };
+    Id loop_counter{};
+    const auto get_loop_counter = [&] {
+        if (!Sirit::ValidId(loop_counter)) {
+            loop_counter = new_counter();
+            ctx.Name(loop_counter, "tlg_loop_budget");
+        }
+        return loop_counter;
+    };
+    const auto increment = [&](Id counter) {
+        const Id count{ctx.OpLoad(ctx.U32[1], counter)};
+        ctx.OpStore(counter, ctx.OpIAdd(ctx.U32[1], count, ctx.ConstU32(1U)));
+    };
+
     IR::Block* current_block{};
     for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
         switch (node.type) {
@@ -162,8 +195,19 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
             }
             current_block = node.data.block;
             ctx.AddLabel(label);
+            // A loop exited here: its own budget starts over the next time it is entered
+            // (stored after the block's OpPhi instructions, which must come first).
+            const auto reset_it = merge_counters.find(node.data.block);
+            bool reset_pending = reset_it != merge_counters.end();
             for (IR::Inst& inst : node.data.block->Instructions()) {
+                if (reset_pending && inst.GetOpcode() != IR::Opcode::Phi) {
+                    ctx.OpStore(reset_it->second, ctx.u32_zero_value);
+                    reset_pending = false;
+                }
                 EmitInst(ctx, &inst);
+            }
+            if (reset_pending) {
+                ctx.OpStore(reset_it->second, ctx.u32_zero_value);
             }
             ctx.first_to_last_label_map[label.value] = ctx.last_label;
             break;
@@ -180,6 +224,16 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
             const Id continue_label{node.data.loop.continue_block->Definition<Id>()};
             const Id endloop_label{node.data.loop.merge->Definition<Id>()};
 
+            if (loop_budget != 0) {
+                // The header runs once per iteration (still in the header block here).
+                increment(get_loop_counter());
+                if (per_loop_budget != 0 && current_block) {
+                    const Id own{new_counter()};
+                    header_counters[current_block] = own;
+                    merge_counters[node.data.loop.merge] = own;
+                    increment(own);
+                }
+            }
             ctx.OpLoopMerge(endloop_label, continue_label, spv::LoopControlMask::MaskNone);
             ctx.OpBranch(body_label);
             break;
@@ -199,6 +253,18 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
             Id cond{ctx.Def(node.data.repeat.cond)};
             const Id loop_header_label{node.data.repeat.loop_header->Definition<Id>()};
             const Id merge_label{node.data.repeat.merge->Definition<Id>()};
+            if (loop_budget != 0) {
+                const Id count{ctx.OpLoad(ctx.U32[1], get_loop_counter())};
+                cond = ctx.OpLogicalAnd(ctx.U1[1], cond,
+                                        ctx.OpULessThan(ctx.U1[1], count, ctx.ConstU32(loop_budget)));
+                if (const auto it = header_counters.find(node.data.repeat.loop_header);
+                    it != header_counters.end()) {
+                    const Id own_count{ctx.OpLoad(ctx.U32[1], it->second)};
+                    cond = ctx.OpLogicalAnd(
+                        ctx.U1[1], cond,
+                        ctx.OpULessThan(ctx.U1[1], own_count, ctx.ConstU32(per_loop_budget)));
+                }
+            }
             ctx.OpBranchConditional(cond, loop_header_label, merge_label);
             break;
         }
@@ -396,6 +462,16 @@ void DefineEntryPoint(const Info& info, EmitContext& ctx, Id main) {
         execution_model = spv::ExecutionModel::GLCompute;
         ctx.AddExecutionMode(main, spv::ExecutionMode::LocalSize, workgroup_size[0],
                              workgroup_size[1], workgroup_size[2]);
+        // tlg: BP06 (SotC 8d84cf7). GCN code reduces values across the lanes of a wave (DPP
+        // shuffles, v_readlane) after loops whose trip count differs per lane and expects every
+        // lane to take part again once the loop is over; Vulkan only guarantees that with
+        // maximal reconvergence. The flag is set only when the user asked for it AND the device
+        // exposes the extension and feature (see Instance::CreateDevice).
+        if (ctx.profile.supports_maximal_reconvergence) {
+            ctx.AddExtension("SPV_KHR_maximal_reconvergence");
+            ctx.AddExecutionMode(main, spv::ExecutionMode::MaximallyReconvergesKHR);
+            Common::Backports::Hit(Common::Backports::Id::MaximalReconvergence);
+        }
         break;
     }
     case SwStage::Vertex:
@@ -429,6 +505,11 @@ void DefineEntryPoint(const Info& info, EmitContext& ctx, Id main) {
         }
         if (info.stores.GetAny(IR::Attribute::Depth)) {
             ctx.AddExecutionMode(main, spv::ExecutionMode::DepthReplacing);
+        } else if (ctx.runtime_info.hw.fs.depth_before_shader) {
+            // tlg: BP12 (shadPS4 7d28d279, #5264). Upstream asserts when the shader also exports
+            // Z; here that case just keeps late tests (no EarlyFragmentTests).
+            ctx.AddExecutionMode(main, spv::ExecutionMode::EarlyFragmentTests);
+            Common::Backports::Hit(Common::Backports::Id::ShadPS4Pr5264);
         }
         break;
     case SwStage::Geometry:

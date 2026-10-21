@@ -73,6 +73,7 @@ struct SwVertexRuntimeInfo {
     u32 step_rate_1;
     u16 vertex_sgpr_offset{};
     u16 instance_sgpr_offset{};
+    bool is_indirect{}; // tlg: BP11 (set only when the backport is on)
     bool tess_emulated_primitive{};
 
     bool operator==(const SwVertexRuntimeInfo& other) const noexcept = default;
@@ -229,6 +230,8 @@ struct HwFragmentRuntimeInfo {
     bool clip_distance_emulation{false};
     /// tlg: writes the object motion vector to MotionVectors::Output.
     bool motion_vectors{false};
+    /// tlg: BP12 (shadPS4 7d28d279, #5264) DEPTH_BEFORE_SHADER asks for early Z tests.
+    bool depth_before_shader{false};
 
     bool operator==(const HwFragmentRuntimeInfo& other) const noexcept {
         return std::ranges::equal(color_buffers, other.color_buffers) &&
@@ -239,6 +242,7 @@ struct HwFragmentRuntimeInfo {
                dual_source_blending == other.dual_source_blending &&
                clip_distance_emulation == other.clip_distance_emulation &&
                motion_vectors == other.motion_vectors &&
+               depth_before_shader == other.depth_before_shader &&
                std::ranges::equal(inputs.begin(), inputs.begin() + num_inputs, other.inputs.begin(),
                                   other.inputs.begin() + num_inputs);
     }

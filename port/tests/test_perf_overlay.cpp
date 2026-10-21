@@ -34,7 +34,7 @@ int main() {
     s.ram_total_gb = 31.9;
     s.vram_used_gb = 5.4;
     s.vram_total_gb = 12.0;
-    assert(P::Format(s, P::DefaultItems, true) == "238 FPS   4.2 ms   FSR 3.1");
+    assert(P::Format(s, P::DefaultItems, true) == "238 FPS   4.2 ms   RTX 4070 87%   VRAM 5.4 / 12.0 GB");
     assert(P::Format(s, P::AllItems, false) ==
            "238 FPS\n4.2 ms\nFSR 3.1\nRTX 4070 87%\nCPU 34%\nRAM 6.1 / 31.9 GB\nVRAM 5.4 / 12.0 GB");
     assert(P::Format(s, P::Cpu | P::Vram, true) == "CPU 34%   VRAM 5.4 / 12.0 GB");
@@ -54,7 +54,11 @@ int main() {
                "overlay_cpu=1\noverlay_ram=0\noverlay_vram=1\noverlay_scale=400\noverlay_corner=2\n"
                "overlay_opacity=-5\noverlay_layout=1\nmenu_tab=3\n";
     }
+#ifdef _WIN32
     _putenv_s("TLG_CONFIG", path);
+#else
+    setenv("TLG_CONFIG", path, 1);
+#endif
     auto& v = TlgSettings::Get();
     assert(v.overlay_items == P::DefaultItems && v.overlay_scale == 100 && v.overlay_corner == 1);
     TlgSettings::Load();

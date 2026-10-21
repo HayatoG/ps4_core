@@ -1,3 +1,4 @@
+#include "tlg_perf_trace.h"
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -60,7 +61,19 @@ struct PageManager::Impl {
     static constexpr size_t NUM_ADDRESS_LOCKS = NUM_ADDRESS_PAGES / PAGES_PER_LOCK;
     inline static Vulkan::Rasterizer* rasterizer;
 
-    Impl() = default;
+    Impl() {
+#if defined(__linux__) && defined(MADV_FREE)
+        // tlg: cached_pages is one zero counter pair per 4 KiB of the 40-bit address space (512
+        // MiB) and is value-initialized, which commits all of it. Hand the untouched part back to
+        // the kernel: MADV_FREE only drops the pages under memory pressure, and a page dropped
+        // that way faults back in zeroed, which is exactly what the counters hold (they are all
+        // zero and any page written afterwards is never dropped). The locks cannot be freed this
+        // way (their mutexes are initialized to non-zero bytes).
+        const VAddr base = reinterpret_cast<VAddr>(cached_pages.data());
+        const VAddr first = Common::AlignUp(base, PM_PAGE_SIZE);
+        ::madvise(reinterpret_cast<void*>(first), sizeof(cached_pages) - (first - base), MADV_FREE);
+#endif
+    }
     virtual ~Impl() = default;
 
     virtual void OnMap(VAddr address, size_t size) {
@@ -123,9 +136,18 @@ struct PageManager::Impl {
 
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
         const auto start = std::chrono::steady_clock::now();
+        const bool write = Common::IsWriteError(context);
+        const auto rip = TlgPerf::Enabled() ? reinterpret_cast<std::uintptr_t>(Common::GetRip(context)) : 0;
+        const auto site = rip >= 0x800000000ULL && rip < 0x810000000ULL ? rip - 0x800000000ULL : 0;
+        TlgPerf::Span perf_fault{TlgPerf::Kind::FaultBegin, TlgPerf::Kind::FaultEnd, site, write};
         const auto addr = reinterpret_cast<VAddr>(fault_address);
+        if (perf_fault.Id()) {
+            TlgPerf::Event e;e.kind=TlgPerf::Kind::FaultContext;e.operation=perf_fault.Id();
+            e.object=TlgPerf::Hash(addr);e.a=site;e.b=write;
+            TlgPerf::Emit(e);
+        }
         const bool handled = HandleGuestFault(context, addr);
-        ProfileFault(context, addr, Common::IsWriteError(context),
+        ProfileFault(context, addr, write,
                      static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                          std::chrono::steady_clock::now() - start).count()));
         return handled;

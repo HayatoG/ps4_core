@@ -16,6 +16,7 @@
 #include "core/emulator_settings.h"
 #include "core/signals.h"
 #include "shader_recompiler/info.h"
+#include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/ir/ir_emitter.h"
 #include "shader_recompiler/ir/opcodes.h"
 #include "shader_recompiler/ir/passes/srt.h"
@@ -835,8 +836,17 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
             inst && inst->GetOpcode() == IR::Opcode::ReadFirstLane) {
             continue;
         }
-        ASSERT_MSG(IsReadConstSource(base->Arg(0)), "ReadConst base low not from constant memory");
-        ASSERT_MSG(IsReadConstSource(base->Arg(1)), "ReadConst base high not from constant memory");
+        // tlg: a ReadConst pattern this pass does not know (new area of inFAMOUS, 2026-10-15) used
+        // to abort the whole game. The shader is reported and refused instead: the pipeline cache
+        // marks it failed and the draws that use it are skipped.
+        if (!IsReadConstSource(base->Arg(0)) || !IsReadConstSource(base->Arg(1))) {
+            const auto message = fmt::format(
+                "shader {:#018x} ({}): ReadConst base {} not from constant memory",
+                program.info.pgm_hash, program.info.hw_stage,
+                IsReadConstSource(base->Arg(0)) ? "high" : "low");
+            LOG_ERROR(Render_Recompiler, "tlg: FlattenExtendedUserdataPass: {}", message);
+            throw Shader::UnsupportedShaderError(message);
+        }
 
         IR::Inst* ptr_lo = base->Arg(0).Inst();
         ptr_lo = pass_info.DeduplicateInstruction(ptr_lo);

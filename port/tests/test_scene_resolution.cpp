@@ -11,9 +11,13 @@
 #include "video_core/renderer_vulkan/vk_scene_resolution.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include <vk_mem_alloc.h>
+#include "vulkan_test_driver.h"
 
 int main() {
     using namespace Vulkan;
+    if (SkipWithoutVulkanDriver()) {
+        return 0;
+    }
     Instance instance(0, false);
     // Calls emitted by this executable use a local dispatcher. libtlggpu.so initializes
     // its own default dispatcher while constructing Instance.

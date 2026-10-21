@@ -22,7 +22,15 @@
 #   PR #15 3727fde SSE4A). Mesclados em 3 vias com base fd78ad5 / 3-way merged on base fd78ad5 (sem conflito
 #   fora do VENDOR.txt: as duas listas ficaram / no conflict except VENDOR.txt: both lists kept); novos / new:
 #   vk_frame_record.*, test_isa_sse4a.c, scripts/frame_diff.py. Fora / not taken: launcher, infamous_run.*, README, CI.
-~/decomp/infamous_pc origin/main 2b82d72b51bc224eb018c844675f0881cfe78fc1
+# + 21/10/2026 (branch sync/ports-2026-10-21): infamous_pc origin/main fb7e452 (PR #318). port-newer/port-only
+#   copiados / copied; diverged mesclados em 3 vias com base 6b668a0 / 3-way merged on base 6b668a0.
+#   Fora (do jogo) / not taken (game-specific): tlg_view.*, view_hook.h e install_view_tuning do probe.c,
+#   menu de distância de visão (fica só o MipLodBias genérico), modo sensor do grafite (mira do mouse,
+#   sensor_aim, guia), tools/xpps, shader_index.py, controller_guides, testes do launcher, launcher.spec,
+#   package.sh (ISS_SPEC_*). recompiler_toggles.h: padrão por serial (CUSA00223) trocado por desligado; o perfil
+#   do inFAMOUS liga TLG_LDS_SMALL/MULTI/READLANE e TLG_LANE_DIVERGENCE. Mapa de botões do mouse: o do núcleo.
+#   + equivalente a feat/new-renderer 2cbcb28 (RLIMIT_NOFILE) no probe.c; c314e70 (gpu_v2) fora.
+~/decomp/infamous_pc origin/main fb7e45238c063bb7d467da5eb84a67f5b3bc144d
 
 # Do TLG (PR #12 mesclado) / from TLG (after PR #12):
 # + 4a375f0, 7f8fb85 pós-processamento / post-processing: postfx_pass.*, smaa*, cas*, post_process.frag,
@@ -34,7 +42,11 @@
 # Mesclados à mão / merged by hand (both sides kept): build.sh, gpu/CMakeLists.txt, tlggpu.cpp, tlggpu.h,
 #   vk_rasterizer.cpp (TLG_SKIP_ADJACENCY kept), vk_scheduler.cpp, avplayer_source.cpp
 # + 14/10/2026, c8f249b (PR #18): só runtime_memory.c (= fix/windows-system-window daqui); o resto é o launcher.
-~/decomp/tlg_pc origin/main c8f249bd950341d6ae8624bebe6bbe545a22f7ff
+# + 21/10/2026, ca72226 (PRs #86, #87): 3dd0230 TLG_RESTART_COMMAND, 6008245 display mode, 0a8ed96 acquire fence,
+#   508ed8e/491f0a0 wave64-ballot-test; o resto da fase 1 veio do inFAMOUS / the rest of phase 1 came from inFAMOUS.
+#   + 08fd9db (PR #88) 91d9a73: cache de shaders -dma / -dma shader cache folder (cache_storage.cpp, shader_cache.py).
+#   Fora / not taken: launcher Qt, tlg_patches.py, test_tlg_patches.py.
+~/decomp/tlg_pc origin/main 08fd9db5383f3ee90caf4d2f4dc196a237ec79c1
 
 # GR2 (PR #9 mesclado): nada novo, só atrás / nothing new, only behind (lower_wave64, runtime.c/h,
 # import_names.inc, packaging, probe.c come from infamous).
@@ -42,7 +54,10 @@
 # + branches fora da main / branches not on main: fix/avplayer-stop-join c5b9770 (threads.h Join),
 #   fix/isa-rewrite-sse4a 5c5d84d (o prefixo do jogo ganha do TLG_ no alias_port_environment, .gitignore
 #   com symlinks; o resto é o ISA do iss 3727fde / the rest is iss 3727fde's ISA).
-~/decomp/gr2_pc origin/main 40d0391af30569b0f168c4ca0c6ee92d5e5aaf2d
+# + 21/10/2026, 29a370b (PRs #41, #42, #39): 3331178 loop budgets + test_loop_budget.cpp, 678e18a dois dedos do
+#   mouse / mouse two-finger gesture. BP01-BP12, LDS/SotC e mouse já vieram do inFAMOUS / already came from inFAMOUS.
+#   Fora / not taken: mapa de botões do GR2, chaves A/B só do GR2 (555a8c6), launcher, test_launcher_options.py.
+~/decomp/gr2_pc origin/main 29a370b62cfd67208f500d0e2b1d8b1418a98370
 
 # Upstream (FelipePrado0/gow3_pc), branch upstream/gow3-sync: só a parte de núcleo de 9a6d17c..2a0eac6
 # (os ports copiaram 9a6d17c em 12/10/2026). Ver docs/CHANGELOG.md, 13/10/2026 "upstream".
