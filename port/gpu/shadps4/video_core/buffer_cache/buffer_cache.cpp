@@ -1,3 +1,4 @@
+#include "tlg_perf_trace.h"
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -67,16 +68,28 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
       memory_semaphore{instance} {
-    while (arena_page_bits > MIN_ARENA_PAGE_BITS &&
-           (u64{2} << arena_page_bits) > instance.GetMaxBufferSize()) {
-        --arena_page_bits;
+    // tlg: TLG_MAX_BUFFER_MB lowers the driver's buffer size limit as the arenas see it
+    // (diagnostics: reproduces AMD on Windows 2048, RADV 4095 on any GPU).
+    u64 max_buffer = instance.GetMaxBufferSize();
+    if (const char* forced = std::getenv("TLG_MAX_BUFFER_MB")) {
+        if (const u64 mb = std::strtoull(forced, nullptr, 10)) {
+            max_buffer = std::min<u64>(max_buffer, mb << 20);
+        }
+    }
+    // tlg: with a limit under two full pages (AMD on Windows 2 GiB, RADV ~4 GiB, Intel), pages
+    // are the smallest size and an arena joins as many as the limit allows: one inFAMOUS request
+    // of ~2.4 GiB (the cutscene before the graffiti) crossed three 1 GiB pages and stopped the
+    // game ("cannot span more than two VA arena pages", iss_pc #18).
+    if ((u64{2} << arena_page_bits) > max_buffer) {
+        arena_page_bits = MIN_ARENA_PAGE_BITS;
     }
     arena_page_size = u64{1} << arena_page_bits;
+    max_arena_pages = std::clamp<u64>(max_buffer >> arena_page_bits, 2, 16);
     num_arena_pages = u64{1} << (ADDRESS_SPACE_BITS - arena_page_bits);
-    if (arena_page_bits != MAX_ARENA_PAGE_BITS) {
-        LOG_INFO(Render_Vulkan, "Buffer arenas of {} MiB (driver buffer limit {} MiB)",
-                 arena_page_size >> 20, instance.GetMaxBufferSize() >> 20);
-    }
+    std::printf("GPU: buffer arenas of %llu MiB, up to %llu pages (driver buffer limit %llu MiB)\n",
+                static_cast<unsigned long long>(arena_page_size >> 20),
+                static_cast<unsigned long long>(max_arena_pages),
+                static_cast<unsigned long long>(max_buffer >> 20));
     const vk::BufferCreateInfo probe_ci = {
         .flags =
             vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency,
@@ -158,11 +171,16 @@ void BufferCache::ExtendWriteFault(VAddr device_addr) {
 namespace {
 struct ReadbackStats {
     std::atomic<u64> count{0}, queue_ns{0}, flush_ns{0}, finish_ns{0}, bytes{0};
-    /// Deferred readbacks: recorded, joined, applied by guest threads, stale (fell back to the
-    /// download), guest time from the request to the copy applied, bytes copied.
-    std::atomic<u64> deferred{0}, joined{0}, applied{0}, stale{0}, deferred_ns{0}, deferred_bytes{0};
+    /// Deferred readbacks: recorded, joined, joined without the GPU command thread (applied on
+    /// the faulting thread, TLG_READBACK_LOCAL_JOIN), applied by guest threads, stale (fell back
+    /// to the download), guest time from the request to the copy applied, bytes copied.
+    std::atomic<u64> deferred{0}, joined{0}, local_joined{0}, applied{0}, stale{0}, deferred_ns{0},
+        deferred_bytes{0};
     /// Eager copies: pages copied, used by a fault, gone stale unread, skipped for backoff.
     std::atomic<u64> eager_copied{0}, eager_used{0}, eager_stale{0}, eager_skipped{0};
+    /// Waits for a readback copy tick (WaitReadbackTick): the scheduler's own waits do not
+    /// count them.
+    std::atomic<u64> guest_waits{0}, guest_wait_ns{0};
     std::atomic<s64> window_start{0};
 };
 ReadbackStats& Readbacks() {
@@ -192,11 +210,12 @@ void ReportReadbacks() {
     std::printf("Readback stats (5 s): %llu downloads, queue %.1f ms, flush %.1f ms (GPU finish %.1f ms), %.1f MB\n",
                 static_cast<unsigned long long>(n), r.queue_ns.exchange(0) / 1e6, r.flush_ns.exchange(0) / 1e6,
                 r.finish_ns.exchange(0) / 1e6, r.bytes.exchange(0) / 1048576.0);
-    std::printf("  deferred: %llu recorded, %llu joined, %llu applied, %llu stale (downloaded), "
-                "guest wait %.1f ms, %.1f MB; eager: %llu pages copied, %llu used, %llu stale unread, "
-                "%llu skipped (backoff)\n",
+    std::printf("  deferred: %llu recorded, %llu joined (%llu without the GPU thread), %llu applied, "
+                "%llu stale (downloaded), guest wait %.1f ms, %.1f MB; eager: %llu pages copied, "
+                "%llu used, %llu stale unread, %llu skipped (backoff)\n",
                 static_cast<unsigned long long>(r.deferred.exchange(0)),
                 static_cast<unsigned long long>(r.joined.exchange(0)),
+                static_cast<unsigned long long>(r.local_joined.exchange(0)),
                 static_cast<unsigned long long>(r.applied.exchange(0)),
                 static_cast<unsigned long long>(r.stale.exchange(0)), r.deferred_ns.exchange(0) / 1e6,
                 r.deferred_bytes.exchange(0) / 1048576.0,
@@ -204,9 +223,28 @@ void ReportReadbacks() {
                 static_cast<unsigned long long>(r.eager_used.exchange(0)),
                 static_cast<unsigned long long>(r.eager_stale.exchange(0)),
                 static_cast<unsigned long long>(r.eager_skipped.exchange(0)));
+    std::printf("  waits for a readback copy: %llu, %.1f ms\n",
+                static_cast<unsigned long long>(r.guest_waits.exchange(0)),
+                r.guest_wait_ns.exchange(0) / 1e6);
     std::fflush(stdout);
 }
 } // namespace
+
+// tlg: the waits for a readback copy tick (eager and deferred copies) go straight to the work
+// semaphore, so the scheduler's own tick_wait_ns misses them; they are counted here instead.
+// Scheduler::Wait also submits when the tick has not been (the copies are always submitted when
+// they are recorded, so this is the bounded fallback that keeps the guest from waiting forever).
+void BufferCache::WaitReadbackTick(u64 tick) {
+    const s64 started = ReadbackStatsEnabled() ? NowNs() : 0;
+    // tlg: the semaphore, not scheduler.Wait: this runs on guest threads (faults, write merge),
+    // which must never submit (the tick was flushed when the copy was recorded).
+    scheduler.GetWorkSemaphore()->Wait(tick);
+    if (started) {
+        auto& r = Readbacks();
+        r.guest_waits.fetch_add(1);
+        r.guest_wait_ns.fetch_add(NowNs() - started);
+    }
+}
 
 std::tuple<const Buffer*, VAddr, VAddr> BufferCache::GetReadbackWindow(VAddr device_addr,
                                                                        u64 size) {
@@ -233,8 +271,20 @@ std::tuple<const Buffer*, VAddr, VAddr> BufferCache::GetReadbackWindow(VAddr dev
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
+    TlgPerf::Span trace_read{TlgPerf::Kind::WaitBegin, TlgPerf::Kind::WaitEnd,
+                            TlgPerf::Label("buffer_readback"), is_write ? 1ULL : 0ULL};
+    const auto trace_operation = trace_read.Id();
+    const auto trace_origin = TlgPerf::Enabled() ? TlgPerf::Hash(device_addr) : 0;
+    if (trace_operation) {
+        TlgPerf::Event e; e.kind=TlgPerf::Kind::ResourceRead; e.operation=trace_operation;
+        e.object=trace_origin; e.a=size; e.generation=is_write; TlgPerf::Emit(e);
+    }
     const s64 queued_at = ReadbackStatsEnabled() ? NowNs() : 0;
-    const auto flush_request = [this, device_addr, size, is_write, queued_at] {
+    const auto flush_request = [this, device_addr, size, is_write, queued_at,trace_operation,trace_origin] {
+        if (trace_operation) {
+            TlgPerf::Event e; e.kind=TlgPerf::Kind::ReadbackApply;e.operation=trace_operation;
+            e.object=trace_origin;e.a=size;e.generation=is_write;TlgPerf::Emit(e);
+        }
         const s64 started_at = queued_at ? NowNs() : 0;
         const auto [arena, window_start, window_end] = GetReadbackWindow(device_addr, size);
         DownloadMemory(arena, window_start, window_end - window_start);
@@ -256,20 +306,33 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         // tlg: the GPU command thread only records the copy and goes on with the game's
         // commands; this thread waits for the copy, as it would for the GPU on a console.
         std::shared_ptr<DeferredReadback> readback;
-        liverpool->SendCommand<true>([&] {
-            readback = StartDeferredReadback(device_addr, size);
-            if (!readback && is_write) {
-                // Nothing to copy back, as when DownloadMemory finds nothing.
-                memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+        if (LocalReadbackJoin()) {
+            // Join an already-recorded copy without sending another GPU command.
+            readback = PendingDeferredReadback(device_addr, size);
+            if (readback && queued_at) {
+                Readbacks().local_joined.fetch_add(1);
             }
-        });
+        }
+        if (!readback) {
+            liverpool->SendCommand<true, true>([&] {
+                if (trace_operation) {
+                    TlgPerf::Event e; e.kind=TlgPerf::Kind::ReadbackApply;e.operation=trace_operation;
+                    e.object=trace_origin;e.a=size;e.generation=is_write;TlgPerf::Emit(e);
+                }
+                readback = StartDeferredReadback(device_addr, size);
+                if (!readback && is_write) {
+                    // Nothing to copy back, as when DownloadMemory finds nothing.
+                    memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+                }
+            });
+        }
         if (readback && !FinishDeferredReadback(*readback, true)) {
             // The GPU (or a CPU write without a fault) changed the memory after the copy was
             // recorded: download it the old way, which first recovers the stale copy's ranges.
             if (queued_at) {
                 Readbacks().stale.fetch_add(1);
             }
-            liverpool->SendCommand<true>(flush_request);
+            liverpool->SendCommand<true, true>(flush_request);
         } else if (readback) {
             if (is_write) {
                 // After the data is back; see MarkRegionAsCpuModifiedUnlessGpu.
@@ -282,7 +345,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
             }
         }
     } else {
-        liverpool->SendCommand<true>(flush_request);
+        liverpool->SendCommand<true, true>(flush_request);
     }
 }
 
@@ -559,53 +622,54 @@ void BufferCache::SynchronizeDmaBuffers() {
 const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
     const u64 first_page = first_block >> blocks_per_arena_page_shift;
     const u64 last_page = last_block >> blocks_per_arena_page_shift;
-    ASSERT_MSG(last_page - first_page <= 1,
-               "Buffer request cannot span more than two VA arena pages");
-
-    const auto* first_arena = address_space[first_page];
-    const auto* last_arena = address_space[last_page];
-    if (first_arena == last_arena) {
-        if (!first_arena) {
-            const u64 base_block = Common::AlignDownPow2<u64>(first_block, blocks_per_arena_page);
-            const u64 num_pages = last_page - first_page + 1;
-            const auto* new_arena =
-                &arenas.emplace_back(instance, base_block << block_shift,
-                                     num_pages << arena_page_bits, MemoryType::Sparse);
-            address_space[first_page] = new_arena;
-            address_space[last_page] = new_arena;
+    // Arenas cover contiguous runs of pages: when both ends are in the same one, so is the rest.
+    if (const Buffer* arena = address_space[first_page]; arena && arena == address_space[last_page]) {
+        return arena;
+    }
+    // tlg: the pages the new arena covers: the request plus every arena it touches (an arena may
+    // join several pages, up to the driver's buffer limit).
+    u64 lo = first_page, hi = last_page;
+    for (u64 page = first_page; page <= last_page; ++page) {
+        if (const Buffer* arena = address_space[page]) {
+            lo = std::min<u64>(lo, arena->cpu_addr >> arena_page_bits);
+            hi = std::max<u64>(hi, ((arena->cpu_addr + arena->size_bytes) >> arena_page_bits) - 1);
         }
-        return address_space[first_page];
+    }
+    const u64 num_pages = hi - lo + 1;
+    // Over the driver's limit: the old code built such arenas too (two merged arenas could
+    // exceed it) and drivers accepted them, so warn instead of stopping.
+    if (num_pages > max_arena_pages) {
+        LOG_WARNING(Render, "Arena of {} pages of {} MiB exceeds the driver buffer limit "
+                    "(request {:#x}+{} MiB)", num_pages, arena_page_size >> 20,
+                    first_block << block_shift,
+                    ((last_block - first_block + 1) << block_shift) >> 20);
     }
 
-    LOG_WARNING(Render, "Migrating arena");
-
-    const u64 first_addr = first_arena ? first_arena->cpu_addr : (first_page << arena_page_bits);
-    const u64 first_size = first_arena ? first_arena->size_bytes : arena_page_size;
-    const u64 last_size = last_arena ? last_arena->size_bytes : arena_page_size;
-
-    const u64 base_block = first_addr >> block_shift;
-    const u64 total_size = first_size + last_size;
-    const u64 end_block = (first_addr + total_size) >> block_shift;
-    auto* new_arena = &arenas.emplace_back(instance, first_addr, total_size, MemoryType::Sparse);
-    auto* bind = BindsForArena(new_arena);
-    resident_ranges.ForEachInRange(base_block, end_block, [&](const Backing& backing) {
-        const u64 start = std::max(base_block, backing.start);
-        const u64 end = std::min(end_block, backing.end);
-        bind->binds.push_back(vk::SparseMemoryBind{
-            .resourceOffset = (start - base_block) << block_shift,
-            .size = (end - start) << block_shift,
-            .memory = backing.memory,
-            .memoryOffset = (backing.offset + start - backing.start) << block_shift,
+    bool any_arena = false;
+    for (u64 page = lo; page <= hi; ++page) {
+        any_arena |= address_space[page] != nullptr;
+    }
+    const u64 base_addr = lo << arena_page_bits;
+    const u64 total_size = num_pages << arena_page_bits;
+    auto* new_arena = &arenas.emplace_back(instance, base_addr, total_size, MemoryType::Sparse);
+    if (any_arena) {
+        LOG_WARNING(Render, "Migrating arena ({} pages of {} MiB)", num_pages, arena_page_size >> 20);
+        const u64 base_block = base_addr >> block_shift;
+        const u64 end_block = (base_addr + total_size) >> block_shift;
+        auto* bind = BindsForArena(new_arena);
+        resident_ranges.ForEachInRange(base_block, end_block, [&](const Backing& backing) {
+            const u64 start = std::max(base_block, backing.start);
+            const u64 end = std::min(end_block, backing.end);
+            bind->binds.push_back(vk::SparseMemoryBind{
+                .resourceOffset = (start - base_block) << block_shift,
+                .size = (end - start) << block_shift,
+                .memory = backing.memory,
+                .memoryOffset = (backing.offset + start - backing.start) << block_shift,
+            });
         });
-    });
-
-    u64 base_page = first_addr >> arena_page_bits;
-    for (u32 page = 0; page < (first_size >> arena_page_bits); ++page) {
-        address_space[base_page + page] = new_arena;
     }
-    base_page = last_page;
-    for (u32 page = 0; page < (last_size >> arena_page_bits); ++page) {
-        address_space[base_page + page] = new_arena;
+    for (u64 page = lo; page <= hi; ++page) {
+        address_space[page] = new_arena;
     }
     return new_arena;
 }
@@ -964,7 +1028,7 @@ bool BufferCache::TryEagerRead(VAddr addr, u64 size) {
         offset = it->second.offset;
         tick = it->second.tick;
     }
-    scheduler.GetWorkSemaphore()->Wait(tick);
+    WaitReadbackTick(tick);
     std::scoped_lock lock{eager_mutex};
     const auto it = eager_pages.find(page_addr);
     if (it == eager_pages.end() || !it->second.valid || it->second.tick != tick) {
@@ -998,6 +1062,19 @@ bool BufferCache::DeferredReadbackEnabled() {
     static const bool enabled = [] {
         const char* e = std::getenv("TLG_DEFERRED_READBACK");
         return e && *e == '1' && EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise;
+    }();
+    return enabled;
+}
+
+bool BufferCache::LocalReadbackJoin() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("TLG_READBACK_LOCAL_JOIN");
+        const bool on = env && env[0] == '1';
+        if (on) {
+            // In last_run.log whatever the GPU log level, so a tester's log shows the mode.
+            std::printf("GPU: local readback join on (TLG_READBACK_LOCAL_JOIN=1)\n");
+        }
+        return on;
     }();
     return enabled;
 }
@@ -1059,9 +1136,28 @@ std::shared_ptr<BufferCache::DeferredReadback> BufferCache::StartDeferredReadbac
     return readback;
 }
 
+std::shared_ptr<BufferCache::DeferredReadback> BufferCache::PendingDeferredReadback(
+    VAddr device_addr, u64 size) {
+    if (!deferred_count.load(std::memory_order_acquire)) {
+        return nullptr;
+    }
+    const auto window = GetReadbackWindow(device_addr, size);
+    const VAddr window_start = std::get<1>(window);
+    const VAddr window_end = std::get<2>(window);
+    std::scoped_lock lock{deferred_mutex};
+    for (const auto& readback : deferred_readbacks) {
+        // The same test StartDeferredReadback joins with on the GPU command thread.
+        if (!readback->Done() && !readback->stale && readback->start <= window_start &&
+            window_end <= readback->end) {
+            return readback;
+        }
+    }
+    return nullptr;
+}
+
 bool BufferCache::FinishDeferredReadback(DeferredReadback& readback, bool wait) {
     if (wait) {
-        scheduler.GetWorkSemaphore()->Wait(readback.tick);
+        WaitReadbackTick(readback.tick);
     }
     std::scoped_lock lock{readback.mutex};
     if (readback.applied.load(std::memory_order_acquire)) {
@@ -1195,16 +1291,10 @@ bool BufferCache::CpuWriteMerge(VAddr dst, const void* src, int fill, u64 size) 
         if (!memory->TryWriteBacking(reinterpret_cast<void*>(dst), src, size)) {
             return false;
         }
-    } else {
-        std::array<u8, 4096> chunk;
-        chunk.fill(static_cast<u8>(fill));
-        for (u64 done = 0; done < size;) {
-            const u64 n = std::min<u64>(chunk.size(), size - done);
-            if (!memory->TryWriteBacking(reinterpret_cast<void*>(dst + done), chunk.data(), n)) {
-                return done == 0 ? false : (std::memset(reinterpret_cast<void*>(dst + done), fill, size - done), true);
-            }
-            done += n;
-        }
+    } else if (!memory->FillBacking(reinterpret_cast<void*>(dst), fill, size)) {
+        // Part of the range has no backing: the guest writes it itself. The runs written through
+        // the backing hold the same fill byte, so a partial fill is not lost.
+        return false;
     }
     std::scoped_lock lock{merge_mutex};
     VAddr start = dst, end = dst + size;
@@ -1474,6 +1564,9 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
     // copy below changes image state, so the helper finishes first.
     runtime.BeforeImageAccess();
     Image& image = texture_cache.GetImage(image_id);
+    if (image.info.props.is_bc_decoded) {
+        return false; // tlg: TLG_BC_TINY: decoded texels, not the guest's blocks
+    }
     ASSERT_MSG(device_addr == image.info.guest_address,
                "Texel buffer aliases image subresources {:x} : {:x}", device_addr,
                image.info.guest_address);
@@ -1542,10 +1635,14 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
     };
 
     info.AddWait(signal_sema, signal_tick);
+    // tlg: the submit callback runs inside SubmitExecution, which with TLG_SPLIT_SUBMIT_LOCK=1
+    // holds the queue lock only for its own submit.
+    auto queue_lock = Vulkan::Scheduler::LockQueueInSubmit();
     const auto bind_start = std::chrono::steady_clock::now();
     auto submit_result = instance.GetGraphicsQueue().bindSparse(sparse_info);
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
     const auto elapsed = std::chrono::steady_clock::now() - bind_start;
+    queue_lock = std::unique_lock<std::mutex>{};
     // Sparse binds are reported to get slower the more memory is bound on NVIDIA drivers. Log the
     // slow ones (the first few, then every 32nd) with how much is resident, to confirm the cost.
     if (elapsed >= std::chrono::milliseconds{2}) {

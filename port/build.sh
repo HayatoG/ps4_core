@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd -- "$(dirname -- "$0")"
+# The commit the probe logs on its first line (CI: GITHUB_SHA; local: git, plus "+dirty").
+if [[ -z ${TLG_BUILD_COMMIT:-} ]]; then
+    TLG_BUILD_COMMIT=${GITHUB_SHA:-$(git rev-parse HEAD 2>/dev/null || echo unknown)}
+    TLG_BUILD_COMMIT=${TLG_BUILD_COMMIT:0:12}
+    [[ -z ${GITHUB_SHA:-} ]] && ! git diff --quiet HEAD -- . 2>/dev/null && TLG_BUILD_COMMIT+="+dirty"
+fi
+export TLG_BUILD_COMMIT
 mkdir -p out
 # Windows: MSYS2 CLANG64 (packages in packaging/windows/README.md). The GPU library is static
 # there and CMake links tlg-probe.exe as well; no PGO (GCC-only flags), LTO off by default.
@@ -11,6 +18,14 @@ if [[ -z ${PORT_ENV_PREFIX+x} && -f packaging/port.env ]]; then
 fi
 env_prefix=()
 if [[ -n ${PORT_ENV_PREFIX:-} ]]; then env_prefix=("-DPORT_ENV_PREFIX=\"$PORT_ENV_PREFIX\""); fi
+# Players' names work too (e.g. ISS_LTO=OFF): <PREFIX>LTO / <PREFIX>PGO set TLG_LTO / TLG_PGO.
+for knob in LTO PGO; do
+    game_knob=${PORT_ENV_PREFIX:-}$knob
+    tlg_knob=TLG_$knob
+    if [[ -n ${PORT_ENV_PREFIX:-} && -n ${!game_knob:-} && -z ${!tlg_knob:-} ]]; then
+        export "TLG_$knob=${!game_knob}"
+    fi
+done
 case $(uname -s) in
 MINGW*|MSYS*)
     # shellcheck source=msys2-env.sh
@@ -101,20 +116,28 @@ if [[ ! -f out/libatrac9.a || -n $(find third_party/LibAtrac9/C/src -newer out/l
 fi
 # isa_emulate runs inside guest code: no XMM/YMM.
 "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -mgeneral-regs-only -c src/isa_emulate.c -o out/isa_emulate.o
-"$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -no-pie "${includes[@]}" -I. -Isrc "${env_prefix[@]}" src/probe.c "${runtime[@]}" src/cpu_check.c src/vulkan_smoke.c out/isa_emulate.o src/isa_rewrite.c out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/tlg-probe
-echo "Built $PWD/out/tlg-probe"
-# GPU check for run.sh (live_resolution=auto): links only the Vulkan loader.
-"$CC" -std=c11 -O2 -Wall -Wextra -Werror -Igpu/shadps4 tools/gpu_capabilities.c "${libraries[@]}" -o out/tlg-gpu-capabilities
-if [[ ${1:-} == --test ]]; then
+# --test builds everything, then the unit tests; --test-only reuses the GPU library in out/ and
+# builds and runs only the tests (CI, after the Build step with the same TLG_LTO/TLG_PGO).
+if [[ ${1:-} != --test-only ]]; then
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -no-pie -DTLG_BUILD_COMMIT="\"$TLG_BUILD_COMMIT\"" "${includes[@]}" -I. -Isrc "${env_prefix[@]}" src/probe.c "${runtime[@]}" src/cpu_check.c src/vulkan_smoke.c out/isa_emulate.o src/isa_rewrite.c out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/tlg-probe
+    echo "Built $PWD/out/tlg-probe"
+    # GPU check for run.sh (live_resolution=auto): links only the Vulkan loader.
+    "$CC" -std=c11 -O2 -Wall -Wextra -Werror -Igpu/shadps4 tools/gpu_capabilities.c "${libraries[@]}" -o out/tlg-gpu-capabilities
+fi
+if [[ ${1:-} == --test || ${1:-} == --test-only ]]; then
     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_pad.c "${libraries[@]}" -lm -o out/pad-test
     out/pad-test
     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_pad_map.c "${libraries[@]}" -lm -o out/pad-map-test
     out/pad-map-test
     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror tests/test_mouse_stick.c -lm -o out/mouse-stick-test
     out/mouse-stick-test
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -UNDEBUG tests/test_mouse_touch.c -Isrc -lm -o out/mouse-touch-test
+    out/mouse-touch-test
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -UNDEBUG -pthread "${includes[@]}" -I. -Isrc tests/test_mouse_pad.c "${libraries[@]}" -lm -o out/mouse-pad-test
+    out/mouse-pad-test
     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_runtime.c "${runtime[@]}" out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/runtime-test
     out/runtime-test
-    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc tests/test_file_mods.c -o out/file-mods-test
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I. -Isrc tests/test_file_mods.c -o out/file-mods-test
     out/file-mods-test
     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread "${includes[@]}" -I. -Isrc tests/test_sema.c "${runtime[@]}" out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/sema-test
     out/sema-test
@@ -141,6 +164,9 @@ if [[ ${1:-} == --test ]]; then
     # SSE4A (EXTRQ/INSERTQ): the CPU is the oracle on AMD; elsewhere recorded AMD results.
     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -msse4a -I. -Isrc tests/test_isa_sse4a.c out/isa_rewrite.o out/isa_emulate.o -o out/isa-sse4a-test
     out/isa-sse4a-test
+    # F16C (VCVTPH2PS/VCVTPS2PH, #51): the CPU is the oracle where it has F16C; elsewhere recorded results.
+    "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -mavx -mf16c -I. -Isrc tests/test_isa_f16c.c out/isa_rewrite.o out/isa_emulate.o -o out/isa-f16c-test
+    out/isa-f16c-test
     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -UNDEBUG -I. -Isrc tests/test_cpu_check.c -o out/cpu-check-test
     out/cpu-check-test
     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I. -Isrc tests/test_ngs2.c src/runtime_ngs2.c out/libatrac9.a -lm -o out/ngs2-test

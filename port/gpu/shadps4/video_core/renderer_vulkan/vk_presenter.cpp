@@ -47,6 +47,41 @@
 
 namespace Vulkan {
 
+// tlg: frame stats the presentation threads accumulate and driver.cpp prints (it declares
+// these): the frame-limit wait in PrepareFrame (the GPU falling behind), and the wait for a
+// free presentation frame in GetRenderFrame (the swapchain holding frames).
+std::atomic<u64> g_tlg_frames_ahead_wait_ns{0};
+std::atomic<u64> g_tlg_free_frame_wait_ns{0};
+/// tlg: the wait for the queue lock before presenting (other threads' submissions).
+std::atomic<u64> g_tlg_present_lock_wait_ns{0};
+
+/// tlg: takes the graphics queue lock for a present and counts the wait (TLG_FRAME_STATS).
+static std::unique_lock<std::mutex> LockQueueForPresent() {
+    const auto wait_start = std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> lock{Scheduler::submit_mutex};
+    g_tlg_present_lock_wait_ns.fetch_add(
+        static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - wait_start)
+                             .count()),
+        std::memory_order_relaxed);
+    return lock;
+}
+
+/// tlg: TLG_PRESENT_SKIP_CLEAR=0 clears the whole swapchain image before the blit again, and
+/// filters the blit linearly, as before. Default on: the clear only runs when the blit leaves
+/// part of the swapchain image untouched (letterbox bars).
+static bool SkipPresentClear() {
+    static const bool skip = [] {
+        const char* env = std::getenv("TLG_PRESENT_SKIP_CLEAR");
+        const bool on = !(env && env[0] == '0');
+        if (!on) {
+            std::printf("GPU: present clears the whole swapchain image (TLG_PRESENT_SKIP_CLEAR=0)\n");
+        }
+        return on;
+    }();
+    return skip;
+}
+
 bool CanBlitToSwapchain(const vk::PhysicalDevice physical_device, vk::Format format) {
     const vk::FormatProperties props{physical_device.getFormatProperties(format)};
     return static_cast<bool>(props.optimalTilingFeatures & vk::FormatFeatureFlagBits::eBlitDst);
@@ -120,14 +155,6 @@ static vk::Rect2D FitImage(s32 frame_width, s32 frame_height, s32 swapchain_widt
     return vk::Rect2D{{offset_x, offset_y}, {dst_width, dst_height}};
 }
 
-[[nodiscard]] vk::ImageBlit MakeImageBlitFit(s32 frame_width, s32 frame_height, s32 swapchain_width,
-                                             s32 swapchain_height) {
-    const auto& dst_rect = FitImage(frame_width, frame_height, swapchain_width, swapchain_height);
-
-    return MakeImageBlit(frame_width, frame_height, dst_rect.extent.width, dst_rect.extent.height,
-                         dst_rect.offset.x, dst_rect.offset.y);
-}
-
 // tlg: screenshot capture and ImGui overlays removed; the port presents directly.
 
 Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_)
@@ -159,7 +186,32 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
     TlgOverlay::Init(instance, swapchain.GetSurfaceFormat().format, num_images);
 
-    const bool binary_cache = EmulatorSettingsImpl::Flag("TLG_PIPELINE_BINARIES", true) &&
+    // tlg: first-run shader compilation (vk_precompile.h): the job file the launcher wrote from
+    // the game files compiles once per cache, behind the loading screen, before the game starts.
+    {
+        auto last = std::chrono::steady_clock::now();
+        const bool compiled = rasterizer->GetPipelineCache().PrecompileFirstStart(
+            [&](u32 total) {
+                TlgOverlay::SetLoadingCompile(true);
+                TlgOverlay::SetLoading(true, 0, total);
+                PresentLoadingFrame();
+            },
+            [&](u32 done, u32 total) {
+                const auto now = std::chrono::steady_clock::now();
+                if (now - last < std::chrono::milliseconds(250) && done != total) {
+                    return;
+                }
+                last = now;
+                TlgOverlay::SetLoading(true, done, total);
+                PresentLoadingFrame();
+            });
+        if (compiled) {
+            TlgOverlay::SetLoadingCompile(false);
+            TlgOverlay::SetLoading(false, 0, 0);
+        }
+    }
+
+    const bool binary_cache = EmulatorSettingsImpl::Flag("TLG_PIPELINE_BINARIES", false) &&
                               EmulatorSettings.IsPipelineCacheEnabled();
     const bool capture_only = EmulatorSettingsImpl::Flag("TLG_PIPELINE_BINARY_ISOLATED", false) &&
                               EmulatorSettingsImpl::Flag("TLG_PIPELINE_CAPTURE_ONLY", false);
@@ -614,7 +666,15 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             const u64 tick = recent_frame_ticks.front();
             recent_frame_ticks.pop_front();
             if (recent_frame_ticks.size() == frames_ahead) {
+                // tlg: this is the guest's frame boundary waiting for the GPU: the frame stats
+                // report how much of the flip interval it takes (TLG_FRAME_STATS).
+                const auto wait_start = std::chrono::steady_clock::now();
                 draw_scheduler.Wait(tick);
+                g_tlg_frames_ahead_wait_ns.fetch_add(
+                    static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - wait_start)
+                                         .count()),
+                    std::memory_order_relaxed);
             }
         }
     }
@@ -743,7 +803,7 @@ void Presenter::PresentLoadingFrame() {
     info.AddSignal(swapchain.GetPresentReadySemaphore());
     present_scheduler.Flush(info);
     {
-        std::scoped_lock submit_lock{Scheduler::submit_mutex};
+        const auto submit_lock = LockQueueForPresent();
         swapchain.Present();
     }
     // A few frames a second during start-up: waiting keeps semaphores and the swapchain simple.
@@ -834,21 +894,33 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                 .subresourceRange = color_range,
             },
         };
+        // tlg: the fit rect covers the whole swapchain image when the window and the game share
+        // the aspect (the common case): the black clear then writes only pixels the blit
+        // overwrites, so it and its barrier are skipped. A blit that lands texel for texel is
+        // exact with nearest filtering (and cheaper) instead of linear.
+        const vk::Rect2D fit = FitImage(frame->width, frame->height, extent.width, extent.height);
+        const bool full = fit.offset.x == 0 && fit.offset.y == 0 &&
+                          fit.extent.width == extent.width && fit.extent.height == extent.height;
+        const bool one_to_one = fit.extent.width == u32(frame->width) &&
+                                fit.extent.height == u32(frame->height);
         cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
                                vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
                                {}, {}, pre_barriers);
-        const vk::ClearColorValue black{std::array<float, 4>{0.0f, 0.0f, 0.0f, 1.0f}};
-        cmdbuf.clearColorImage(swapchain_image, vk::ImageLayout::eTransferDstOptimal, black, color_range);
-        const vk::MemoryBarrier clear_done{
-            .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
-            .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
-        };
-        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer,
-                               vk::DependencyFlagBits::eByRegion, clear_done, {}, {});
+        if (!(full && SkipPresentClear())) {
+            const vk::ClearColorValue black{std::array<float, 4>{0.0f, 0.0f, 0.0f, 1.0f}};
+            cmdbuf.clearColorImage(swapchain_image, vk::ImageLayout::eTransferDstOptimal, black, color_range);
+            const vk::MemoryBarrier clear_done{
+                .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+                .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
+            };
+            cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer,
+                                   vk::DependencyFlagBits::eByRegion, clear_done, {}, {});
+        }
         cmdbuf.blitImage(frame->image, vk::ImageLayout::eTransferSrcOptimal, swapchain_image,
                          vk::ImageLayout::eTransferDstOptimal,
-                         MakeImageBlitFit(frame->width, frame->height, extent.width, extent.height),
-                         vk::Filter::eLinear);
+                         MakeImageBlit(frame->width, frame->height, fit.extent.width,
+                                       fit.extent.height, fit.offset.x, fit.offset.y),
+                         one_to_one ? vk::Filter::eNearest : vk::Filter::eLinear);
         // tlg: the settings menu / FPS counter over the frame, at display resolution.
         const bool overlay = TlgOverlay::Visible();
         const std::array post_barriers{
@@ -910,11 +982,14 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     scheduler.Flush(info);
 
     // Present to swapchain.
+    bool recreate = false;
     {
-        std::scoped_lock submit_lock{Scheduler::submit_mutex};
-        if (!swapchain.Present() && window.GetWidth() != 0 && window.GetHeight() != 0) {
-            swapchain.Recreate(window.GetWidth(), window.GetHeight());
-        }
+        const auto submit_lock = LockQueueForPresent();
+        recreate = !swapchain.Present() && window.GetWidth() != 0 && window.GetHeight() != 0;
+    }
+    if (recreate) {
+        // Out of date: rebuild outside the present lock (Create takes the queue lock itself).
+        swapchain.Recreate(window.GetWidth(), window.GetHeight());
     }
 
     free_frame();
@@ -927,8 +1002,16 @@ Frame* Presenter::GetRenderFrame() {
     // Wait for free presentation frames
     Frame* frame;
     {
+        const auto wait_start = std::chrono::steady_clock::now();
         std::unique_lock lock{free_mutex};
         free_cv.wait(lock, [this] { return !free_queue.empty(); });
+        // tlg: every frame without a free slot is a frame the swapchain still holds: the frame
+        // stats report the wait (TLG_FRAME_STATS).
+        g_tlg_free_frame_wait_ns.fetch_add(
+            static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - wait_start)
+                                 .count()),
+            std::memory_order_relaxed);
         LOG_DEBUG(Render_Vulkan, "Got render frame, remaining {}", free_queue.size() - 1);
 
         // Take the frame from the queue
@@ -945,6 +1028,7 @@ Frame* Presenter::GetRenderFrame() {
     };
 
     // Wait for the presentation to be finished so all frame resources are free
+    const auto fence_start = std::chrono::steady_clock::now();
     while (wait() != vk::Result::eSuccess) {
         ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
                    "Device lost during waiting for a frame");
@@ -953,6 +1037,13 @@ Frame* Presenter::GetRenderFrame() {
             continue;
         }
     }
+    // tlg: waitForFences is untimed today; the frame stats show how long the fence of the
+    // frame being reused still took (TLG_FRAME_STATS).
+    g_tlg_free_frame_wait_ns.fetch_add(
+        static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - fence_start)
+                             .count()),
+        std::memory_order_relaxed);
 
     if (frame->width != expected_frame_width || frame->height != expected_frame_height ||
         frame->is_hdr != swapchain.GetHDR()) {

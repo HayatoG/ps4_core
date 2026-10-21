@@ -10,6 +10,9 @@ from patches import (compile_patches, external_patches, external_selection, comp
 
 TLG = ROOT / 'patches/God_of_War_III_Remastered.xml'
 TLG_IDS = {'CUSA01623'}
+# The God of War III patch file left with the rest of the GoW3 assets (pre-publication cleanup);
+# the tests that read its patches run only if a tree still has it.
+needs_tlg = unittest.skipUnless(TLG.is_file(), f'{TLG.name} not in this tree (GoW3 assets removed)')
 SEGMENTS = [(0, 0x6000000)]
 
 
@@ -59,6 +62,7 @@ class GameProfileTests(unittest.TestCase):
         self.assertIsNone(game_profile('CUSA99999'))
         self.assertIsNone(game_profile(None))
 
+    @needs_tlg
     def test_tlg_defaults_and_extras(self):
         self.assertEqual(selected_patches(TLG, '01.02', ''),
                          ['Bug Fix - Texture Corruption Fix', 'Skip Any Video With X Button'])
@@ -69,6 +73,7 @@ class GameProfileTests(unittest.TestCase):
         self.assertEqual(selected_patches(TLG, '01.02', 'Skip Any Video With X Button', only=True), ['Skip Any Video With X Button'])
         self.assertEqual(selected_patches(TLG, '01.02', '', only=True), [])
 
+    @needs_tlg
     def test_tlg_resolution_patch_replaces_texture_fix(self):
         self.assertEqual(selected_patches(TLG, '01.02', 'Resolution Patch - 4K'),
                          ['Skip Any Video With X Button', 'Resolution Patch - 4K'])
@@ -104,10 +109,12 @@ class GameProfileTests(unittest.TestCase):
             self.assertFalse(game_patchable(folder))  # no param.sfo: unknown game
             self.assertFalse(game_patchable(None))
 
+    @needs_tlg
     def test_tlg_patches_compile(self):
         names = [m.get('Name') for m in ET.parse(TLG).getroot().iter('Metadata')]
         self.assertTrue(compile_patches(TLG, names, '01.02', SEGMENTS))
 
+    @needs_tlg
     def test_tlg_skip_intro_targets(self):
         # Ported from the other 01.02 build: every jump must land where this eboot has the code.
         writes = dict(compile_patches(TLG, ['Skip Intro'], '01.02', SEGMENTS))
@@ -134,6 +141,7 @@ class GameProfileTests(unittest.TestCase):
             at = text['offset'] + offset - text['vaddr']
             self.assertEqual(bytes(elf[at:at + len(value) // 2]).hex(), value, hex(offset))
 
+    @needs_tlg
     def test_requirements_from_patch_notes(self):
         # Notes ask for extra direct memory (shadPS4 "DMEM") and a VBlank rate.
         self.assertEqual(patch_requirements(TLG, ['Resolution Patch - 4K', 'Skip Any Video With X Button'], '01.02'),

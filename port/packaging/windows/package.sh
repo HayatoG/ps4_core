@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Builds dist/$PORT_SLUG-windows-x86_64.zip after `bash build.sh` in an MSYS2 CLANG64 shell:
-# "$PORT_NAME.exe" (the launcher, frozen with PyInstaller so players need no Python),
+# "$PORT_NAME.exe" (the Qt Quick launcher) and "$PORT_NAME (classic).exe" (the Tk launcher),
+# both frozen with PyInstaller (packaging/launcher.spec) so players need no Python, Qt or Tk,
 # "Play $PORT_NAME.exe" (starts the game with the saved settings), out/tlg-probe.exe with
 # the CLANG64 DLLs it loads, the preparation scripts and the player README. No game or console
 # file may ship. Freezing uses a Windows Python 3.10+ (python.org or actions/setup-python;
@@ -25,16 +26,18 @@ export USERPROFILE=${USERPROFILE:-$(cygpath -w "/c/Users/$(id -un)")}
 if [[ ! -x out/pyenv/Scripts/python.exe ]]; then
     "$python" -m venv out/pyenv
 fi
-out/pyenv/Scripts/python.exe -m pip install -q --disable-pip-version-check pyinstaller iced-x86==1.21.0
+out/pyenv/Scripts/python.exe -m pip install -q --disable-pip-version-check pyinstaller iced-x86==1.21.0 "$PORT_QT_PACKAGE"
 hidden=()
 for module in argparse base64 collections hashlib json re shutil struct tempfile xml.etree.ElementTree \
-              urllib.request runpy ctypes.wintypes msvcrt iced_x86; do
-    hidden+=(--hidden-import "$module")
+              urllib.request runpy sqlite3 mmap multiprocessing multiprocessing.pool dataclasses array bisect random time typing ctypes.wintypes msvcrt iced_x86; do
+    hidden+=("$module")
 done
-out/pyenv/Scripts/python.exe -m PyInstaller --noconfirm --clean --log-level WARN --windowed \
-    --name "$PORT_NAME" --icon "$(cygpath -w "$PWD/launcher/$PORT_ICON.ico")" --distpath out/pyi-dist \
-    --workpath out/pyi-work --specpath out/pyi-work --paths "$(cygpath -w "$PWD/scripts")" \
-    --paths "$(cygpath -w "$PWD/launcher")" "${hidden[@]}" "$(cygpath -w "$PWD/launcher/$PORT_LAUNCHER")"
+# One folder, two launchers sharing their libraries; native Windows paths go to the spec in the
+# environment (it joins them with pathlib), the icon is the same .ico as before.
+ISS_SPEC_NAME=$PORT_NAME ISS_SPEC_ROOT=$(cygpath -w "$PWD") ISS_SPEC_ICON=$(cygpath -w "$PWD/launcher/$PORT_ICON.ico") \
+ISS_SPEC_QT=$PORT_LAUNCHER ISS_SPEC_TK=$PORT_LAUNCHER_CLASSIC ISS_SPEC_HIDDEN="${hidden[*]}" \
+    out/pyenv/Scripts/python.exe -m PyInstaller --noconfirm --clean --log-level WARN \
+    --distpath out/pyi-dist --workpath out/pyi-work "$(cygpath -w "$PWD/packaging/launcher.spec")"
 
 dest=out/stage/$name
 rm -rf -- out/stage
@@ -68,11 +71,20 @@ while ((${#queue[@]})); do
 done
 echo "Packaged $(find "$dest/out" -maxdepth 1 -iname '*.dll' | wc -l) DLLs from /clang64/bin"
 cp -r scripts "$dest/"
+cp -r patches "$dest/"
+# The shader list generator (scripts/build_jobs.py imports it from ../tools): plain files, like scripts/.
+mkdir -p "$dest/tools"
+cp -r tools/xpps "$dest/tools/"
 find "$dest" -name __pycache__ -prune -exec rm -r {} +
 cp LICENSE packaging/README-player.md "$dest/"
+# The release name (vYYYY.MM.DD-<commit>, as the CI publishes it): the launcher shows it and compares it with the latest release.
+if [[ -n ${GITHUB_SHA:-} ]]; then printf 'v%s-%s\n' "$(date -u +%Y.%m.%d)" "${GITHUB_SHA::7}" > "$dest/VERSION"; fi
 printf '%s\r\n' 'Este jogo não precisa de módulos do firmware do console: a pasta fica vazia.' \
     'This game needs no console firmware modules: leave this folder empty.' > "$dest/system_lib/LEIA-ME.txt"
 bash packaging/check_package.sh "$dest"
+# Only these hashed package files may be replaced by the in-place updater.
+if [[ ! -f "$dest/VERSION" ]]; then git rev-parse --short HEAD > "$dest/VERSION"; fi
+out/pyenv/Scripts/python.exe launcher/update_install.py --manifest "$dest" "$(tr -d '\r\n' < "$dest/VERSION")"
 mkdir -p dist
 rm -f "dist/$name.zip"
 (cd out/stage && powershell -NoProfile -Command "Compress-Archive -Path '$name' -DestinationPath '../../dist/$name.zip'")

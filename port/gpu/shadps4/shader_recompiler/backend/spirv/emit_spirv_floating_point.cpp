@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/backports.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 
@@ -148,12 +149,22 @@ Id EmitFPSqrt(EmitContext& ctx, Id value) {
 Id EmitFPSaturate32(EmitContext& ctx, Id value) {
     const Id zero{ctx.ConstF32(f32{0.0})};
     const Id one{ctx.ConstF32(f32{1.0})};
+    if (Common::Backports::On(Common::Backports::Id::SaturateNan)) {
+        // tlg: BP05 (shadPS4 #5257): NaN saturates to 0 like HLSL/DX10_CLAMP (FClamp is
+        // undefined for NaN). NClamp(x, lo, hi) == NMin(NMax(x, lo), hi).
+        Common::Backports::Hit(Common::Backports::Id::SaturateNan);
+        return ctx.OpNMin(ctx.F32[1], ctx.OpNMax(ctx.F32[1], value, zero), one);
+    }
     return ctx.OpFClamp(ctx.F32[1], value, zero, one);
 }
 
 Id EmitFPSaturate64(EmitContext& ctx, Id value) {
     const Id zero{ctx.Constant(ctx.F64[1], f64{0.0})};
     const Id one{ctx.Constant(ctx.F64[1], f64{1.0})};
+    if (Common::Backports::On(Common::Backports::Id::SaturateNan)) {
+        Common::Backports::Hit(Common::Backports::Id::SaturateNan);
+        return ctx.OpNMin(ctx.F64[1], ctx.OpNMax(ctx.F64[1], value, zero), one);
+    }
     return ctx.OpFClamp(ctx.F64[1], value, zero, one);
 }
 

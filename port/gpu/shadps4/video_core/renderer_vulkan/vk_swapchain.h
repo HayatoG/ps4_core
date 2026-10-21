@@ -23,6 +23,7 @@ public:
     ~Swapchain();
 
     /// Creates (or recreates) the swapchain with a given size.
+    /// tlg: holds the graphics queue lock across the rebuild.
     void Create(u32 width, u32 height);
 
     /// Recreates the swapchain with a given size and current surface.
@@ -106,7 +107,9 @@ private:
     /// Sets the surface properties according to device capabilities
     void SetSurfaceProperties();
 
-    /// Destroys current swapchain resources
+    /// Destroys current swapchain resources.
+    /// tlg: the caller holds the graphics queue lock: the device is waited on here and the
+    /// swapchain resources are destroyed while other threads may submit.
     void Destroy();
 
     /// Performs creation of image views and framebuffers from the swapchain images

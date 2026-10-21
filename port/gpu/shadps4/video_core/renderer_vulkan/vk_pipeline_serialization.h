@@ -45,5 +45,11 @@ void RegisterShaderMeta(const Shader::Info& info,
                         const std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
                         const Shader::StageSpecialization& spec, size_t perm_hash, size_t perm_idx);
 void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx);
+/// tlg: reads a .meta blob (false: another format or recompiler version, or a motion shader).
+bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
+                    std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
+                    Shader::StageSpecialization& spec, size_t& perm_idx);
+/// tlg: the binary version written in .meta files (recompiler and option salts included).
+u32 ShaderBinaryVersionForCache();
 
 } // namespace Vulkan

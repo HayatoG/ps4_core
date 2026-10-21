@@ -34,16 +34,22 @@ int main(void) {
     assert(cpu_missing_fatal((CpuFeatureWords){0, 0, 0}, out, 8) == 3 && strlen(out) < 8);
     /* TLG_ISA_REWRITE values. */
     int valid;
-    assert(cpu_sets_named("1", &valid) == (CPU_SET_MOVBE | CPU_SET_BMI1 | CPU_SET_LZCNT | CPU_SET_SSE4A) && valid);
+    assert(cpu_sets_named("1", &valid) == (CPU_SET_MOVBE | CPU_SET_BMI1 | CPU_SET_LZCNT | CPU_SET_F16C | CPU_SET_SSE4A) &&
+           valid);
     assert(cpu_sets_named("0", &valid) == 0 && valid && cpu_sets_named("", &valid) == 0 && valid);
     assert(cpu_sets_named(NULL, &valid) == 0 && valid);
     assert(cpu_sets_named("sse4a", &valid) == CPU_SET_SSE4A && valid);
     assert(cpu_sets_named("SSE4A,movbe", &valid) == (CPU_SET_SSE4A | CPU_SET_MOVBE) && valid);
     assert(cpu_sets_named("sse4", &valid) == 0 && !valid);
-    assert(cpu_sets_named("f16c", &valid) == 0 && !valid);   /* never emulated */
-    /* The words come from CPUID: the machine running this test is newer than 2013 (SSE4A only on AMD). */
-    assert(cpu_missing_fatal(cpu_feature_words(), out, sizeof out) == 0 &&
-           (cpu_missing_rewritable(cpu_feature_words(), out, sizeof out) & ~CPU_SET_SSE4A) == 0);
+    assert(cpu_sets_named("f16c", &valid) == CPU_SET_F16C && valid);   /* iss_pc #51 */
+    assert(cpu_sets_named("F16C,sse4a", &valid) == (CPU_SET_F16C | CPU_SET_SSE4A) && valid);
+    /* The words come from CPUID: a machine newer than 2013 lacks at most SSE4A (AMD only). An older
+     * host (or a VM hiding AVX) skips this check instead of failing it. */
+    if (cpu_missing_fatal(cpu_feature_words(), out, sizeof out) ||
+        (cpu_missing_rewritable(cpu_feature_words(), out, sizeof out) & ~CPU_SET_SSE4A)) {
+        printf("cpu-check-test ok (SKIP host CPUID check: host lacks %s)\n", out);
+        return 0;
+    }
     puts("cpu-check-test ok");
     return 0;
 }

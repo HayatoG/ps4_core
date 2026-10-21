@@ -1,4 +1,4 @@
-/* Loader side of the ISA rewrite (#33, #66; SSE4A on Intel): reads a G3ISA1 table (scripts/isa_rewrite.py), builds
+/* Loader side of the ISA rewrite (#33, #66; SSE4A on Intel; F16C, iss_pc #51): reads a G3ISA1 table (scripts/isa_rewrite.py), builds
  * one machine-code stub per site in an area next to the image and patches each site with a jmp
  * into its stub (or an int3). The stub saves the guest's registers, calls isa_emulate and jumps
  * back. Runs at load time, before the image is protected; libc is fine here. */

@@ -46,7 +46,7 @@ int main(int argc, char **argv) {
     assert(ajm_mp3_parse_frame((const unsigned char *)"\0\0\0\0",4,1,&frame)==ERR_INVALID_PARAMETER);
     assert(ajm_mp3_parse_frame(mp3,3,1,&frame)==ERR_INVALID_PARAMETER);
 
-    uint32_t ctx, instance;
+    uint32_t ctx = 0, instance = 0;
     assert(ajm_initialize(0,&ctx)==0 && ajm_module_register(ctx,0,0)==0);
     assert(ajm_instance_create(ctx,0,1|(FORMAT_S16<<7),&instance)==0 && ajm_instance_codec(instance)==0);
 

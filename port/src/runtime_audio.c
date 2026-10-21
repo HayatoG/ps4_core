@@ -113,9 +113,12 @@ static ABI int32_t audio_init(void) {
     int32_t r=initialized ? ERR_ALREADY_INIT : 0;
     initialized=1;
     pthread_mutex_unlock(&table_lock);
+    if (runtime_verbose()) printf("Verbose: sceAudioOutInit -> %#x\n",(unsigned)r);
     return r;
 }
 static int32_t open_port(int32_t type, uint32_t length, uint32_t freq, uint32_t param) {
+    if (runtime_verbose() && ((!length || length>2048 || (length & 0xff)) || freq!=48000 || (param & 0xff)>7))
+        printf("Verbose: sceAudioOutOpen refused: type %d, length %u, freq %u, param %#x\n",type,length,freq,param);
     if (!length || length>2048 || (length & 0xff)) return ERR_INVALID_SIZE;
     if (freq!=48000) return ERR_INVALID_FREQ;
     uint32_t format=param & 0xff;
@@ -153,6 +156,7 @@ static int32_t open_port(int32_t type, uint32_t length, uint32_t freq, uint32_t 
     pthread_mutex_unlock(&table_lock);
     printf("Runtime: audio port %d opened (type %d, %d ch, %s, %u frames%s)\n",id,type,p->channels,p->is_float ? "float" : "s16",length,
            p->downmix ? ", downmixed to stereo" : "");
+    if (runtime_verbose()) printf("Verbose: audio port %d: SDL stream %s, format code %u\n",id,p->stream ? "open" : "none (timer sink)",format);
     return (type<<16) | id | 0x20000000;
 }
 static ABI int32_t audio_open(int32_t user, int32_t type, int32_t index, uint32_t length, uint32_t freq, uint32_t param) {

@@ -79,6 +79,24 @@ def module(path):
                 sha256=hashlib.sha256(source).hexdigest(), missing=missing)
 
 
+def local_tls(symbol, addend, has_tls):
+    """A DTPMOD64 relocation this linker can resolve: the module's own TLS block (unnamed
+    STT_TLS symbol, no addend). The libc.prx of older SDKs (inFAMOUS base 1.00) also points at
+    other modules' thread-local symbols, which needs the console's dynamic linker."""
+    return not symbol['name'] and symbol['type'] == 3 and not addend and has_tls
+
+
+def external_tls_relocations(m):
+    """How many TLS relocations of module m are not local_tls (0 = linkable)."""
+    has_tls = any(p['type'] == 7 for p in m['ph'])
+    return sum(1 for _, kind, symid, addend in m['relocs']
+               if kind == 16 and not local_tls(m['symbols'][symid], addend, has_tls))
+
+
+class ExternalTlsError(ValueError):
+    """The module is from an SDK this linker does not support (see local_tls)."""
+
+
 # `mov r64, fs:[0]` for any register: 64, REX.W (48/4c), 8b, ModRM mod=00 rm=100 (SIB), SIB 25, disp32 0.
 FS_LOAD_ANY = re.compile(rb'\x64[\x48\x4c]\x8b[\x04\x0c\x14\x1c\x24\x2c\x34\x3c]\x25\x00\x00\x00\x00')
 
@@ -160,9 +178,9 @@ def link(game, out, module_names=DEFAULT_MODULES):
             if kind == 8:
                 relocs.append((target, 0, base + addend, 0))
             elif kind == 16:
-                symbol = m['symbols'][symid]
-                if symbol['name'] or symbol['type'] != 3 or addend or not module_id:
-                    raise ValueError(f'{filename}: unsupported external TLS relocation')
+                if not local_tls(m['symbols'][symid], addend, bool(module_id)):
+                    raise ExternalTlsError(f'{filename}: unsupported external TLS relocation '
+                                           f'(module from an older SDK: use the one from the game update)')
                 struct.pack_into('<Q', image, target, module_id)
                 tls_relocations += 1
             elif kind in (1, 6, 7):

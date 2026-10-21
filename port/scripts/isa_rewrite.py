@@ -4,9 +4,11 @@ scan_segment decodes one executable segment with iced-x86 and classifies each
 site: JMP (5+ bytes, patched with a jump to a stub), JMP_RELOCATE (4 bytes,
 the jump also covers the plain next instruction, copied into the stub), INT3
 (4 bytes, trapped at run time) or UNSUPPORTED (an encoding the stubs do not
-emulate: segment override, LOCK, 32-bit addressing, F16C, MOVNTSS or MOVNTSD).
+emulate: segment override, LOCK, 32-bit addressing, EVEX F16C, MOVNTSS or MOVNTSD).
 SSE4A EXTRQ/INSERTQ keep their XMM numbers in dst/src1 and, in the immediate
-forms, length | index << 8 in disp.
+forms, length | index << 8 in disp. F16C VCVTPH2PS/VCVTPS2PH (VEX, iss_pc #51) keep
+their XMM/YMM numbers in dst/src1, the vector size in bytes (16 or 32) in width and
+the VCVTPS2PH rounding immediate in imm.
 
 Usage: isa_rewrite.py out/boot-linked.bin --out out [--red-zone]
 Reads the G3PROBE5 image, scans its executable segments and writes
@@ -33,10 +35,13 @@ except ImportError:
  KIND_BLSI, KIND_BLSMSK, KIND_BLSR, KIND_VCVTPH2PS, KIND_VCVTPS2PH,
  KIND_EXTRQ, KIND_EXTRQ_IMM, KIND_INSERTQ, KIND_INSERTQ_IMM, KIND_MOVNTSS, KIND_MOVNTSD) = range(1, 18)
 MODE_JMP, MODE_JMP_RELOCATE, MODE_INT3, MODE_UNSUPPORTED = range(4)
+# The VEX F16C forms the stubs emulate, with their vector size in bytes (the EVEX forms are AVX-512).
+F16C_VEX = {Code.VEX_VCVTPH2PS_XMM_XMMM64: 16, Code.VEX_VCVTPH2PS_YMM_XMMM128: 32,
+            Code.VEX_VCVTPS2PH_XMMM64_XMM_IMM8: 16, Code.VEX_VCVTPS2PH_XMMM128_YMM_IMM8: 32} if iced_x86 else {}
 MEM_RELOCATED_FAULTABLE = 2
 NO_REG = 0xFF
 HEADER = struct.Struct('<8sQ32sIIQ')                # magic, image size, sha256, sites, unsupported, red-zone bytes
-RECORD = struct.Struct('<QBBBBBBBBBBBB4xq15sB15sx')  # mirrors IsaSite in the C loader
+RECORD = struct.Struct('<QBBBBBBBBBBBBB3xq15sB15sx')  # mirrors IsaSite in the C loader
 SET_OF_KIND = {KIND_MOVBE_LOAD: 'MOVBE', KIND_MOVBE_STORE: 'MOVBE', KIND_LZCNT: 'LZCNT',
                KIND_TZCNT: 'BMI1', KIND_ANDN: 'BMI1', KIND_BEXTR: 'BMI1', KIND_BLSI: 'BMI1',
                KIND_BLSMSK: 'BMI1', KIND_BLSR: 'BMI1', KIND_VCVTPH2PS: 'F16C', KIND_VCVTPS2PH: 'F16C',
@@ -63,6 +68,7 @@ class Site:
     disp: int
     original: bytes
     relocated: bytes
+    imm: int = 0    # VCVTPS2PH rounding control (imm8)
 
 
 def kind_of(ins):
@@ -95,9 +101,13 @@ def site_of(ins, kind, original):
             mem_slot = 1 if i == 0 else 2
     if SET_OF_KIND[kind] in ('F16C', 'SSE4A'):
         width = 0
+    imm = 0
+    if SET_OF_KIND[kind] == 'F16C':
+        width = F16C_VEX.get(ins.code, 0)
+        imm = ins.immediate8 if kind == KIND_VCVTPS2PH else 0
     base = index = NO_REG
     scale = mem_flags = disp = 0
-    unsupported = (SET_OF_KIND[kind] == 'F16C' or kind in (KIND_MOVNTSS, KIND_MOVNTSD)
+    unsupported = ((SET_OF_KIND[kind] == 'F16C' and not width) or kind in (KIND_MOVNTSS, KIND_MOVNTSD)
                    or ins.segment_prefix != Register.NONE or ins.has_lock_prefix)
     if kind in (KIND_EXTRQ_IMM, KIND_INSERTQ_IMM):
         disp = ins.immediate8 | ins.immediate8_2nd << 8   # field length, bit index
@@ -110,8 +120,11 @@ def site_of(ins, kind, original):
             base, index = register_number(ins.memory_base), register_number(ins.memory_index)
             disp = ins.memory_displacement  # iced reports it as u64; the table stores int64
             disp -= (1 << 64) if disp >= 1 << 63 else 0
+    if SET_OF_KIND[kind] == 'F16C' and ins.len < 5:
+        unsupported = True          # no VEX F16C encoding is that short; the int3 path has no YMM state
     mode = MODE_UNSUPPORTED if unsupported else MODE_JMP if ins.len >= 5 else MODE_INT3
-    return Site(ins.ip, ins.len, kind, width, mode, *regs, mem_slot, base, index, scale, mem_flags, disp, original, b'')
+    return Site(ins.ip, ins.len, kind, width, mode, *regs, mem_slot, base, index, scale, mem_flags, disp, original, b'',
+                imm)
 
 
 def is_plain(ins, end):
@@ -172,7 +185,7 @@ def encode_table(image, sites, red_zone_section=b'', digest=None):
     table = [HEADER.pack(b'G3ISA1\0\0', len(image), digest, len(sites), unsupported, len(red_zone_section))]
     for s in sorted(sites, key=lambda s: s.offset):   # the C loader rejects records out of order
         table.append(RECORD.pack(s.offset, s.length, s.kind, s.width, s.mode, s.dst, s.src1, s.src2, s.mem_slot,
-                                 s.base, s.index, s.scale, s.mem_flags, s.disp, s.original, len(s.relocated),
+                                 s.base, s.index, s.scale, s.mem_flags, s.imm, s.disp, s.original, len(s.relocated),
                                  s.relocated))
     table.append(red_zone_section)
     return b''.join(table)

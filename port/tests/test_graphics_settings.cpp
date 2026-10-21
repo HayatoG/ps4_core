@@ -21,13 +21,23 @@ static std::string Read(const char* path) {
     return s.str();
 }
 
+// An empty value removes the variable, as _putenv_s does.
+static void SetEnv(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    if (*value) setenv(name, value, 1);
+    else unsetenv(name);
+#endif
+}
+
 int main() {
     assert(G::ParseDisplayMode("borderless") == G::Borderless && G::ParseDisplayMode("bogus") == G::Windowed);
     assert(G::ParseFpsLimit(240) == 240 && G::ParseFpsLimit(75) == 0);
     assert(G::ParseResolution("1440p") == 3 && G::ParseResolution("8K") == 0);
     assert(G::ParseEngineFps(240) == 240 && G::ParseEngineFps(90) == 120);
     assert(G::ParseFramesQueued(2) == 2 && G::ParseFramesQueued(0) == 0 && G::ParseFramesQueued(5) == 1);
-    assert(G::ParseRcasStrength(100) == 100 && G::ParseRcasStrength(101) == 75 && G::ParseRcasStrength(-1) == 75);
+    assert(G::ParseRcasStrength(100) == 100 && G::ParseRcasStrength(101) == 60 && G::ParseRcasStrength(-1) == 60);
     assert(G::RcasAttenuation(100) == 0.0f && G::RcasAttenuation(0) == 2.0f && G::RcasAttenuation(75) == 0.5f);
     assert(G::ParseRcasStrength(101, 50) == 50 && G::CasSharpness(100) == 1.0f && G::CasSharpness(-3) == 0.5f);
     assert(G::ClampColor(G::Gamma, 9.0f) == 2.0f && G::ClampColor(G::Contrast, 0.1f) == 0.5f);
@@ -49,8 +59,8 @@ int main() {
                "smaa=1\ncas=1\ncas_strength=30\ncolor_adjust=1\ncolor_brightness=0.10\n"
                "color_contrast=1.20\ncolor_saturation=0.80\ncolor_gamma=9\n";
     }
-    _putenv_s("TLG_CONFIG", path);
-    _putenv_s("TLG_ASYNC_SHADERS", "");
+    SetEnv("TLG_CONFIG", path);
+    SetEnv("TLG_ASYNC_SHADERS", "");
     auto& v = TlgSettings::Get();
     // Filters on the final image are off by default.
     assert(!v.smaa && !v.cas && !v.color_adjust && v.cas_strength == 50 && v.color_gamma == 1.0f);
@@ -62,10 +72,10 @@ int main() {
     assert(v.brightness == 0.10f && v.contrast == 1.20f && v.saturation == 0.80f);
     assert(!TlgSettings::GraphicsNeedRestart());
     assert(v.applied_engine_fps == 240);  // no TLG_ENGINE_FPS: the configured rate
-    _putenv_s("TLG_ENGINE_FPS", "60");    // run.py: the frame rate patch did not apply
+    SetEnv("TLG_ENGINE_FPS", "60");    // run.py: the frame rate patch did not apply
     TlgSettings::Load();
     assert(v.engine_fps == 240 && v.applied_engine_fps == 60 && !TlgSettings::GraphicsNeedRestart());
-    _putenv_s("TLG_ENGINE_FPS", "");
+    SetEnv("TLG_ENGINE_FPS", "");
     v.engine_fps = 120;
     assert(TlgSettings::GraphicsNeedRestart());
     v.fps_limit = 60;  // live: no restart because of it
@@ -88,11 +98,11 @@ int main() {
         out << "display_mode=huge\nfps_limit=7\nrender_resolution=8K\nengine_fps=1\n"
                "rcas_strength=250\nframes_queued=9\n";
     }
-    _putenv_s("TLG_ASYNC_SHADERS", "1");  // the environment still wins at start
+    SetEnv("TLG_ASYNC_SHADERS", "1");  // the environment still wins at start
     v.async_shaders = false;
     TlgSettings::Load();
     assert(v.display_mode == G::Windowed && v.fps_limit == 0 && v.render_resolution == 0 && v.engine_fps == 120);
-    assert(v.rcas_strength == 75 && v.frames_queued == 1);
+    assert(v.rcas_strength == 60 && v.frames_queued == 1);
     assert(v.async_shaders);
     {
         std::ofstream out(path);
@@ -103,6 +113,18 @@ int main() {
     const std::string cheats = Read(path);
     assert(cheats.find("cheat_double_jumps=1\n") != std::string::npos);
     assert(cheats.find("cheat_very_hard=1\n") != std::string::npos);
+    {
+        std::ofstream out(path);
+        out << "bp06=1\nbp12=0\nwqm=0\nbc_tiny=1\nbp99=1\n";
+    }
+    TlgSettings::Load();
+    assert(v.backport_pref[5] == 1 && v.backport_pref[11] == 0 && v.backport_pref[0] == -1);
+    TlgSettings::Save();
+    const std::string fixes = Read(path);
+    for (const char* line : {"bp06=1\n", "bp12=0\n", "wqm=0\n", "bc_tiny=1\n"}) {
+        assert(fixes.find(line) != std::string::npos);
+    }
+    assert(fixes.find("bp01=") == std::string::npos && fixes.find("bp99") == std::string::npos);
     std::remove(path);
     std::puts("PASS: graphics settings");
 }

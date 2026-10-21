@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
+#include <time.h>
 #include "runtime.h"
 #include "cpu_check.h"
 #include "isa_rewrite.h"
@@ -828,9 +829,83 @@ static void alias_port_environment(void) {
 static void alias_port_environment(void) {}
 #endif
 
+/* Detailed log mode (ISS_VERBOSE_LOG=1 or 2, copied to TLG_VERBOSE_LOG above): turns on the
+ * bounded trace switches that are safe together and asks the GPU log for debug (1) or trace (2).
+ * A variable the player already set is never overwritten. Switches left off on purpose, because
+ * they change behavior or are heavy single-subsystem debugging: TLG_IMPORT_TRACE (reroutes every
+ * import call through a stub), TLG_WRITE_LOG (ring buffer plus scans on every GPU write),
+ * TLG_REGION_TRACE (writes a file), TLG_DEBUG_MOTION (draws a debug overlay), TLG_SCENE_DEBUG
+ * (dumps frames and deletes the trigger file). */
+static void verbose_default(const char *name, const char *value, char *list, size_t size) {
+    if (getenv(name)) return;
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 0);
+#endif
+    size_t used = strlen(list);
+    snprintf(list + used, size - used, "%s%s=%s", used ? ", " : "", name, value);
+}
+static void apply_verbose_log(void) {
+    const char *mode = getenv("TLG_VERBOSE_LOG");
+    const int level = mode ? atoi(mode) : 0;
+    if (level <= 0) return;
+    char list[512] = "";
+    verbose_default("TLG_GPU_LOG", level >= 2 ? "trace" : "debug", list, sizeof list);
+    verbose_default("TLG_AUDIO_TRACE", "1", list, sizeof list);        /* 400 lines: sound opens, Ajm */
+    verbose_default("TLG_MOD_TRACE", "1", list, sizeof list);          /* 32 lines, only with TLG_MODS_DIR */
+    verbose_default("TLG_OCCLUSION_LOG", "1", list, sizeof list);      /* first 48 events, then 1 in 2000 */
+    verbose_default("TLG_MOTION_SELECT_LOG", "1", list, sizeof list);  /* one line per G-buffer shader */
+    verbose_default("TLG_PIPELINE_LOG", "1", list, sizeof list);       /* one line per pipeline built */
+    if (level >= 2) {
+        verbose_default("TLG_TRACE_SEMA", "1", list, sizeof list);     /* capped at 2000 lines by the runtime */
+        verbose_default("TLG_JSON_LOG", "1", list, sizeof list);       /* sce::Json serialize results */
+        verbose_default("TLG_MOUSE_LOG", "1", list, sizeof list);      /* 4 lines/s while the mouse is used */
+        verbose_default("TLG_RECORDER_TRACE", "1", list, sizeof list); /* top callers every 2000 recordings */
+    }
+    printf("Verbose log: on (level %d); switches: %s\n", level, list[0] ? list : "(all already set by the user)");
+}
+/* Detailed log mode: boot step with the time since the first one (ms). */
+static void boot_step(const char *what) {
+    if (!runtime_verbose()) return;
+    static struct timespec start;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (!start.tv_sec && !start.tv_nsec) start = now;
+    printf("Verbose: boot step '%s' at +%ld ms\n", what,
+           (long)((now.tv_sec - start.tv_sec) * 1000 + (now.tv_nsec - start.tv_nsec) / 1000000));
+}
+
+#ifdef __linux__
+#include <sys/resource.h>
+/* Raise the open-file limit (soft to hard) on Linux: the game, its modules, the pipeline cache and
+ * the shader files can pass the usual 1024 soft limit (iss_pc 2cbcb28 did this in the launcher;
+ * here it covers every way the probe is started). */
+static void raise_open_file_limit(void) {
+    struct rlimit limit;
+    if (getrlimit(RLIMIT_NOFILE, &limit) != 0 || limit.rlim_cur >= limit.rlim_max) return;
+    const rlim_t before = limit.rlim_cur;
+    limit.rlim_cur = limit.rlim_max == RLIM_INFINITY ? (rlim_t)1 << 20 : limit.rlim_max; /* nr_open */
+    if (limit.rlim_cur <= before) return;
+    if (setrlimit(RLIMIT_NOFILE, &limit) == 0)
+        printf("Open-file limit: %llu -> %llu\n", (unsigned long long)before, (unsigned long long)limit.rlim_cur);
+    else
+        printf("Open-file limit: %llu (could not raise to %llu)\n", (unsigned long long)before,
+               (unsigned long long)limit.rlim_max);
+}
+#endif
+
+#ifndef TLG_BUILD_COMMIT
+#define TLG_BUILD_COMMIT "unknown"
+#endif
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     alias_port_environment();
+    apply_verbose_log();
+    boot_step("start");
+#ifdef __linux__
+    raise_open_file_limit();
+#endif
 #ifndef _WIN32
     /* Keep host heap objects handed to the guest (thread handles, TLS) in the
        non-PIE brk heap, i.e. below 1 TiB: the guest packs pointers into 40 bits. */
@@ -882,15 +957,26 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Usage: %s boot.bin [--cpu-only] [--strict-imports] [--check-imports] [--content-profile file] [--app0 dir] [--user dir] [--patches file] [--isa-rewrite file] [--mount guest=host]... [--timeout seconds] | --vulkan-only | --cpu-features | --gamepad\n", argv[0]);
         return 1;
     }
+    {
+        /* The first log line says which build and which game this is (players often can't tell
+         * which zip they ran, or which dump: only CUSA00223 1.07 is supported). */
+        char path[4096], serial[32] = "?", version[32] = "?";
+        snprintf(path, sizeof(path), "%s/sce_sys/param.sfo", app0 ? app0 : ".");
+        sfo_value(path, "TITLE_ID", serial, sizeof(serial), NULL);
+        sfo_value(path, "APP_VER", version, sizeof(version), NULL);
+        printf("Build: %s (built %s %s); game %s %s; threads inherit the creator's MXCSR/x87 control\n",
+               TLG_BUILD_COMMIT, __DATE__, __TIME__, serial, version);
+    }
     if (!cpu_supported(missing, sizeof missing)) return 20;
     if (cpu_missing_sets) printf("CPU: missing %s\n", missing);
-    /* TLG_ISA_REWRITE=0 never rewrites, =1 rewrites every emulated site (MOVBE, BMI1, LZCNT, SSE4A: a
-     * test on a complete CPU; F16C left out, its sites are never emulated and inFAMOUS has 13), a list
-     * such as "sse4a" or "movbe,bmi1" rewrites those sets; by default the sets the CPU lacks. */
+    boot_step("cpu check done");
+    /* TLG_ISA_REWRITE=0 never rewrites, =1 rewrites every emulated site (MOVBE, BMI1, LZCNT, F16C, SSE4A:
+     * a test on a complete CPU), a list such as "sse4a", "f16c" or "movbe,bmi1" rewrites those sets; by
+     * default the sets the CPU lacks. */
     const char *policy = getenv("TLG_ISA_REWRITE");
     int policy_valid;
     const unsigned isa_forced = cpu_sets_named(policy, &policy_valid);
-    if (!policy_valid) printf("ISA: TLG_ISA_REWRITE=%s ignored (use 0, 1 or a list of movbe, bmi1, lzcnt, sse4a)\n", policy);
+    if (!policy_valid) printf("ISA: TLG_ISA_REWRITE=%s ignored (use 0, 1 or a list of movbe, bmi1, lzcnt, f16c, sse4a)\n", policy);
     const int forced = isa_forced != 0;
     unsigned isa_sets = forced ? isa_forced | cpu_missing_sets : policy && !strcmp(policy, "0") ? 0 : cpu_missing_sets;
     if (cpu_missing_sets && !isa_sets) {
@@ -940,6 +1026,7 @@ int main(int argc, char **argv) {
         if (sfo_value(sfo,"INSTALL_DIR_SAVEDATA",id,sizeof(id),NULL) || sfo_value(sfo,"TITLE_ID",id,sizeof(id),NULL))
             runtime_savedata_configure(id);
     }
+    boot_step("content mounted");
     tlggpu_register_kernel();
 #ifdef _WIN32
     SYSTEM_INFO system_info; GetSystemInfo(&system_info); page_size = system_info.dwPageSize;
@@ -986,7 +1073,9 @@ int main(int argc, char **argv) {
     import_count = read64(f);
     uint64_t capabilities = memcmp(magic, "G3PROBE1", 8) ? read64(f) : 0;
     if (capabilities & ~UINT64_C(1)) fail("unknown runtime capabilities");
+    boot_step("boot file read, starting runtime");
     runtime_start(strict_imports ? 0 : capabilities);
+    boot_step("runtime started");
     if (!size || size > 512*1024*1024 || entry >= size || !ns || ns > 64 || nr > 1000000 || import_count > 100000)
         fail("boot file limits exceeded");
     int multi=!memcmp(magic,"G3PROBE5",8);
@@ -1105,7 +1194,7 @@ int main(int argc, char **argv) {
         red_zone_on = 0;
     }
     if (!cpu_only) {
-        char title[128]="God of War III", serial[16]="UNKNOWN", sfo[4096];
+        char title[128]="inFAMOUS Second Son", serial[16]="UNKNOWN", sfo[4096];
         uint32_t attributes=0;
         snprintf(sfo,sizeof(sfo),"%s/sce_sys/param.sfo",app0 ? app0 : ".");
         sfo_value(sfo,"TITLE",title,sizeof(title),NULL);
@@ -1115,7 +1204,9 @@ int main(int argc, char **argv) {
         if (procparam) memcpy(&sdk,image+procparam+16,8); /* procparam: size, magic, count, sdk_version */
         TlgGpuConfig gpu={title,serial,user_dir ? user_dir : "user",(uint32_t)sdk,attributes,1920,1080};
         gpu_enabled=1; /* page tracking starts while the rasterizer registers guest memory */
+        boot_step("initializing GPU");
         if (tlggpu_init(&gpu)) fail("GPU initialization failed");
+        boot_step("GPU ready");
         printf("GPU: window and Vulkan presenter ready; SDK 0x%08x, %u HLE symbols\n",(unsigned)sdk,tlggpu_symbol_count());
     }
     unsigned char *traps = allocate(round_page((import_count + 1) * 32));
@@ -1219,6 +1310,7 @@ int main(int argc, char **argv) {
     }
     if (!executable_entry) fail("entry is not executable");
     printf("Mapped %" PRIu64 " bytes, %" PRIu64 " segments; applied %" PRIu64 " relocations\n", size, ns, nr);
+    boot_step("image mapped and relocated");
     if (native_libc) {
         for (uint64_t m=0;m<module_count;++m) {
             int init_executable=0;
@@ -1246,7 +1338,14 @@ int main(int argc, char **argv) {
         unsigned seconds = freeze && *freeze ? (unsigned)strtoul(freeze, NULL, 10) : 10;
         runtime_freeze_start((uintptr_t)image, round_page(size) + stub_area + red_zone_area, gpu_enabled ? seconds : 0);
     }
+    boot_step("entering the game");
     printf("Entering original x86-64 code at guest offset 0x%" PRIx64 "\n", entry);
+#ifdef _WIN32
+    /* The guest main thread starts with the PS4's (FreeBSD's) x87 control word: 64-bit
+     * precision (0x037F, as on Linux). Windows' default is 53-bit (0x027F). Threads the game
+     * creates copy the creator's x87 and SSE control words (runtime_thread.c host_start). */
+    { const uint16_t cw = 0x037F; __asm__ volatile("fldcw %0" : : "m"(cw)); }
+#endif
     entered_game=1;
     struct { uint64_t argc; const char *argv[2]; } params = {1, {"/app0/eboot.bin", NULL}};
 #ifdef _WIN32

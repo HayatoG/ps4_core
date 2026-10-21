@@ -6,6 +6,7 @@
 #include <xxhash.h>
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
+#include "vulkan_test_driver.h"
 
 // Match the library's Vulkan-Hpp dispatcher layout, then enable test assertions.
 #undef NDEBUG
@@ -274,7 +275,9 @@ int main(int argc, char** argv) {
     _set_error_mode(_OUT_TO_STDERR);
 #endif
     if (argc == 3 && std::string_view(argv[1]) == "--gpu") {
-        TestRealDriver(argv[2]);
+        if (!SkipWithoutVulkanDriver()) {
+            TestRealDriver(argv[2]);
+        }
         return 0;
     }
     using namespace Vulkan::PipelineBinaryCache;

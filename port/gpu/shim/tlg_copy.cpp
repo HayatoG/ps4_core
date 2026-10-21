@@ -50,9 +50,18 @@ public:
         return !threads.empty();
     }
 
+    // Same test as WaitAll's early return. Takes the lock: only asked while tracing.
+    bool HasPending() {
+        std::scoped_lock lk{mutex};
+        return pending != 0 || epochs.size() > 1 || draining;
+    }
+
     void Async(std::function<void()> task) {
         {
             std::scoped_lock lk{mutex};
+            // Before the counters move: a WaitAll() that reads the flag must not return on a
+            // task queued while it was reading.
+            idle.store(false, std::memory_order_release);
             const u64 epoch = epoch_base + epochs.size() - 1;
             ++epochs.back().pending;
             ++pending;
@@ -64,6 +73,7 @@ public:
     void AfterCopies(std::function<void()> callback) {
         {
             std::unique_lock lk{mutex};
+            idle.store(false, std::memory_order_release);
             if (epochs.size() > 1 || epochs.back().pending != 0 || draining) {
                 // Runs once every copy issued so far is done, in order with earlier ones.
                 epochs.back().callbacks.push_back(std::move(callback));
@@ -74,13 +84,24 @@ public:
         callback();
     }
 
+    /// tlg: true when WaitAll() would return at once (nothing issued, no callback waiting).
+    /// Read without `mutex`: the frame presents and every fence call it, and the copy threads
+    /// update their counters in the same cache line as that mutex.
+    bool Idle() const {
+        return idle.load(std::memory_order_acquire);
+    }
+
     void WaitAll() {
+        if (Idle()) {
+            return;
+        }
         // The waiting thread helps instead of only spinning.
         while (true) {
             Task task;
             {
                 std::scoped_lock lk{mutex};
                 if (pending == 0 && epochs.size() == 1 && !draining) {
+                    idle.store(true, std::memory_order_release);
                     return;
                 }
                 if (!async_tasks.empty()) {
@@ -153,6 +174,8 @@ private:
             return;
         }
         draining = true;
+        // A waiter must not return while a callback runs here.
+        idle.store(false, std::memory_order_release);
         while (true) {
             std::vector<std::function<void()>> ready;
             while (epochs.size() > 1 && epochs.front().pending == 0) {
@@ -172,6 +195,8 @@ private:
             lk.lock();
         }
         draining = false;
+        // Nothing pending and no queued callback: WaitAll() may return without `mutex` again.
+        idle.store(pending == 0 && epochs.size() == 1, std::memory_order_release);
     }
 
     static void Work(Job& job) {
@@ -222,6 +247,9 @@ private:
     u64 epoch_base = 0;       ///< epoch number of epochs.front()
     std::size_t pending = 0;
     bool draining = false;
+    /// tlg: mirror of `pending == 0 && epochs.size() == 1 && !draining`, written under `mutex`
+    /// whenever the pool stops or starts having work (see WaitAll).
+    std::atomic<bool> idle{true};
 };
 
 Pool& GetPool() {
@@ -239,6 +267,10 @@ thread_local Batch batch;
 
 bool Enabled() {
     return GetPool().Enabled() && !TlgToggle::Disabled(TlgToggle::ParallelCopies);
+}
+
+bool HasPending() {
+    return !batch.items.empty() || GetPool().HasPending();
 }
 
 void Async(std::function<void()> task) {

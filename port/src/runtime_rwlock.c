@@ -17,6 +17,7 @@ typedef struct Rwlock {
     pthread_rwlock_t native;
     Holder *holders;
     unsigned inflight;
+    char name[32];
     struct Rwlock *next;
 } Rwlock;
 typedef struct { int64_t seconds, nanoseconds; } GuestTime;
@@ -43,9 +44,10 @@ static Rwlock *find_locked(Rwlock *handle) {
     for (Rwlock *r=registry; r; r=r->next) if (r==handle) return r;
     return NULL;
 }
-static int create_locked(Rwlock **out) {
+static int create_locked(Rwlock **out,const char *name) {
     Rwlock *r=calloc(1,sizeof(*r));
     if (!r) return ENOMEM;
+    if (name) snprintf(r->name,sizeof(r->name),"%s",name);
     int e=pthread_rwlock_init(&r->native,NULL);
     if (e) { free(r); return e; }
     r->next=registry; registry=r; *out=r; ++created; return 0;
@@ -64,14 +66,13 @@ static ABI int32_t rwattr_destroy(uint64_t **attr) {
     (*attr)[0]=0; free(*attr); *attr=NULL; return 0;
 }
 static ABI int32_t rw_init(Rwlock **out, void *const *attr, const char *name) {
-    (void)name;
     if (!out || (attr && !*attr)) return error(EINVAL);
     if (attr && *(const uint64_t *)*attr!=RWATTR_MAGIC) {
         fputs("STOP: unknown PS4 rwlock attribute object\n",stderr); exit(21);
     }
     pthread_mutex_lock(&registry_lock);
     /* POSIX allows uninitialized storage, so never read *out during init. */
-    int e=create_locked(out);
+    int e=create_locked(out,name);
     pthread_mutex_unlock(&registry_lock); return error(e);
 }
 static void prune_locked(Rwlock *r, Holder *h) {
@@ -81,14 +82,14 @@ static void prune_locked(Rwlock *r, Holder *h) {
     *link=h->next; free(h);
 }
 enum Operation { READ, WRITE, TRY_READ, TRY_WRITE, TIMED_READ, TIMED_WRITE };
-static int32_t acquire(Rwlock **handle, enum Operation op, const GuestTime *time) {
+static int32_t acquire(Rwlock **handle, enum Operation op, const GuestTime *time, uintptr_t frame) {
     if (!handle) return error(EINVAL);
     int writer=op==WRITE || op==TRY_WRITE || op==TIMED_WRITE;
     int attempt=op==TRY_READ || op==TRY_WRITE;
     int timed=op==TIMED_READ || op==TIMED_WRITE;
     pthread_mutex_lock(&registry_lock);
     int e=0;
-    if (!*handle) e=create_locked(handle);
+    if (!*handle) e=create_locked(handle,NULL);
     Rwlock *r=e ? NULL : find_locked(*handle);
     if (!r) { pthread_mutex_unlock(&registry_lock); return error(e ? e : EINVAL); }
     Holder *h=r->holders;
@@ -104,14 +105,24 @@ static int32_t acquire(Rwlock **handle, enum Operation op, const GuestTime *time
     }
     ++r->inflight; ++h->pending;
     pthread_mutex_unlock(&registry_lock);
+    /* Blocking acquires are marked like the mutexes: without it the freeze report shows a thread
+     * waiting on a rwlock as running (the try path returns now and needs no mark). */
+    const char *kind=timed ? (writer ? "rwlock (timed write)" : "rwlock (timed read)")
+                           : (writer ? "rwlock (write)" : "rwlock (read)");
     /* Timed operations first try the lock, matching POSIX timeout validation. */
     if (attempt || timed) e=writer ? pthread_rwlock_trywrlock(&r->native) : pthread_rwlock_tryrdlock(&r->native);
-    else e=writer ? pthread_rwlock_wrlock(&r->native) : pthread_rwlock_rdlock(&r->native);
+    else {
+        runtime_wait_begin(kind,r,r->name,NULL,frame);
+        e=writer ? pthread_rwlock_wrlock(&r->native) : pthread_rwlock_rdlock(&r->native);
+        runtime_wait_end();
+    }
     if (timed && e==EBUSY) {
         if (!time || time->nanoseconds<0 || time->nanoseconds>=1000000000) e=EINVAL;
         else {
             struct timespec deadline={.tv_sec=(time_t)time->seconds,.tv_nsec=(long)time->nanoseconds};
+            runtime_wait_begin(kind,r,r->name,NULL,frame);
             e=writer ? pthread_rwlock_timedwrlock(&r->native,&deadline) : pthread_rwlock_timedrdlock(&r->native,&deadline);
+            runtime_wait_end();
         }
     }
     pthread_mutex_lock(&registry_lock);
@@ -123,12 +134,12 @@ static int32_t acquire(Rwlock **handle, enum Operation op, const GuestTime *time
     prune_locked(r,h);
     pthread_mutex_unlock(&registry_lock); return error(e);
 }
-static ABI int32_t rw_read(Rwlock **r) { return acquire(r,READ,NULL); }
-static ABI int32_t rw_write(Rwlock **r) { return acquire(r,WRITE,NULL); }
-static ABI int32_t rw_tryread(Rwlock **r) { return acquire(r,TRY_READ,NULL); }
-static ABI int32_t rw_trywrite(Rwlock **r) { return acquire(r,TRY_WRITE,NULL); }
-static ABI int32_t rw_timedread(Rwlock **r,const GuestTime *t) { return acquire(r,TIMED_READ,t); }
-static ABI int32_t rw_timedwrite(Rwlock **r,const GuestTime *t) { return acquire(r,TIMED_WRITE,t); }
+static ABI int32_t rw_read(Rwlock **r) { return acquire(r,READ,NULL,RUNTIME_GUEST_FRAME()); }
+static ABI int32_t rw_write(Rwlock **r) { return acquire(r,WRITE,NULL,RUNTIME_GUEST_FRAME()); }
+static ABI int32_t rw_tryread(Rwlock **r) { return acquire(r,TRY_READ,NULL,RUNTIME_GUEST_FRAME()); }
+static ABI int32_t rw_trywrite(Rwlock **r) { return acquire(r,TRY_WRITE,NULL,RUNTIME_GUEST_FRAME()); }
+static ABI int32_t rw_timedread(Rwlock **r,const GuestTime *t) { return acquire(r,TIMED_READ,t,RUNTIME_GUEST_FRAME()); }
+static ABI int32_t rw_timedwrite(Rwlock **r,const GuestTime *t) { return acquire(r,TIMED_WRITE,t,RUNTIME_GUEST_FRAME()); }
 static ABI int32_t rw_unlock(Rwlock **handle) {
     if (!handle) return error(EINVAL);
     pthread_mutex_lock(&registry_lock);

@@ -1,3 +1,4 @@
+#include "tlg_perf_trace.h"
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -16,6 +17,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
+#include "common/backports.h"
 #include "common/serdes.h"
 #include "common/scope_exit.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
@@ -27,6 +29,8 @@
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_amd_paths.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "common/hash.h"
+#include "shader_recompiler/recompiler_toggles.h"
 #include "video_core/renderer_vulkan/vk_lighting_test.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -34,8 +38,8 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 7u; // tlg: interpolated integer fix (Pascal)
-static constexpr u32 ShaderMetaVersion = 7u; // tlg: ImageResource::needs_native
+static constexpr u32 ShaderBinaryVersion = 9u; // tlg: LDS barrier scope per guest wave
+static constexpr u32 ShaderMetaVersion = 9u; // tlg: LDS barrier scope per guest wave
 static constexpr u32 PipelineKeyVersion = 5u; // tlg: Info layout (ImageResource::needs_native)
 } // namespace Serialization
 
@@ -43,14 +47,23 @@ namespace Vulkan {
 
 namespace {
 // tlg: the test knobs that change recompiled SPIR-V (TLG_LIGHTING_TEST=dref,
-// TLG_AMD_PATHS_OFF=shaderext) get their own shader binary cache version.
+// TLG_AMD_PATHS_OFF=shaderext) get their own shader binary cache version, and so do the
+// recompiler switches of recompiler_toggles.h (TLG_LDS_SMALL/MULTI/READLANE, TLG_WQM,
+// TLG_LANE_DIVERGENCE, TLG_RFL_ALL): the
+// base and the lighting salt stay below 64.
 u32 CurrentShaderBinaryVersion() {
     return LightingTest::ShaderBinaryVersion(
-        Serialization::ShaderBinaryVersion,
-        LightingTest::ShaderBinarySalt(LightingTest::Current().dref,
-                                       AmdPathsOff::Current().shaderext));
+               Serialization::ShaderBinaryVersion,
+               LightingTest::ShaderBinarySalt(LightingTest::Current().dref,
+                                              AmdPathsOff::Current().shaderext)) +
+           64u * Shader::Toggles::ShaderBinarySalt() +
+           4096u * Common::Backports::ShaderSalt();
 }
 } // namespace
+
+u32 ShaderBinaryVersionForCache() {
+    return CurrentShaderBinaryVersion();
+}
 
 namespace PipelineBinaryCache {
 bool ValidKey(const Key& key) {
@@ -271,23 +284,44 @@ vk::ResultValue<vk::UniquePipeline> CreateCachedGraphicsPipeline(
     using namespace PipelineBinaryCache;
     const auto& dispatch = VULKAN_HPP_DEFAULT_DISPATCHER;
     const bool enabled = global_key.keySize && EmulatorSettings.IsPipelineCacheEnabled();
-    const auto create = [&](vk::PipelineCache used_cache, const auto& used_info, bool restored) {
+    const auto create = [&](vk::PipelineCache used_cache, const auto& used_info, bool restored,
+                            bool retry = true) {
         const auto started = std::chrono::steady_clock::now();
-        auto result = device.createGraphicsPipelineUnique(used_cache, used_info);
+        // One snapshot: feedback is attached and read under the same decision.
+        const bool trace = TlgPerf::Enabled();
+        const u64 trace_key = trace ? std::hash<GraphicsPipelineKey>{}(key) : 0;
+        TlgPerf::Span trace_build{TlgPerf::Kind::CompileBegin, TlgPerf::Kind::CompileEnd,
+                                 trace_key, 'g'};
+        vk::PipelineCreationFeedback feedback{};
+        const vk::PipelineCreationFeedbackCreateInfo feedback_info{
+            .pNext = used_info.pNext, .pPipelineCreationFeedback = &feedback};
+        auto measured_info = used_info;
+        if (trace) measured_info.pNext = &feedback_info;
+        auto result = device.createGraphicsPipelineUnique(used_cache, measured_info);
         // tlg: a failure the driver may recover from is tried again (a binary that failed to
         // restore is compiled instead).
         for (u32 attempt = 1;
-             !restored && result.result != vk::Result::eSuccess &&
+             retry && !restored && result.result != vk::Result::eSuccess &&
              RetryPipelineCreation(result.result, attempt, "graphics",
                                    fmt::format("{:#x}", std::hash<GraphicsPipelineKey>{}(key)));
              ++attempt) {
-            result = device.createGraphicsPipelineUnique(used_cache, used_info);
+            result = device.createGraphicsPipelineUnique(used_cache, measured_info);
+        }
+        if (trace) {
+            TlgPerf::Event e; e.kind = TlgPerf::Kind::PipelineFeedback; e.operation = trace_build.Id();
+            e.object = trace_key;
+            e.b = result.result == vk::Result::eSuccess ? TlgPerf::CacheFeedback(static_cast<unsigned>(feedback.flags)) : 0;
+            e.a = e.b ? feedback.duration : 0;
+            e.generation = 'g'; TlgPerf::Emit(e);
         }
         const auto ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now() - started)
                                 .count());
         extern std::atomic<u64> g_tlg_pipeline_driver_ns;
         g_tlg_pipeline_driver_ns += ns;
+        if (result.result == vk::Result::eSuccess) {
+            g_tlg_driver_pipelines_created.fetch_add(1, std::memory_order_relaxed);
+        }
         if (enabled) {
             (restored ? binary_restore_ns : binary_compile_ns) += ns;
             ++(restored ? binary_restore_calls : binary_compile_calls);
@@ -318,6 +352,12 @@ vk::ResultValue<vk::UniquePipeline> CreateCachedGraphicsPipeline(
     binary_key_ns += ElapsedNs(key_started);
     if (key_result != vk::Result::eSuccess ||
         !ValidKey(global) || !ValidKey(BinaryKey(pipeline_key))) {
+        // tlg: a binary that is skipped used to be counted only: the call name and the VkResult are
+        // what a crash right after it (NVIDIA 595, ISS_PIPELINE_BINARIES) needs (TLG_GPU_LOG=info).
+        LOG_INFO(Render_Vulkan,
+                 "tlg: pipeline binary skipped (vkGetPipelineKeyKHR {}, global key {}, pipeline "
+                 "key {})",
+                 vk::to_string(key_result), global.size(), pipeline_key.keySize);
         ++binary_errors;
         ++binary_misses;
         return create(cache, info, false);
@@ -386,19 +426,34 @@ vk::ResultValue<vk::UniquePipeline> CreateCachedGraphicsPipeline(
                     ++binary_hits;
                     return result;
                 }
+                // tlg: the created pipeline was rejected with binaries (NVIDIA 595 crashed right
+                // after this): name the call and its VkResult (TLG_GPU_LOG=info).
+                LOG_INFO(Render_Vulkan,
+                         "tlg: pipeline binary restore rejected ({} binaries, createGraphicsPipeline "
+                         "result {})",
+                         handles.size(), vk::to_string(result.result));
+            } else {
+                LOG_INFO(Render_Vulkan,
+                         "tlg: pipeline binary restore failed (vkCreatePipelineBinariesKHR {})",
+                         vk::to_string(static_cast<vk::Result>(handles_result)));
             }
             ++binary_rejected;
             destroy();
         }
-    } catch (const std::exception&) {
+    } catch (const std::exception& e) {
+        // tlg: name what failed on the restore path (TLG_GPU_LOG=info).
+        LOG_INFO(Render_Vulkan, "tlg: pipeline binary restore failed: {}", e.what());
         ++binary_errors;
         destroy();
     }
     ++binary_misses;
     flags.flags = vk::PipelineCreateFlags2{static_cast<VkPipelineCreateFlags>(info.flags)} |
                   vk::PipelineCreateFlagBits2::eCaptureDataKHR;
-    auto result = create(nullptr, captured_info, false);
+    // tlg: not retried: a failed capture compile falls back to a plain compile, which is.
+    auto result = create(nullptr, captured_info, false, false);
     if (result.result != vk::Result::eSuccess) {
+        LOG_INFO(Render_Vulkan, "tlg: pipeline binary capture creation failed ({})",
+                 vk::to_string(result.result));
         ++binary_errors;
         return create(cache, info, false);
     }
@@ -415,16 +470,27 @@ vk::ResultValue<vk::UniquePipeline> CreateCachedGraphicsPipeline(
             VK_STRUCTURE_TYPE_PIPELINE_BINARY_CREATE_INFO_KHR};
         binary_info.pipeline = *result.value;
         VkPipelineBinaryHandlesInfoKHR output{VK_STRUCTURE_TYPE_PIPELINE_BINARY_HANDLES_INFO_KHR};
-        if (dispatch.vkCreatePipelineBinariesKHR(device, &binary_info, nullptr, &output) !=
-                VK_SUCCESS ||
-            !output.pipelineBinaryCount || output.pipelineBinaryCount > MaxBinaries) {
+        const auto count_result =
+            dispatch.vkCreatePipelineBinariesKHR(device, &binary_info, nullptr, &output);
+        if (count_result != VK_SUCCESS || !output.pipelineBinaryCount ||
+            output.pipelineBinaryCount > MaxBinaries) {
+            // tlg: the VkResult and the call name of a failed capture (TLG_GPU_LOG=info).
+            LOG_INFO(Render_Vulkan,
+                     "tlg: pipeline binary capture failed (vkCreatePipelineBinariesKHR count {}, "
+                     "binaries {})",
+                     vk::to_string(static_cast<vk::Result>(count_result)),
+                     output.pipelineBinaryCount);
             ++binary_errors;
             return result;
         }
         handles.resize(output.pipelineBinaryCount);
         output.pPipelineBinaries = handles.data();
-        if (dispatch.vkCreatePipelineBinariesKHR(device, &binary_info, nullptr, &output) !=
-            VK_SUCCESS) {
+        const auto handles_result =
+            dispatch.vkCreatePipelineBinariesKHR(device, &binary_info, nullptr, &output);
+        if (handles_result != VK_SUCCESS) {
+            LOG_INFO(Render_Vulkan,
+                     "tlg: pipeline binary capture failed (vkCreatePipelineBinariesKHR {})",
+                     vk::to_string(static_cast<vk::Result>(handles_result)));
             ++binary_errors;
             return result;
         }
@@ -436,18 +502,28 @@ vk::ResultValue<vk::UniquePipeline> CreateCachedGraphicsPipeline(
             vk::PipelineBinaryKeyKHR binary_key;
             size_t size = 0;
             auto* raw_key = reinterpret_cast<VkPipelineBinaryKeyKHR*>(&binary_key);
-            if (dispatch.vkGetPipelineBinaryDataKHR(device, &data_info, raw_key, &size, nullptr) !=
-                    VK_SUCCESS ||
-                !size || size > MaxFileSize || total_size + size > MaxFileSize ||
-                !ValidKey(BinaryKey(binary_key))) {
+            const auto data_result =
+                dispatch.vkGetPipelineBinaryDataKHR(device, &data_info, raw_key, &size, nullptr);
+            if (data_result != VK_SUCCESS || !size || size > MaxFileSize ||
+                total_size + size > MaxFileSize || !ValidKey(BinaryKey(binary_key))) {
+                LOG_INFO(Render_Vulkan,
+                         "tlg: pipeline binary capture failed (vkGetPipelineBinaryDataKHR {}, "
+                         "size {})",
+                         vk::to_string(static_cast<vk::Result>(data_result)), size);
                 ++binary_errors;
                 return result;
             }
             total_size += size;
             Binary binary{BinaryKey(binary_key), std::vector<u8>(size)};
-            if (dispatch.vkGetPipelineBinaryDataKHR(device, &data_info, raw_key, &size,
-                                                    binary.data.data()) != VK_SUCCESS ||
-                size > binary.data.size()) {
+            const auto copy_result =
+                dispatch.vkGetPipelineBinaryDataKHR(device, &data_info, raw_key, &size,
+                                                    binary.data.data());
+            if (copy_result != VK_SUCCESS || size > binary.data.size()) {
+                LOG_INFO(Render_Vulkan,
+                         "tlg: pipeline binary capture failed (vkGetPipelineBinaryDataKHR {}, size "
+                         "{}/{})",
+                         vk::to_string(static_cast<vk::Result>(copy_result)), size,
+                         binary.data.size());
                 ++binary_errors;
                 return result;
             }
@@ -762,6 +838,8 @@ void GraphicsPipeline::SerializationSupport::Serialize(Serialization::Archive& a
     sdata.Write(multisampling);
     sdata.Write(tcs);
     sdata.Write(tes);
+    // tlg: last, so .key files written before it still load (with no discard shader).
+    sdata.Write(fragment);
 }
 
 bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive& ar) {
@@ -773,6 +851,9 @@ bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive&
     sdata.Read(multisampling);
     sdata.Read(tcs);
     sdata.Read(tes);
+    if (!ar.IsEoS()) {
+        sdata.Read(fragment);
+    }
     return true;
 }
 
@@ -882,7 +963,59 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
     return true;
 }
 
+bool PipelineCache::LoadProgramFromCache(u64 hash) {
+    const auto next = next_permutation.find(hash);
+    if (next == next_permutation.end() || !lazy_tried.insert(hash).second) {
+        return false;
+    }
+    auto& db = Storage::DataBase::Instance();
+    std::unique_ptr<Program> program;
+    u32 loaded = 0;
+    for (size_t idx = 0; idx < next->second; ++idx) {
+        std::vector<u8> meta_blob;
+        db.Load(Storage::BlobType::ShaderMeta, fmt::format("{:#018x}", HashCombine(hash, idx)),
+                meta_blob);
+        if (meta_blob.empty()) {
+            continue;
+        }
+        auto candidate = std::make_unique<Program>();
+        Shader::StageSpecialization spec{};
+        std::optional<Shader::Gcn::FetchShaderData> fetch;
+        size_t perm_idx{};
+        Serialization::Archive ar{std::move(meta_blob)};
+        if (!LoadShaderMeta(ar, candidate->info, fetch, spec, perm_idx) || perm_idx != idx ||
+            candidate->info.pgm_hash != hash) {
+            continue;
+        }
+        std::vector<u32> spv;
+        db.Load(Storage::BlobType::ShaderBinary, fmt::format("{:#018x}_{}", hash, idx), spv);
+        if (spv.empty()) {
+            continue;
+        }
+        if (!program) {
+            program = std::move(candidate);
+        }
+        spec.info = &program->info;
+        program->InsertPermut(CompileSPV(spv, instance.GetDevice()), std::move(spec), idx);
+        ++loaded;
+    }
+    if (!program) {
+        return false;
+    }
+    std::unique_lock lock{programs_mutex};
+    program_cache.emplace(hash, std::move(program));
+    ++lazy_loaded_programs;
+    lazy_loaded_permutations += loaded;
+    if ((lazy_loaded_programs & 255) == 0) {
+        std::printf("Pipeline cache: %llu programs (%llu permutations) loaded on first use\n",
+                    (unsigned long long)lazy_loaded_programs,
+                    (unsigned long long)lazy_loaded_permutations);
+    }
+    return true;
+}
+
 bool PipelineCache::CheckCacheProfile() {
+    next_permutation.clear();
     if (!EmulatorSettings.IsPipelineCacheEnabled()) {
         return false;
     }
@@ -922,7 +1055,37 @@ bool PipelineCache::CheckCacheProfile() {
                                            std::move(profile_data));
         return false;
     }
+    // tlg: the indices the cache already holds, so permutations compiled in game never take one.
+    Storage::DataBase::Instance().ForEachBlobName(
+        Storage::BlobType::ShaderBinary, [this](std::string_view name) {
+            // "{:#018x}_{}": program hash, permutation index
+            const auto split = name.find('_');
+            if (split == std::string_view::npos) {
+                return;
+            }
+            const std::string hash_text{name.substr(0, split)};
+            const std::string index_text{name.substr(split + 1)};
+            char* end = nullptr;
+            const u64 hash = std::strtoull(hash_text.c_str(), &end, 16);
+            if (end == hash_text.c_str() || *end) {
+                return;
+            }
+            const u64 index = std::strtoull(index_text.c_str(), &end, 10);
+            if (end == index_text.c_str() || *end) {
+                return;
+            }
+            auto& next = next_permutation[hash];
+            next = std::max<size_t>(next, index + 1);
+        });
+    std::printf("Pipeline cache: %zu programs on disk\n", next_permutation.size());
     return true;
+}
+
+size_t PipelineCache::NewPermutationIndex(const Program& program, u64 hash) const {
+    // A program has at most one permutation in flight, and the one inserted at this index makes
+    // modules.size() the next one, so nothing needs reserving (a refused queue retries the same).
+    const auto it = next_permutation.find(hash);
+    return std::max(program.modules.size(), it == next_permutation.end() ? 0 : it->second);
 }
 
 void PipelineCache::WarmUp(const std::function<void(u32, u32)>& progress) {
@@ -1071,7 +1234,16 @@ struct PipelineCache::BackgroundWarmup {
     u64 pump_ns = 0, pump_max_ns = 0, pump_gap_max_ns = 0;
     u32 batches = 0;
     bool finished = false;
+    /// tlg: a precompiled cache holds the pipelines of the whole game: load only their shader
+    /// stages, and build each pipeline when the game first asks for it (the driver's own cache
+    /// has it from the first start's compilation, so that takes about a millisecond).
+    bool stages_only = false;
+    /// tlg: TLG_WARMUP_BUILD_CACHED=1 (default off): with `stages_only`, still build the pipelines
+    /// of the store in the background: on a driver whose cache lost them (an update, a crash, a
+    /// pipeline built in the last minute) the game would otherwise compile them where it draws.
+    bool build_cached = false;
     u32 loaded = 0, threads = 0;
+    u32 merge_refused_initial = 0, merge_refused_moved = 0, merge_refused_taken = 0;
     std::chrono::steady_clock::time_point started, last_batch;
     std::chrono::steady_clock::time_point last_pump{}, last_report{};
     std::unique_ptr<WarmupPool> pool; ///< last: its jobs use the members above
@@ -1087,6 +1259,24 @@ bool PipelineCache::StartBackgroundWarmUp() {
     background = new BackgroundWarmup;
     auto& warm = *background;
     warm.started = std::chrono::steady_clock::now();
+    {
+        const char* env = std::getenv("TLG_WARMUP_STAGES_ONLY");
+        std::error_code ec;
+        warm.stages_only = env && *env ? env[0] == '1'
+                                       : std::filesystem::exists(
+                                             Storage::GameCacheDir() / Precompile::DoneFile, ec);
+        if (warm.stages_only) {
+            UseDefaultPipelineWait();
+            // tlg: TLG_WARMUP_BUILD_CACHED=1 also builds the pipelines of a precompiled cache in
+            // the background (covers a driver cache lost to an update or a crash, at the cost of
+            // CPU time while the game runs); by default they are left to the driver's own cache.
+            static const bool build_cached = [] {
+                const char* v = std::getenv("TLG_WARMUP_BUILD_CACHED");
+                return v && *v == '1';
+            }();
+            warm.build_cached = build_cached;
+        }
+    }
     warm.threads = WarmupThreadCount(std::max(1u, std::thread::hardware_concurrency()));
     warm.pool = std::make_unique<WarmupPool>(warm.threads, true);
     // The first job reads the whole store; with one thread the builds queue behind it.
@@ -1103,7 +1293,12 @@ bool PipelineCache::StartBackgroundWarmUp() {
         warm.reading = false;
         return true;
     });
-    std::printf("Pipeline warm-up: loading in the background (%u threads)\n", warm.threads);
+    std::printf("Pipeline warm-up: loading %s in the background (%u threads)\n",
+                warm.stages_only
+                    ? (warm.build_cached ? "the precompiled cache's shader stages and pipelines"
+                                         : "shader stages only")
+                    : "pipelines",
+                warm.threads);
     return true;
 }
 
@@ -1196,17 +1391,22 @@ bool PipelineCache::MergeWarmStage(WarmStage& stage) {
     }
     // The game already uses this shader: its permutations are the ones that count.
     Program& program = *it_pgm->second;
-    if (program.pending) {
-        return false; // the game is compiling a permutation that takes the next index
+    if (program.PendingInitial()) {
+        ++background->merge_refused_initial; // its Info is not translated yet
+        return false;
     }
+    // A permutation the game compiles takes an index past every cached one
+    // (NewPermutationIndex), so a cached permutation keeps its own even while one is pending.
     const auto it = std::ranges::find(program.modules, stage.spec, &Program::Module::spec);
     if (it != program.modules.end()) {
         if (size_t(std::distance(program.modules.begin(), it)) != stage.perm_idx) {
+            ++background->merge_refused_moved; // the game compiled it again at another index
             return false;
         }
         stage.result = it->module;
     } else {
         if (stage.perm_idx < program.modules.size() && program.modules[stage.perm_idx].module) {
+            ++background->merge_refused_taken; // another specialization holds this index
             return false;
         }
         stage.spec.info = &program.info;
@@ -1246,6 +1446,7 @@ void PipelineCache::PumpWarmUp() {
         warm.loaded += kept;
         warm.done.fetch_add(1, std::memory_order_relaxed);
     }
+    warmup_pipelines_loaded = warm.loaded; // for the worker cache re-seed (SeedWorkerCaches)
 
     const auto now = std::chrono::steady_clock::now();
     if (now - warm.last_batch < 4ms) {
@@ -1284,7 +1485,7 @@ void PipelineCache::PumpWarmUp() {
                 fetch = stage.fetch; // the blocking load keeps the last stage's too
             }
         }
-        if (!usable) {
+        if (!usable || (warm.stages_only && !warm.build_cached)) {
             warm.done.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
@@ -1328,6 +1529,9 @@ void PipelineCache::PumpWarmUp() {
                 warm.loaded, warm.total.load(),
                 std::chrono::duration<double>(now - warm.started).count(), warm.threads);
     LOG_INFO(Render, "Preloaded {} pipelines in the background", warm.loaded);
+    std::printf("Warm-up merge: refused %u (initial compile pending), %u (compiled again at "
+                "another index), %u (index taken by another specialization)\n",
+                warm.merge_refused_initial, warm.merge_refused_moved, warm.merge_refused_taken);
     ReportPipelineBinaryCache();
     std::printf("Warm-up profile: reader wall %.3f s, entries %.3f s, shader IO/meta %.3f s, "
                 "modules %.3f s (%u); GPU pump %.3f s, max %.3f ms, gap max %.3f ms, "

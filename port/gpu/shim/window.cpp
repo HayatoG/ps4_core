@@ -39,9 +39,9 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     {
         const char* app_name = std::getenv("TLG_APP_NAME");
         const char* app_id = std::getenv("TLG_APP_ID");
-        SDL_SetAppMetadata(app_name && *app_name ? app_name : "The Last Guardian", nullptr,
-                           app_id && *app_id ? app_id : "tlg-pc");
-        SDL_SetHint(SDL_HINT_APP_ID, app_id && *app_id ? app_id : "tlg-pc");
+        SDL_SetAppMetadata(app_name && *app_name ? app_name : "inFAMOUS Second Son", nullptr,
+                           app_id && *app_id ? app_id : "infamous-pc");
+        SDL_SetHint(SDL_HINT_APP_ID, app_id && *app_id ? app_id : "infamous-pc");
     }
     // Gamepads are sampled by runtime_pad.c; their events are pumped here with the window's.
     if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
@@ -216,7 +216,7 @@ void WindowSDL::UpdateMouseCapture() {
         mouse_state = TlgGpuMouse{};
         mouse_state.captured = want;
     }
-    std::printf("Mouse: %s\n", want ? "captured for the camera (Esc releases)"
+    std::printf("Mouse: %s\n", want ? "captured for the camera and touchpad (Esc releases)"
                                      : mouse_released ? "released (click in the window to capture)"
                                                       : "released");
 }

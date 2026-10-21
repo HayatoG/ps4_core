@@ -1,7 +1,11 @@
 #!/bin/bash
 # Itemzflow USB dump progress, read via PS4 FTP LIST (64-bit sizes)
-H=ftp://192.168.1.10:2121/mnt/usb0/CUSA03627
-TOTAL=$(awk '{s+=$1} END{print s}' "$(dirname -- "$0")/../dump/.filelist")   # base game size from app0 listing
+# PS4_FTP, TITLE_ID: as in ftp_mirror.sh; USB_DIR: the dump folder on the PS4 (default /mnt/usb0/<title>).
+# TOTAL_BYTES: the expected size (default: the app0 listing in dump/.filelist, else ~27 GB, the base game).
+T=${TITLE_ID:-CUSA00223}
+H=${PS4_FTP:-ftp://192.168.1.10:2121}${USB_DIR:-/mnt/usb0/$T}
+list=$(dirname -- "$0")/../dump/.filelist
+TOTAL=${TOTAL_BYTES:-$( [ -f "$list" ] && awk '{s+=$1} END{print s}' "$list" || echo 27000000000 )}
 last=-1; prevb=-1; prevt=$(date +%s); stall=0
 while true; do
   B=$(curl -s --max-time 20 "$H/" | awk '$1 ~ /^-/ {s+=$5} END{print s+0}')

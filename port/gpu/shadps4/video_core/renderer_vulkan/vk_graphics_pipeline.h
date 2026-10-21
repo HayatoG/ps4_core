@@ -4,6 +4,8 @@
 #pragma once
 
 #include <algorithm>
+#include <memory>
+#include <span>
 
 #include <boost/container/static_vector.hpp>
 #include <xxhash.h>
@@ -27,6 +29,21 @@ static constexpr u32 MaxVertexBufferCount = 32;
 class Instance;
 class Scheduler;
 class DescriptorHeap;
+class AsyncCompiler;
+/// tlg: every structure the create-info of one graphics pipeline points at, kept past the
+/// constructor when a compiler thread builds the pipeline (vk_graphics_pipeline.cpp).
+struct PipelineCreateInfoBlock;
+
+/// tlg: compiler threads that build a graphics pipeline the driver's cache did not have.
+struct GraphicsBuilder {
+    AsyncCompiler* compiler;
+    std::span<const vk::UniquePipelineCache> caches; ///< one per compiler thread
+};
+
+/// tlg: TLG_GFX_DEFERRED_BIND (default off, vk_graphics_pipeline.cpp): a pipeline the driver's
+/// cache misses is built on a compiler thread and the draw waits for it at the bind instead of
+/// being skipped, so PipelineCache asks this before taking its own asynchronous path.
+bool GraphicsDeferredBindEnabled(const Instance& instance, const Scheduler& scheduler);
 
 template <typename T>
 using VertexInputs = boost::container::static_vector<T, MaxVertexBufferCount>;
@@ -93,7 +110,7 @@ public:
                      std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
                      std::optional<const Shader::Gcn::FetchShaderData> fetch_shader,
                      std::span<const vk::ShaderModule> modules, SerializationSupport& sdata,
-                     bool preloading);
+                     bool preloading, const GraphicsBuilder* builder = nullptr);
     ~GraphicsPipeline();
 
     // tlg: switch from compiler-owned snapshots to live stage data on publication.
@@ -109,10 +126,9 @@ public:
         return key;
     }
 
-    /// tlg: second draw squaring a self-scaled MIN/MAX blend, or null (vk_blend_rewrite.h).
-    vk::Pipeline SquarePassHandle() const noexcept {
-        return *square_pipeline;
-    }
+    /// tlg: second draw squaring a self-scaled MIN/MAX blend, or null (vk_blend_rewrite.h). Waits
+    /// when a compiler thread is still building it (TLG_GFX_DEFERRED_BIND).
+    vk::Pipeline SquarePassHandle() const;
 
     /// Gets the attributes and bindings for vertex inputs.
     template <typename Attribute, typename Binding>
@@ -124,10 +140,21 @@ public:
 private:
     void BuildDescSetLayout(bool preloading);
 
+    /// tlg: the pipeline `info` describes: created here when the driver's cache holds it (the
+    /// probe asks for the pipeline alone), else built on a compiler thread, with `state` set:
+    /// Handle() then waits for it at the bind. `out` takes it when this call created it.
+    void CreatePipeline(const std::shared_ptr<PipelineCreateInfoBlock>& block,
+                        vk::PipelineCache cache, const vk::GraphicsPipelineCreateInfo& info,
+                        vk::UniquePipeline& out, const GraphicsBuilder* builder,
+                        std::shared_ptr<Build>& state, bool square);
+    /// tlg: waits for a pipeline a compiler thread is building.
+    static void WaitForBuild(const std::shared_ptr<Build>& state);
+
 private:
     GraphicsPipelineKey key;
     std::optional<const Shader::Gcn::FetchShaderData> fetch_shader{};
     vk::UniquePipeline square_pipeline;
+    std::shared_ptr<Build> square_build; ///< the squaring pass, while a compiler thread builds it
 };
 
 struct ClipDistanceShaderKey {

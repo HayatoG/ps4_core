@@ -19,12 +19,15 @@ typedef int32_t (ABI *CondOp)(void **);
 typedef int32_t (ABI *SemCreate)(uint32_t *, const char *, uint32_t, int32_t, int32_t, const void *);
 typedef int32_t (ABI *SemWait)(uint32_t, int32_t, uint32_t *);
 typedef int32_t (ABI *SemSignal)(uint32_t, int32_t);
+typedef int32_t (ABI *SleepUs)(uint32_t);
 #define GET(t, n) ((t)runtime_resolve(n, 0))
-static MutexInit mutex_init;
+static MutexInit mutex_init, rw_init;
 static MutexOp mutex_lock, mutex_unlock;
 static CondInit cond_init;
 static CondWait cond_wait;
 static CondOp cond_signal;
+static MutexOp rw_read_lock, rw_write_lock, rw_release;
+static SleepUs usleep_guest;
 static SemCreate sem_create;
 static SemWait sem_wait;
 static SemSignal sem_signal;
@@ -146,7 +149,13 @@ static void contended_mutex(void) {
     assert(!pthread_join(thread, NULL));
     count = runtime_thread_snapshot(infos, 256);
     for (size_t i = 0; i < count; ++i)
-        if (!strcmp(infos[i].name, "mutex waiter")) assert(!infos[i].wait.depth && !infos[i].wait.level[0].kind);
+        if (!strcmp(infos[i].name, "mutex waiter")) {
+            assert(!infos[i].wait.depth && !infos[i].wait.level[0].kind);
+            /* TLG_WAIT_STATS (set in main): the wait is accounted to this thread (RuntimeWait). */
+            assert(infos[i].wait.wait_count == 1 && infos[i].wait.wait_ns >= 100000);
+            assert(infos[i].wait.wait_max_kind && !strcmp(infos[i].wait.wait_max_kind, "mutex"));
+            assert(!strcmp(infos[i].wait.wait_max_name, "test lock") && infos[i].wait.wait_max_end_ms);
+        }
 }
 
 static void cond_and_sema(void) {
@@ -175,7 +184,73 @@ static void cond_and_sema(void) {
     assert(!pthread_join(thread, NULL));
 }
 
+/* A rwlock waiter is marked like a mutex one (runtime_rwlock.c acquire): without it the report
+ * showed the thread as running. */
+static void *rwlock = NULL;
+static void *rwlock_waiter(void *arg) {
+    (void)arg;
+    runtime_thread_attach_host("rwlock waiter");
+    assert(rw_read_lock(&rwlock) == 0);
+    assert(rw_release(&rwlock) == 0);
+    return NULL;
+}
+static void contended_rwlock(void) {
+    char text[512];
+    assert(rw_init(&rwlock, NULL, "test rwlock") == 0);
+    assert(rw_write_lock(&rwlock) == 0);
+    pthread_t thread;
+    assert(!pthread_create(&thread, NULL, rwlock_waiter, NULL));
+    const RuntimeThreadInfo *t = waiting("rwlock waiter");
+    assert(t);
+    assert(t->wait.level[0].kind && !strcmp(t->wait.level[0].kind, "rwlock (read)"));
+    assert(t->wait.level[0].frame);
+    describe(t, text, sizeof(text));
+    assert(!strncmp(text, "waiting on rwlock (read) 'test rwlock' 0x", 40));
+    assert(rw_release(&rwlock) == 0);
+    assert(!pthread_join(thread, NULL));
+}
+
+/* Host threads that never attach (GPU library, decoders) take one of 64 wait slots on their first
+ * marked wait. Every one of them is taken here by a thread that then exits: a thread that needs a
+ * slot afterwards must get the one of a dead owner (runtime_wait_slot), not none. */
+static void *sleeping_host(void *arg) {
+    (void)arg;
+    assert(usleep_guest(1000) == 0);
+    return NULL;
+}
+static void *raw_mutex_waiter(void *arg) {
+    (void)arg;
+    assert(mutex_lock(&mutex) == 0);   /* no runtime_thread_attach_host: a host wait slot */
+    assert(mutex_unlock(&mutex) == 0);
+    return NULL;
+}
+static void wait_slots_recycle(void) {
+    for (unsigned i = 0; i < 80; ++i) {
+        pthread_t thread;
+        assert(!pthread_create(&thread, NULL, sleeping_host, NULL));
+        assert(!pthread_join(thread, NULL));
+    }
+    assert(mutex_lock(&mutex) == 0);
+    pthread_t thread;
+    assert(!pthread_create(&thread, NULL, raw_mutex_waiter, NULL));
+    /* The only marked mutex wait in a host slot is this thread's (the other slots hold waits that
+     * already ended, and main/test threads have a record). */
+    const RuntimeThreadInfo *host = NULL;
+    for (int attempt = 0; attempt < 2000 && !host; ++attempt) {
+        count = runtime_thread_snapshot(infos, 256);
+        for (size_t i = 0; i < count; ++i)
+            if (!infos[i].record && infos[i].wait.depth && infos[i].wait.level[0].kind &&
+                !strcmp(infos[i].wait.level[0].kind, "mutex")) host = &infos[i];
+        if (!host) nap();
+    }
+    assert(host && host->os_tid);
+    assert(mutex_unlock(&mutex) == 0);
+    assert(!pthread_join(thread, NULL));
+}
+
 int main(void) {
+    /* Before any marked wait: the accounting is read once (TLG_WAIT_STATS). */
+    setenv("TLG_WAIT_STATS", "1", 1);
     runtime_start(1);
     runtime_thread_attach_main();
     runtime_freeze_start(0, 0, 0); /* capture signal and GPU hooks, no monitor */
@@ -188,12 +263,19 @@ int main(void) {
     sem_create = GET(SemCreate, "188x57JYp0g#libkernel");
     sem_wait = GET(SemWait, "Zxa0VhQVTsk#libkernel");
     sem_signal = GET(SemSignal, "4czppHBiriw#libkernel");
+    rw_init = GET(MutexInit, "6ULAa0fq4jA#libkernel");
+    rw_read_lock = GET(MutexOp, "Ox9i0c7L5w0#libkernel");
+    rw_write_lock = GET(MutexOp, "mqdNorrB+gI#libkernel");
+    rw_release = GET(MutexOp, "+L98PIbGttk#libkernel");
+    usleep_guest = GET(SleepUs, "1jfXLRVzisc#libkernel");
     assert(mutex_init && mutex_lock && mutex_unlock && cond_init && cond_wait && cond_signal &&
-           sem_create && sem_wait && sem_signal);
+           sem_create && sem_wait && sem_signal && rw_init && rw_read_lock && rw_write_lock && rw_release && usleep_guest);
     monitor_steps();
     slot_levels();
     contended_mutex();
     cond_and_sema();
+    contended_rwlock();
+    wait_slots_recycle();
     puts("freeze report tests passed");
     return 0;
 }

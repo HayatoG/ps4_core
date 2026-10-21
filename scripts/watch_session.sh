@@ -2,11 +2,12 @@
 # Vigia uma sessão do jogo: avisa quando abre/fecha/cai e, se o jogo parar de apresentar frames
 # por $STALL segundos (sem "Frame stats" no log), tira um dump das threads com kill -USR1.
 # Uma linha por evento (feito para o Monitor do Claude Code). Resumo de FPS a cada $SUMMARY s.
+# Linux; precisa de ISS_FRAME_STATS=1 (o launcher já liga). LOGS: pasta dos run-*.log (padrão port/out/logs).
 STALL=${STALL:-20}; SUMMARY=${SUMMARY:-120}
-logs=$HOME/decomp/port/out/logs
+logs=${LOGS:-$(cd -- "$(dirname -- "$0")/.." && pwd)/port/out/logs}
 pid=""; log=""; dumped=0; last_sum=$(date +%s)
 while true; do
-  p=$(pgrep -f "out/tlg-probe .*boot-linked.bin" | head -1)
+  p=$(pgrep -f "tlg-probe .*boot-linked.bin" | head -1)
   if [[ -n $p && $p != "$pid" ]]; then
     pid=$p; dumped=0; sleep 2; log=$(ls -1t "$logs"/run-*.log | head -1)
     echo "Sessão iniciada (pid $pid, log $(basename "$log"))"

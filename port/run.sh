@@ -11,7 +11,7 @@ if [[ ${1:-} == --software ]]; then
     if [[ -z ${VK_DRIVER_FILES:-} ]]; then echo 'Lavapipe not found; set VK_DRIVER_FILES.' >&2; exit 1; fi
     export VK_LOADER_LAYERS_DISABLE='~implicit~'
 fi
-# TLG_PREBUILT=1 (packaged builds, the AppImage): out/tlg-probe and its GPU library are installed
+# TLG_PREBUILT=1 (packaged builds): out/tlg-probe and its GPU library are installed
 # next to this script; nothing is built and no nix-shell is needed.
 # TLG_DATA_DIR: writable directory for the generated files (out/), saves (user/) and tlg.ini;
 # by default this directory.
@@ -36,8 +36,8 @@ if [[ -z ${PYTHON:-} ]]; then
     fi
 fi
 if [[ -z ${PYTHON:-} ]]; then echo 'Install Python 3 or set PYTHON.' >&2; exit 1; fi
-# TLG_GAME_DIR: the game's folder (eboot.bin, sce_module, ...); default next to this directory.
-game=${TLG_GAME_DIR:-../CUSA01623}
+# TLG_GAME_DIR: the game's folder (eboot.bin, sce_module, ...); default game/CUSA00223, as in the launcher.
+game=${TLG_GAME_DIR:-../game/CUSA00223}
 if [[ ! -f $game/eboot.bin ]]; then echo "No eboot.bin in $game (set TLG_GAME_DIR)." >&2; exit 1; fi
 original_game=$game
 game=$("$PYTHON" scripts/mods.py "$game" --out "$out" \

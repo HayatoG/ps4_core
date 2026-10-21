@@ -38,10 +38,33 @@ port/gpu/*
 @port/gpu/third_party/vulkan-headers
 @port/gpu/third_party/xbyak
 @port/third_party/LibAtrac9
+# Distância de visão do inFAMOUS / inFAMOUS draw distance hooks (game-specific)
+!port/gpu/shim/tlg_view.*
+!port/src/view_hook.h
 
 # Testes e ferramentas / tests and tools
 port/tests/*
 port/tools/*
+# Do jogo ou do launcher (launcher ainda é por jogo) / game- or launcher-specific (launcher is per game for now)
+!port/tools/xpps/*
+!port/tools/shader_index.py
+!port/tools/controller_guides/*
+!port/tests/test_orb_multiplier.cpp
+!port/tests/test_xpps_*
+!port/tests/test_shader_index.py
+!port/tests/test_qt_*
+!port/tests/test_tk_launcher_builds.py
+!port/tests/test_update*
+!port/tests/test_savemanager.py
+!port/tests/test_userdata.py
+!port/tests/test_open_external.py
+!port/tests/test_preset_share.py
+!port/tests/test_launcher_detach.py
+!port/tests/test_game_*.py
+!port/tests/test_backports_table.py
+!port/tests/test_precompile.py
+!port/tests/test_cli_precompile.py
+!port/tests/test_probe_env.py
 port/launcher/tlg_vulkan.py
 port/launcher/shader_cache.py
 
@@ -51,6 +74,7 @@ port/packaging/*
 !port/packaging/icon/*
 !port/packaging/README-player.md
 !port/packaging/windows/*.rc
+!port/packaging/launcher.spec
 
 # Ferramentas genéricas do repositório / generic repo tools
 scripts/make_game_view.py

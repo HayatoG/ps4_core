@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/amdgpu/tlg_amd_1d.h"
 #include "common/logging/log.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -15,9 +16,9 @@ namespace VideoCore {
 vk::ImageViewType ConvertImageViewType(AmdGpu::ImageType type) {
     switch (type) {
     case AmdGpu::ImageType::Color1D:
-        return vk::ImageViewType::e1D;
+        return AmdGpu::All1DAs2D() ? vk::ImageViewType::e2D : vk::ImageViewType::e1D; // tlg: BP09
     case AmdGpu::ImageType::Color1DArray:
-        return vk::ImageViewType::e1DArray;
+        return AmdGpu::All1DAs2D() ? vk::ImageViewType::e2DArray : vk::ImageViewType::e1DArray;
     case AmdGpu::ImageType::Color2D:
     case AmdGpu::ImageType::Color2DMsaa:
         return vk::ImageViewType::e2D;
@@ -34,7 +35,10 @@ bool IsViewTypeCompatible(AmdGpu::ImageType view_type, AmdGpu::ImageType image_t
     switch (view_type) {
     case AmdGpu::ImageType::Color1D:
     case AmdGpu::ImageType::Color1DArray:
-        return image_type == AmdGpu::ImageType::Color1D;
+        // tlg: BP09, a 1D view is a 2D view of height 1 of a 1D or a 2D image.
+        return image_type == AmdGpu::ImageType::Color1D ||
+               (AmdGpu::All1DAs2D() && (image_type == AmdGpu::ImageType::Color2D ||
+                                        image_type == AmdGpu::ImageType::Color3D));
     case AmdGpu::ImageType::Color2D:
     case AmdGpu::ImageType::Color2DArray:
     case AmdGpu::ImageType::Color2DMsaa:
@@ -117,6 +121,13 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
         aspect = vk::ImageAspectFlagBits::eStencil;
     }
 
+    // tlg: TLG_BC_TINY: the image holds the decoded texels; a BC view reads them through the
+    // matching plain format (sRGB and snorm kept), anything else through the image's own.
+    if (image.info.props.is_bc_decoded) {
+        const vk::Format decoded = BcTinyDecodedFormat(format);
+        format = decoded != vk::Format::eUndefined ? decoded : image.info.pixel_format;
+    }
+
     // tlg: storage writes never convert to sRGB and sRGB formats cannot be storage images
     // (AMD's driver loses the device on such a view; NVIDIA tolerates it): write through the
     // UNORM format, which stores the same bytes.
@@ -165,7 +176,19 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
                   magic_enum::enum_name(info.type), magic_enum::enum_name(image.info.type));
     }
 
+    const bool trace_1d = AmdGpu::ImgTrace() && (image_view_ci.viewType == vk::ImageViewType::e1D ||
+                                                 image_view_ci.viewType == vk::ImageViewType::e1DArray);
+    if (trace_1d) {
+        TLG_IMG_TRACE("create 1D view %s of image %p %s mips %u+%u layers %u+%u usage %s\n",
+                      vk::to_string(image_view_ci.viewType).c_str(), (void*)VkImage(image_view_ci.image),
+                      vk::to_string(image_view_ci.format).c_str(), info.range.base.level,
+                      info.range.extent.levels, info.range.base.layer, info.range.extent.layers,
+                      vk::to_string(usage_ci.usage).c_str());
+    }
     auto [view_result, view] = instance.GetDevice().createImageViewUnique(image_view_ci);
+    if (trace_1d) {
+        TLG_IMG_TRACE("created 1D view: %s\n", vk::to_string(view_result).c_str());
+    }
     ASSERT_MSG(view_result == vk::Result::eSuccess, "Failed to create image view: {}",
                vk::to_string(view_result));
     image_view = std::move(view);

@@ -50,11 +50,14 @@ class LoaderTests(unittest.TestCase):
                     self.assertIn('content profile',r.stderr)
 
     def run_image(self, data, *options):
+        # The synthetic images use only baseline x86-64, so the PS4 CPU check is off: on a CPU
+        # without SSE4A (every Intel) or AVX (Rosetta) it stopped before the loader ran (exit 20).
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'boot.bin'
             path.write_bytes(data)
             return subprocess.run([str(EXE.resolve()), str(path), '--cpu-only', *options],
-                                  capture_output=True, text=True, timeout=5)
+                                  capture_output=True, text=True, timeout=5,
+                                  env={**os.environ, 'TLG_CPU_CHECK': '0'})
 
     def test_original_instruction_reaches_named_import(self):
         # jmp [rip+2]; two padding bytes; relocated function pointer at +8
@@ -168,7 +171,12 @@ def host_env():
 class CpuFeaturesTests(unittest.TestCase):
     def test_cpu_features_mode_reports_this_machine(self):
         result = subprocess.run([str(HOST_EXE.resolve()), '--cpu-features'], capture_output=True, text=True, env=host_env())
-        self.assertEqual(result.returncode, 0)
+        # A CPU without a set nothing can rewrite (AVX: emulated x86-64 such as Rosetta) exits 20
+        # with the STOP reason, which the launcher shows (infamous_run.cpu_missing_sets).
+        if result.returncode == 20:
+            self.assertRegex(result.stdout, r"^STOP: this CPU lacks instruction sets the game's code uses: [A-Z0-9., ]+ ")
+            return
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertRegex(result.stdout, r'^CPU: (complete|missing [A-Z0-9., ]+)\n$')
 
 

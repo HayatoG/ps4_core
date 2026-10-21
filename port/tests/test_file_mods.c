@@ -9,6 +9,8 @@ void runtime_wait_begin(const char *kind, const void *object, const char *name, 
     (void)kind; (void)object; (void)name; (void)owner; (void)frame;
 }
 void runtime_wait_end(void) {}
+/* Region trace hook (GPU library, not linked here). */
+void tlggpu_note_open(const char *guest_path) { (void)guest_path; }
 uintptr_t runtime_lookup(const RuntimeExport *table,size_t n,const char *name) {
     for (size_t i=0;i<n;++i) if (!strcmp(table[i].name,name)) return (uintptr_t)table[i].function;
     return 0;

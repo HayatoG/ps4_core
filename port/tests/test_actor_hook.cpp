@@ -4,7 +4,11 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <sys/mman.h>
+#endif
 #include "../src/actor_hook.h"
 #include "tlg_actors.h"
 
@@ -15,7 +19,8 @@ asm(".globl actor_hook_return\nactor_hook_return:\n    ret\n");
 alignas(64) static TlgActorSlot slots[2];
 
 static void hit(unsigned char* stub, unsigned char* actor) {
-    asm volatile("mov %0, %%r13\n\tcall *%1\n\t"
+    // The call steps over the SysV red zone, which the compiler may use here.
+    asm volatile("mov %0, %%r13\n\tlea -128(%%rsp), %%rsp\n\tcall *%1\n\tlea 128(%%rsp), %%rsp\n\t"
                  :
                  : "r"(actor), "r"(stub)
                  : "rax", "rdi", "r13", "memory", "cc");
@@ -33,8 +38,14 @@ int main() {
     assert(!tlg_actor_signature_match(other, sizeof(other)));
     assert(!tlg_actor_signature_match(tlg_actor_original, TLG_ACTOR_HOOK_LENGTH - 1));
 
+#ifdef _WIN32
     auto* stub = static_cast<unsigned char*>(
         VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+#else
+    auto* stub = static_cast<unsigned char*>(mmap(nullptr, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                                                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    assert(stub != MAP_FAILED);
+#endif
     assert(stub);
     const unsigned n = tlg_actor_build_stub(stub, reinterpret_cast<uintptr_t>(slots),
                                              reinterpret_cast<uintptr_t>(&actor_hook_return));
@@ -57,5 +68,9 @@ int main() {
     assert(!TlgActors::Valid(NAN, 100.0f) && !TlgActors::Valid(10.0f, 0.0f));
     assert(!TlgActors::Valid(-1.0f, 100.0f) && !TlgActors::Valid(200.0f, 100.0f));
     assert(!TlgActors::Valid(1.0f, 1e9f) && TlgActors::Fraction(NAN, 1.0f) == 0.0f);
+#ifdef _WIN32
     VirtualFree(stub, 0, MEM_RELEASE);
+#else
+    munmap(stub, 4096);
+#endif
 }

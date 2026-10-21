@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 
@@ -95,6 +96,10 @@ public:
         RegionBits& bits = GetRegionBits<type>();
         if constexpr (type == Type::CPU && enable) {
             CountWriteFaults(start_page, end_page);
+            NoteCpuBitsSet();
+        }
+        if constexpr (type == Type::GPU && enable) {
+            NoteGpuBitsSet();
         }
         if constexpr (enable) {
             bits.SetRange(start_page, end_page);
@@ -102,9 +107,17 @@ public:
             bits.UnsetRange(start_page, end_page);
         }
         if constexpr (type == Type::CPU) {
+            if constexpr (!enable) {
+                NoteCpuBitsCleared();
+            }
             UpdateProtection<!enable, false>();
-        } else if (EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise) {
-            UpdateProtection<enable, true>();
+        } else {
+            if constexpr (!enable) {
+                NoteGpuBitsCleared();
+            }
+            if (EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise) {
+                UpdateProtection<enable, true>();
+            }
         }
     }
 
@@ -122,6 +135,7 @@ public:
         if (add.None()) {
             return;
         }
+        NoteCpuBitsSet();
         cpu |= add;
         UpdateProtection<false, false>();
     }
@@ -149,8 +163,8 @@ public:
         // tlg: nothing modified in the range means nothing to clear or re-protect (CPU bits
         // always match `writeable` after a change); this runs for every buffer binding, so
         // it is checked before building the range mask.
-        if (type == Type::CPU && !bits.AnyInRange(start_page, end_page) &&
-            !TlgToggle::Disabled(TlgToggle::PageTrackingEarlyExit)) {
+        if (type == Type::CPU && !TlgToggle::Disabled(TlgToggle::PageTrackingEarlyExit) &&
+            (!cpu_any.load(std::memory_order_acquire) || !bits.AnyInRange(start_page, end_page))) {
             return;
         }
         RegionBits mask(bits, start_page, end_page);
@@ -159,9 +173,13 @@ public:
             bits.UnsetRange(start_page, end_page);
             if constexpr (type == Type::CPU) {
                 KeepHotPagesModified(start_page, end_page);
+                NoteCpuBitsCleared();
                 UpdateProtection<true, false>();
-            } else if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled) {
-                UpdateProtection<false, true>();
+            } else {
+                NoteGpuBitsCleared();
+                if (EmulatorSettings.GetReadbacksMode() != GpuReadbacksMode::Disabled) {
+                    UpdateProtection<false, true>();
+                }
             }
         }
 
@@ -186,6 +204,21 @@ public:
             return false;
         }
 
+        if constexpr (type == Type::CPU) {
+            // tlg: the common case, nothing of this region modified since its upload, costs
+            // one load instead of a scan of the bitmap (this runs for every buffer of every
+            // draw, without the lock: see the note on cpu_any).
+            if (!cpu_any.load(std::memory_order_acquire)) {
+                return false;
+            }
+        } else {
+            // tlg: the same early-out for the GPU bits: they are empty for most regions
+            // between two frames, and this is asked for every guest memcpy/memset into the
+            // range (BufferCache::CpuWriteMerge) and for every read fault (see gpu_any).
+            if (!gpu_any.load(std::memory_order_acquire)) {
+                return false;
+            }
+        }
         const RegionBits& bits = GetRegionBits<type>();
         return bits.AnyInRange(start_page, end_page);
     }
@@ -261,6 +294,34 @@ private:
         }
     }
 
+    // tlg: cpu_any is true whenever any bit of `cpu` may be set. It is stored before the bits
+    // on every path that sets them (all under `lock`), so a reader without the lock that sees
+    // a set bit also sees the flag (x86 keeps store order; the lock-free readers rely on the
+    // same ordering for the bits themselves, see MemoryTracker::ForEachUploadRange). A reader
+    // racing with a clear can only see a stale true, which falls back to the exact scan.
+    void NoteCpuBitsSet() {
+        if (!cpu_any.load(std::memory_order_relaxed)) {
+            cpu_any.store(true, std::memory_order_seq_cst);
+        }
+    }
+    void NoteCpuBitsCleared() {
+        cpu_any.store(cpu.Any(), std::memory_order_release);
+    }
+
+    // tlg: gpu_any is the mirror of cpu_any for the GPU bits, with the same contract: set
+    // before the bits on every path that sets them (all under `lock`, ChangeRegionState and
+    // ForEachModifiedRange are the only writers), so a reader without the lock that sees a set
+    // bit also sees the flag; a reader racing with a clear sees a stale true and falls back to
+    // the exact scan.
+    void NoteGpuBitsSet() {
+        if (!gpu_any.load(std::memory_order_relaxed)) {
+            gpu_any.store(true, std::memory_order_seq_cst);
+        }
+    }
+    void NoteGpuBitsCleared() {
+        gpu_any.store(gpu.Any(), std::memory_order_release);
+    }
+
     void KeepHotPagesModified(size_t start_page, size_t end_page) {
         if (num_hot == 0) {
             return;
@@ -274,6 +335,7 @@ private:
             num_hot = 0;
             return;
         }
+        NoteCpuBitsSet();
         cpu |= RegionBits(hot, start_page, end_page);
     }
 
@@ -284,6 +346,8 @@ private:
 
     PageManager* tracker;
     VAddr cpu_addr = 0;
+    std::atomic<bool> cpu_any{true}; ///< see NoteCpuBitsSet; the constructor fills `cpu`
+    std::atomic<bool> gpu_any{false}; ///< see NoteGpuBitsSet; the constructor clears `gpu`
     RegionBits cpu;
     RegionBits gpu;
     RegionBits writeable;

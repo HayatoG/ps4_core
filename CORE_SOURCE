@@ -22,7 +22,15 @@
 #   PR #15 3727fde SSE4A). Mesclados em 3 vias com base fd78ad5 / 3-way merged on base fd78ad5 (sem conflito
 #   fora do VENDOR.txt: as duas listas ficaram / no conflict except VENDOR.txt: both lists kept); novos / new:
 #   vk_frame_record.*, test_isa_sse4a.c, scripts/frame_diff.py. Fora / not taken: launcher, infamous_run.*, README, CI.
-~/decomp/infamous_pc origin/main 2b82d72b51bc224eb018c844675f0881cfe78fc1
+# + 21/10/2026 (branch sync/ports-2026-10-21): infamous_pc origin/main fb7e452 (PR #318). port-newer/port-only
+#   copiados / copied; diverged mesclados em 3 vias com base 6b668a0 / 3-way merged on base 6b668a0.
+#   Fora (do jogo) / not taken (game-specific): tlg_view.*, view_hook.h e install_view_tuning do probe.c,
+#   menu de distância de visão (fica só o MipLodBias genérico), modo sensor do grafite (mira do mouse,
+#   sensor_aim, guia), tools/xpps, shader_index.py, controller_guides, testes do launcher, launcher.spec,
+#   package.sh (ISS_SPEC_*). recompiler_toggles.h: padrão por serial (CUSA00223) trocado por desligado; o perfil
+#   do inFAMOUS liga TLG_LDS_SMALL/MULTI/READLANE e TLG_LANE_DIVERGENCE. Mapa de botões do mouse: o do núcleo.
+#   + equivalente a feat/new-renderer 2cbcb28 (RLIMIT_NOFILE) no probe.c; c314e70 (gpu_v2) fora.
+~/decomp/infamous_pc origin/main fb7e45238c063bb7d467da5eb84a67f5b3bc144d
 
 # Do TLG (PR #12 mesclado) / from TLG (after PR #12):
 # + 4a375f0, 7f8fb85 pós-processamento / post-processing: postfx_pass.*, smaa*, cas*, post_process.frag,

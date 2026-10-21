@@ -73,11 +73,12 @@ static int name_is(const char *text, size_t n, const char *name) {
 
 unsigned cpu_sets_named(const char *list, int *valid) {
     static const struct { const char *name; unsigned set; } names[] = {
-        {"movbe", CPU_SET_MOVBE}, {"bmi1", CPU_SET_BMI1}, {"lzcnt", CPU_SET_LZCNT}, {"sse4a", CPU_SET_SSE4A},
+        {"movbe", CPU_SET_MOVBE}, {"bmi1", CPU_SET_BMI1}, {"lzcnt", CPU_SET_LZCNT}, {"f16c", CPU_SET_F16C},
+        {"sse4a", CPU_SET_SSE4A},
     };
     *valid = 1;
     if (!list || !*list || !strcmp(list, "0")) return 0;
-    if (!strcmp(list, "1")) return CPU_SET_MOVBE | CPU_SET_BMI1 | CPU_SET_LZCNT | CPU_SET_SSE4A;
+    if (!strcmp(list, "1")) return CPU_SET_MOVBE | CPU_SET_BMI1 | CPU_SET_LZCNT | CPU_SET_F16C | CPU_SET_SSE4A;
     unsigned sets = 0;
     for (const char *at = list; *at;) {
         size_t n = strcspn(at, ",");

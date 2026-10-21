@@ -22,6 +22,10 @@ struct PushData;
 
 namespace Vulkan {
 
+/// tlg: pipelines the driver created (graphics and compute, any thread): the driver cache saver
+/// (BP08) skips its merge and copy of the whole blob while this has not moved.
+extern std::atomic<u64> g_tlg_driver_pipelines_created;
+
 static constexpr auto AllGraphicsStageBits =
     vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eTessellationControl |
     vk::ShaderStageFlagBits::eTessellationEvaluation | vk::ShaderStageFlagBits::eGeometry |
@@ -82,7 +86,10 @@ public:
     }
 
     using DescriptorWrites = std::vector<vk::WriteDescriptorSet>;
-    void BindResources(DescriptorWrites& set_writes, const Shader::PushData& push_data) const;
+    /// tlg: `count` of `set_writes` are this draw's writes; the vector may hold more (the pool in
+    /// vk_rasterizer.cpp keeps its storage between draws, SetWritePool).
+    void BindResources(DescriptorWrites& set_writes, u32 count,
+                       const Shader::PushData& push_data) const;
 
 protected:
     [[nodiscard]] std::string GetDebugString() const;

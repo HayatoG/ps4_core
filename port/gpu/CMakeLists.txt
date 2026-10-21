@@ -2,6 +2,9 @@
 # drivers, adapted to the native_probe runtime through shims in shim/.
 cmake_minimum_required(VERSION 3.24)
 project(tlggpu LANGUAGES C CXX)
+# Standalone diagnostics tests can be built without the GPU dependency stack:
+# cmake -S port/tests/perf -B <test-build>
+
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -163,6 +166,14 @@ file(GLOB_RECURSE RECOMPILER CONFIGURE_DEPENDS shadps4/shader_recompiler/*.cpp)
 file(GLOB_RECURSE TLG_SHADER_KEY_SOURCES shadps4/shader_recompiler/*.cpp shadps4/shader_recompiler/*.h)
 list(APPEND TLG_SHADER_KEY_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/amdgpu/resource.h
+    # tlg: the 1D/BC promotion predicates that resource.h and the SPIR-V image emitter read
+    # (IsBlock1D): their code changes which texels a shader samples, without changing the profile
+    # the cache compares.
+    ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/amdgpu/tlg_block1d.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/amdgpu/tlg_bc_tiny.h
+    # tlg: the graphics pipeline writes the host tessellation/discard SPIR-V into its serialized
+    # pipeline entry and decides when to emit it.
+    ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/renderer_vulkan/vk_pipeline_cache.cpp)
 list(SORT TLG_SHADER_KEY_SOURCES)
 set(TLG_SHADER_KEY_DATA "")
@@ -197,6 +208,10 @@ add_library(tlggpu ${TLGGPU_KIND} ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_S
     shadps4/core/libraries/videoout/driver.cpp shadps4/core/libraries/videoout/video_out.cpp
     shadps4/core/libraries/kernel/equeue.cpp ${AVPLAYER}
     shadps4/core/libraries/videodec/video_utils.cpp)
+# Identify diagnostic captures without exposing a build directory.
+include(cmake/PerfBuildRevision.cmake)
+tlg_perf_build_revision("${CMAKE_CURRENT_SOURCE_DIR}" TLG_TRACE_REV)
+target_compile_definitions(tlggpu PRIVATE TLG_PERF_BUILD_ID="${TLG_TRACE_REV}")
 add_dependencies(tlggpu host_shaders)
 # In-game settings menu: Dear ImGui (third_party/imgui, MIT) with its Vulkan backend, and an
 # embedded Cyrillic font (third_party/fonts).
@@ -247,6 +262,9 @@ if (WIN32)
         ../src/isa_rewrite.c ../src/isa_emulate.c
         ../packaging/windows/tlg-probe.rc)
     set_target_properties(tlg-probe PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
+    if (DEFINED ENV{TLG_BUILD_COMMIT})
+        target_compile_definitions(tlg-probe PRIVATE TLG_BUILD_COMMIT="$ENV{TLG_BUILD_COMMIT}")
+    endif()
     target_compile_options(tlg-probe PRIVATE $<$<COMPILE_LANGUAGE:C>:-Wall -Wextra -Werror>)
     target_include_directories(tlg-probe PRIVATE .. ../src)
     # Per-game environment prefix (build.sh passes PORT_ENV_PREFIX from packaging/port.env).
@@ -278,6 +296,7 @@ if (WIN32)
     add_executable(mouse-stick-test EXCLUDE_FROM_ALL ../tests/test_mouse_stick.c)
     set_target_properties(mouse-stick-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
     target_compile_options(mouse-stick-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+    target_include_directories(mouse-stick-test PRIVATE .. ../src)
     add_executable(audio-downmix-test EXCLUDE_FROM_ALL ../tests/test_audio_downmix.c ../src/compat_win.c)
     set_target_properties(audio-downmix-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
     target_compile_options(audio-downmix-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
@@ -307,6 +326,12 @@ if (WIN32)
     set_target_properties(isa-sse4a-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
     target_compile_options(isa-sse4a-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
     target_include_directories(isa-sse4a-test PRIVATE .. ../src)
+    # F16C sites against the real VCVTPH2PS/VCVTPS2PH (hosts with F16C) or recorded results.
+    add_executable(isa-f16c-test EXCLUDE_FROM_ALL ../tests/test_isa_f16c.c ../src/isa_rewrite.c ../src/isa_emulate.c)
+    set_source_files_properties(../tests/test_isa_f16c.c PROPERTIES COMPILE_OPTIONS "-mavx;-mf16c")
+    set_target_properties(isa-f16c-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
+    target_compile_options(isa-f16c-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+    target_include_directories(isa-f16c-test PRIVATE .. ../src)
     # tlg: the runtime memory table's reader-preferring lock (winpthreads' rwlock deadlocks nested readers).
     add_executable(rwlock-rp-test EXCLUDE_FROM_ALL ../tests/test_rwlock_rp.c)
     set_target_properties(rwlock-rp-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
@@ -384,6 +409,19 @@ target_include_directories(warmup-inbox-test PRIVATE shadps4)
 add_executable(wave-stats-test EXCLUDE_FROM_ALL ../tests/test_wave_stats.cpp)
 target_compile_options(wave-stats-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(wave-stats-test PRIVATE shadps4)
+# tlg: SotC recompiler fixes (LDS barriers, S_WQM_B64); see the test for its env runs.
+add_executable(recompiler-fixes-test EXCLUDE_FROM_ALL ../tests/test_recompiler_fixes.cpp
+    ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(recompiler-fixes-test PRIVATE shim shadps4 third_party/gcn/include)
+target_compile_options(recompiler-fixes-test PRIVATE -UNDEBUG -fPIC)
+target_link_libraries(recompiler-fixes-test PRIVATE tlggpu)
+# tlg: first-run shader compilation, gate G4.1: translates a shader cache again from its .meta
+# files alone and compares the SPIR-V (local tool: needs the player's game files).
+add_executable(shader-replay EXCLUDE_FROM_ALL ../tests/shader_replay.cpp
+    ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(shader-replay PRIVATE . shim shadps4 third_party/gcn/include)
+target_compile_options(shader-replay PRIVATE -UNDEBUG -fPIC)
+target_link_libraries(shader-replay PRIVATE tlggpu)
 add_executable(pass-census-test EXCLUDE_FROM_ALL ../tests/test_pass_census.cpp)
 target_compile_options(pass-census-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(pass-census-test PRIVATE shadps4)
@@ -395,6 +433,9 @@ target_link_libraries(frame-capture-test PRIVATE Vulkan::Headers fmt::fmt Boost:
 add_executable(lighting-test-knob-test EXCLUDE_FROM_ALL ../tests/test_lighting_test.cpp)
 target_compile_options(lighting-test-knob-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(lighting-test-knob-test PRIVATE shadps4)
+add_executable(bc-decode-test EXCLUDE_FROM_ALL ../tests/test_bc_decode.cpp)
+target_compile_options(bc-decode-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(bc-decode-test PRIVATE shadps4)
 add_executable(amd-paths-test EXCLUDE_FROM_ALL ../tests/test_amd_paths.cpp)
 target_compile_options(amd-paths-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(amd-paths-test PRIVATE shadps4)
@@ -472,6 +513,11 @@ target_compile_options(perf-overlay-test PRIVATE -UNDEBUG)
 add_executable(cheat-hooks-test EXCLUDE_FROM_ALL ../tests/test_cheat_hooks.cpp)
 target_compile_options(cheat-hooks-test PRIVATE -UNDEBUG)
 add_executable(readback-queue-test EXCLUDE_FROM_ALL ../tests/test_readback_queue.cpp)
+
+# RX580 opt-in image-barrier coalescing, using Vulkan-Hpp without a GPU/driver.
+add_executable(barrier-merge-test EXCLUDE_FROM_ALL ../tests/test_barrier_merge.cpp)
+target_include_directories(barrier-merge-test PRIVATE shadps4 third_party/vulkan-headers/include)
+target_compile_options(barrier-merge-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(readback-queue-test PRIVATE shadps4)
 target_compile_options(readback-queue-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 add_executable(wait-diagnostics-test EXCLUDE_FROM_ALL ../tests/test_wait_diagnostics.cpp)
@@ -487,6 +533,10 @@ target_compile_options(actor-hook-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 add_executable(readback-sources-test EXCLUDE_FROM_ALL ../tests/test_readback_sources.cpp)
 target_include_directories(readback-sources-test PRIVATE shadps4)
 target_compile_options(readback-sources-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+add_executable(bit-array-test EXCLUDE_FROM_ALL ../tests/test_bit_array.cpp)
+target_include_directories(bit-array-test PRIVATE ../tests/stubs shim shadps4)
+target_compile_options(bit-array-test PRIVATE -UNDEBUG -Wall -Wextra -Werror -mavx2)
+
 add_executable(page-state-test EXCLUDE_FROM_ALL ../tests/test_page_state.cpp)
 target_include_directories(page-state-test PRIVATE ../tests/stubs shim shadps4)
 target_link_libraries(page-state-test PRIVATE Boost::headers)
@@ -497,5 +547,5 @@ add_executable(fsr4-bench EXCLUDE_FROM_ALL tools/fsr4_bench.cpp
 target_include_directories(fsr4-bench PRIVATE shadps4/video_core/renderer_vulkan/fsr411)
 target_link_libraries(fsr4-bench PRIVATE ffx-vulkan::fsr4-v07-vulkan ffx-vulkan::fsr4-v07-assets Vulkan::Vulkan)
 
-add_executable(cheat-hook-test ../tests/test_cheat_hook.cpp)
+add_executable(cheat-hook-test EXCLUDE_FROM_ALL ../tests/test_cheat_hook.cpp)
 target_compile_options(cheat-hook-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)

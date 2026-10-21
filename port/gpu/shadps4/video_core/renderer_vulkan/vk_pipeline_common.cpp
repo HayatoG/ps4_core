@@ -68,7 +68,7 @@ vk::Pipeline Pipeline::BuiltHandle() const {
 }
 
 
-void Pipeline::BindResources(DescriptorWrites& set_writes,
+void Pipeline::BindResources(DescriptorWrites& set_writes, u32 count,
                              const Shader::PushData& push_data) const {
     const auto bind_point =
         IsCompute() ? vk::PipelineBindPoint::eCompute : vk::PipelineBindPoint::eGraphics;
@@ -79,30 +79,31 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
     });
 
     // Bind descriptor set.
-    if (set_writes.empty()) {
+    if (count == 0) {
         return;
     }
+    const std::span<const vk::WriteDescriptorSet> writes{set_writes.data(), count};
 
     if (uses_push_descriptors) {
         if (!scheduler.IsRecordingDeferred()) {
-            scheduler.Record([&](vk::CommandBuffer cmdbuf) {
-                cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, set_writes);
+            scheduler.Record([bind_point, layout, writes](vk::CommandBuffer cmdbuf) {
+                cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, writes);
             });
             return;
         }
         // Writes and the infos they point to are laid out in the recording chunk, with the
         // pointers already aimed at those copies: the command only carries a span.
-        size_t bytes = set_writes.size() * sizeof(vk::WriteDescriptorSet) + 64;
-        for (const auto& write : set_writes) {
+        size_t bytes = writes.size() * sizeof(vk::WriteDescriptorSet) + 64;
+        for (const auto& write : writes) {
             bytes += write.descriptorCount *
                          (sizeof(vk::DescriptorBufferInfo) + sizeof(vk::DescriptorImageInfo) +
                           sizeof(vk::BufferView)) +
                      32;
         }
         scheduler.ReserveRecordData(bytes);
-        const auto writes = scheduler.RecordData(std::span<const vk::WriteDescriptorSet>{set_writes});
-        auto* patched = const_cast<vk::WriteDescriptorSet*>(writes.data());
-        for (size_t i = 0; i < writes.size(); ++i) {
+        const auto recorded = scheduler.RecordData(writes);
+        auto* patched = const_cast<vk::WriteDescriptorSet*>(recorded.data());
+        for (size_t i = 0; i < recorded.size(); ++i) {
             auto& write = patched[i];
             if (write.pBufferInfo) {
                 write.pBufferInfo = scheduler.RecordData(std::span{write.pBufferInfo, write.descriptorCount}).data();
@@ -115,14 +116,17 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
                     scheduler.RecordData(std::span{write.pTexelBufferView, write.descriptorCount}).data();
             }
         }
-        scheduler.Record([bind_point, layout, writes](vk::CommandBuffer cmdbuf) {
-            cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, writes);
+        scheduler.Record([bind_point, layout, recorded](vk::CommandBuffer cmdbuf) {
+            cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, recorded);
         });
         return;
     }
 
-    // Descriptor set updates are device calls: they stay on this thread.
+    // Descriptor set updates are device calls: they stay on this thread. The pool may hold more
+    // writes than this draw's, so drop them before the call (no element is constructed: the
+    // vector only grows, see EnsureSetWrites).
     const auto desc_set = desc_heap.Commit(*desc_layout);
+    set_writes.resize(count);
     for (auto& set_write : set_writes) {
         set_write.dstSet = desc_set;
     }

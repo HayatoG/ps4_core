@@ -1,3 +1,4 @@
+#include "tlg_perf_trace.h"
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -14,6 +15,7 @@
 #ifndef _WIN32
 #include <sys/resource.h>
 #endif
+#include "common/backports.h"
 #include "common/assert.h"
 #include "tlg_toggles.h"
 #include "tlg_freeze.h"
@@ -44,9 +46,80 @@ extern std::atomic<u32> g_tlg_compiles;
 extern std::atomic<u64> g_tlg_capture_ns, g_tlg_async_ns, g_tlg_compile_wait_ns;
 extern std::atomic<u64> g_tlg_snapshot_ns, g_tlg_guest_wait_ns;
 extern std::atomic<u32> g_tlg_pending_draws;
+extern std::atomic<u64> g_tlg_frames_ahead_wait_ns, g_tlg_free_frame_wait_ns;
+extern std::atomic<u64> g_tlg_present_lock_wait_ns;
+extern std::atomic<int> g_tlg_recorder_cpu_clock;
+extern std::atomic<u32> g_tlg_recorder_cpu_tid;
+extern std::atomic<u64> g_tlg_recorder_spin_ns;
 } // namespace Vulkan
 
 namespace Libraries::VideoOut {
+namespace {
+/// tlg: frame stats of the flip path: the time from a guest flip request being queued to the
+/// present thread taking it up. The timestamp belongs to the request that found the queue
+/// empty (a single flip in flight, the common case).
+std::atomic<u64> flip_request_ns{0};
+std::atomic<u64> flip_queue_wait_ns{0};
+std::atomic<u64> flip_queue_samples{0};
+
+u64 NowNs() {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+}
+
+/// tlg: CPU time of another thread, for the frame stats. Linux: the clock id the thread
+/// registered (pthread_getcpuclockid), as the GPU command thread does. Windows: user + kernel
+/// time through a handle opened once (GetThreadTimes has no clock id). 0 when unknown.
+#ifndef _WIN32
+u64 HelperThreadCpuNs(int clock, u32) {
+    if (clock == -1) {
+        return 0;
+    }
+    timespec ts{};
+    if (clock_gettime(static_cast<clockid_t>(clock), &ts) != 0) {
+        return 0;
+    }
+    return static_cast<u64>(ts.tv_sec) * 1000000000ull + static_cast<u64>(ts.tv_nsec);
+}
+#else
+u64 HelperThreadCpuNs(int, u32 tid) {
+    if (!tid) {
+        return 0;
+    }
+    static u32 slot_tids[4]{};
+    static HANDLE slot_handles[4]{};
+    HANDLE handle = nullptr;
+    for (u32 i = 0; i < 4; ++i) {
+        if (slot_tids[i] == tid) {
+            handle = slot_handles[i];
+            break;
+        }
+    }
+    if (!handle) {
+        for (u32 i = 0; i < 4; ++i) {
+            if (slot_tids[i] == 0) {
+                slot_tids[i] = tid;
+                slot_handles[i] = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
+                handle = slot_handles[i];
+                break;
+            }
+        }
+    }
+    if (!handle) {
+        return 0;
+    }
+    FILETIME created, exited, kernel, user;
+    if (!GetThreadTimes(handle, &created, &exited, &kernel, &user)) {
+        return 0;
+    }
+    const auto ns = [](const FILETIME& t) {
+        return ((static_cast<u64>(t.dwHighDateTime) << 32) | t.dwLowDateTime) * 100;
+    };
+    return ns(kernel) + ns(user);
+}
+#endif
+} // namespace
 
 constexpr static bool Is32BppPixelFormat(PixelFormat format) {
     switch (format) {
@@ -315,6 +388,16 @@ void VideoOutDriver::Flip(const Request& req) {
 
     // tlg: TLG_FRAME_STATS=1 prints flip rate and frame time spread every 5 seconds.
     static const bool frame_stats = EmulatorSettingsImpl::Flag("TLG_FRAME_STATS", false);
+    if (TlgPerf::FramesEnabled()) {
+        using Clock = std::chrono::steady_clock;
+        static auto last_trace = Clock::time_point{};
+        static std::uint64_t trace_frame = 0;
+        const auto now = Clock::now();
+        const auto interval = last_trace == Clock::time_point{} ? 0 :
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now - last_trace).count();
+        last_trace = now;
+        TlgPerf::FramePresented(++trace_frame, interval);
+    }
     if (frame_stats) {
         using Clock = std::chrono::steady_clock;
         static Clock::time_point window_start = Clock::now(), last = window_start;
@@ -520,6 +603,7 @@ void VideoOutDriver::Flip(const Request& req) {
                         frames ? double(TlgStats::scene_draws.exchange(0)) / frames : 0.0);
             presenter->GetRasterizer().GetPipelineCache().ReportCompilerStats();
             Vulkan::WaitDiagnostics::Report();
+            Common::Backports::LogHits();
             // Frame pacing: spread of the guest flip intervals (judder that the mean hides).
             if (intervals.size() > 2) {
                 std::vector<double> sorted = intervals;
@@ -538,6 +622,35 @@ void VideoOutDriver::Flip(const Request& req) {
                             median, std::sqrt(std::max(0.0, sq / intervals.size() - mean * mean)),
                             sorted[std::min(sorted.size() - 1, sorted.size() * 99 / 100)], spikes);
             }
+            // tlg: the waits that pace the frame (below the GPU thread's own, reported above)
+            // and the helper threads' CPU time, over the same window. The helper spin is idle
+            // CPU: stage B and the recorder pause up to TLG_PIPE_SPIN_US for the next packet.
+            const double frames_ahead_ms = Vulkan::g_tlg_frames_ahead_wait_ns.exchange(0) / 1e6;
+            const double free_frame_ms = Vulkan::g_tlg_free_frame_wait_ns.exchange(0) / 1e6;
+            const double present_lock_ms = Vulkan::g_tlg_present_lock_wait_ns.exchange(0) / 1e6;
+            const u64 flip_samples = flip_queue_samples.exchange(0);
+            const double flip_queue_ms =
+                flip_samples ? flip_queue_wait_ns.exchange(0) / 1e6 / double(flip_samples) : 0.0;
+            static u64 window_subs = 0, last_drawrec_cpu = 0, last_vkrec_cpu = 0;
+            const u64 all_subs = TlgStats::submissions.load();
+            const double subs_per_frame = frames ? double(all_subs - window_subs) / frames : 0.0;
+            window_subs = all_subs;
+            auto& rasterizer = presenter->GetRasterizer();
+            const u64 drawrec_cpu =
+                HelperThreadCpuNs(rasterizer.DrawPipeCpuClock(), rasterizer.DrawPipeCpuThreadId());
+            const u64 vkrec_cpu = HelperThreadCpuNs(Vulkan::g_tlg_recorder_cpu_clock.load(),
+                                                    Vulkan::g_tlg_recorder_cpu_tid.load());
+            std::printf("Frame waits: GPU frames %.1f ms, free frame %.1f ms, present lock "
+                        "%.1f ms, flip queue %.2f ms over %llu flips; %.1f submissions/frame; "
+                        "helper CPU: draw recording %.1f ms, Vulkan recorder %.1f ms (spin "
+                        "%.1f ms)\n",
+                        frames_ahead_ms, free_frame_ms, present_lock_ms, flip_queue_ms,
+                        static_cast<unsigned long long>(flip_samples), subs_per_frame,
+                        drawrec_cpu > last_drawrec_cpu ? (drawrec_cpu - last_drawrec_cpu) / 1e6 : 0.0,
+                        vkrec_cpu > last_vkrec_cpu ? (vkrec_cpu - last_vkrec_cpu) / 1e6 : 0.0,
+                        Vulkan::g_tlg_recorder_spin_ns.exchange(0) / 1e6);
+            last_drawrec_cpu = drawrec_cpu;
+            last_vkrec_cpu = vkrec_cpu;
             intervals.clear();
             window_start = now;
             frames = 0;
@@ -651,6 +764,10 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
             .index = index,
             .eop = is_eop,
         });
+        if (requests.size() == 1) {
+            // tlg: flip latency starts here (frame stats).
+            flip_request_ns.store(NowNs(), std::memory_order_relaxed);
+        }
     }
     request_cv.notify_one();
 }
@@ -689,6 +806,12 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         std::scoped_lock lk{mutex};
         if (!requests.empty()) {
             const auto request = requests.front();
+            if (requests.size() == 1) {
+                // tlg: how long the flip waited for its presentation slot (frame stats).
+                const u64 queued = flip_request_ns.load(std::memory_order_relaxed);
+                flip_queue_wait_ns.fetch_add(NowNs() - queued, std::memory_order_relaxed);
+                flip_queue_samples.fetch_add(1, std::memory_order_relaxed);
+            }
             requests.pop();
             return request;
         }

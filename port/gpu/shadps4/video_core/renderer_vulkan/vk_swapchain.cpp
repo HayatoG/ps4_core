@@ -11,6 +11,7 @@
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 
 namespace Vulkan {
@@ -30,11 +31,18 @@ Swapchain::Swapchain(const Instance& instance_, const Frontend::WindowSDL& windo
 }
 
 Swapchain::~Swapchain() {
-    Destroy();
+    // tlg: Destroy waits for the device, which needs host access to the graphics queue.
+    {
+        const auto queue_lock = Scheduler::LockQueue();
+        Destroy();
+    }
     instance.GetInstance().destroySurfaceKHR(surface);
 }
 
 void Swapchain::Create(u32 width_, u32 height_) {
+    // tlg: the rebuild waits for the device (Destroy) and destroys the swapchain and its image
+    // views while other threads submit on the same queue: hold the queue lock throughout.
+    const auto queue_lock = Scheduler::LockQueue();
     width = width_;
     height = height_;
     needs_recreation = false;
@@ -92,10 +100,15 @@ void Swapchain::SetHDR(bool hdr) {
         return;
     }
 
-    auto result = instance.GetDevice().waitIdle();
-    if (result != vk::Result::eSuccess) {
-        LOG_WARNING(ImGui, "Failed to wait for Vulkan device idle on mode change: {}",
-                    vk::to_string(result));
+    {
+        // tlg: the device wait needs host access to the graphics queue, which other threads
+        // submit on (Recreate below waits again with the lock).
+        const auto queue_lock = Scheduler::LockQueue();
+        auto result = instance.GetDevice().waitIdle();
+        if (result != vk::Result::eSuccess) {
+            LOG_WARNING(ImGui, "Failed to wait for Vulkan device idle on mode change: {}",
+                        vk::to_string(result));
+        }
     }
 
     needs_hdr = hdr;
@@ -215,9 +228,14 @@ void Swapchain::UpdateVsync() {
     if (TlgSettings::Get().vsync == vsync) {
         return;
     }
-    if (const auto result = instance.GetDevice().waitIdle(); result != vk::Result::eSuccess) {
-        LOG_WARNING(Render_Vulkan, "Failed to wait for the device before a VSync change: {}",
-                    vk::to_string(result));
+    {
+        // tlg: the device wait needs host access to the graphics queue, which other threads
+        // submit on.
+        const auto queue_lock = Scheduler::LockQueue();
+        if (const auto result = instance.GetDevice().waitIdle(); result != vk::Result::eSuccess) {
+            LOG_WARNING(Render_Vulkan, "Failed to wait for the device before a VSync change: {}",
+                        vk::to_string(result));
+        }
     }
     FindPresentMode();
     Recreate(width, height);

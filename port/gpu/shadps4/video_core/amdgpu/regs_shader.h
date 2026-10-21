@@ -3,7 +3,12 @@
 
 #pragma once
 
+#include <algorithm>
+#include <atomic>
+#include <optional>
+
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/types.h"
 #include "shader_recompiler/params.h"
 
@@ -221,23 +226,90 @@ struct ComputeProgram {
     }
 };
 
-static constexpr const BinaryInfo& SearchBinaryInfo(const u32* code) {
+// tlg: nullptr when the code has no valid binary info within the search limit. inFAMOUS points
+// a stage at code it has not finished writing yet (next to the smoke ducts the game copies the
+// effect's shaders in with the GPU right before using them), and the old UNREACHABLE stopped the
+// game ("Shader binary info not found", exit 23). Callers skip that draw or dispatch instead;
+// the next frame normally finds the finished code.
+//
+// The scan is bounded (search_limit dwords from the code) and an info block only counts when it
+// is consistent with the code in front of it: a non-empty, dword-sized length whose code span
+// ends at or before the block (OrbShdr follows the code it describes, padding aside). Half-copied
+// memory can hold a stale OrbShdr of another shader further on; its length would then put the
+// code span past the block, or the block past the limit, and that stage is skipped instead of
+// translated from garbage.
+inline constexpr u32 BinaryInfoSearchLimit = 0x4000; // dwords (64 KiB)
+
+static constexpr bool BinaryInfoMatchesCode(const u32* code, const BinaryInfo* info) {
+    const auto offset_dwords =
+        static_cast<u64>(reinterpret_cast<const u32*>(info) - code);
+    return info->Valid() && info->length != 0 && info->length % sizeof(u32) == 0 &&
+           info->length / sizeof(u32) <= offset_dwords && offset_dwords < BinaryInfoSearchLimit;
+}
+
+static constexpr const BinaryInfo* FindBinaryInfo(const u32* code) {
     constexpr u32 token_mov_vcchi = 0xBEEB03FF;
-    if (code[0] == token_mov_vcchi) {
+    if (code[0] == token_mov_vcchi && code[1] < BinaryInfoSearchLimit / 2) {
         const auto* info = std::bit_cast<const BinaryInfo*>(code + (code[1] + 1) * 2);
-        if (info->Valid()) {
-            return *info;
+        if (BinaryInfoMatchesCode(code, info)) {
+            return info;
         }
     }
-    constexpr u32 signature_size = sizeof(BinaryInfo::signature_ref) / sizeof(u8);
-    constexpr u32 search_limit = 0x4000;
-    const u32* end = code + search_limit;
+    const u32* end = code + BinaryInfoSearchLimit - sizeof(BinaryInfo) / sizeof(u32);
     for (const u32* it = code; it < end; ++it) {
         if (const BinaryInfo* info = std::bit_cast<const BinaryInfo*>(it); info->Valid()) {
-            return *info;
+            // The first OrbShdr after the code is this shader's; a bad one means the code is not
+            // there yet (do not keep scanning into whatever lies behind it).
+            return BinaryInfoMatchesCode(code, info) ? info : nullptr;
         }
     }
-    UNREACHABLE_MSG("Shader binary info not found.");
+    return nullptr;
+}
+
+static constexpr const BinaryInfo& SearchBinaryInfo(const u32* code) {
+    const BinaryInfo* info = FindBinaryInfo(code);
+    if (!info) {
+        UNREACHABLE_MSG("Shader binary info not found.");
+    }
+    return *info;
+}
+
+/// tlg: logs a stage without binary info once per code address (up to 64 addresses, then
+/// silently): several effects can be waiting for their code at the same time.
+inline void LogMissingBinaryInfo(const u32* code) {
+    static constexpr size_t MaxLogged = 64;
+    static std::atomic<uintptr_t> logged[MaxLogged]{};
+    static std::atomic<size_t> count{0};
+    const auto address = reinterpret_cast<uintptr_t>(code);
+    const size_t n = std::min(count.load(std::memory_order_relaxed), MaxLogged);
+    for (size_t i = 0; i < n; ++i) {
+        if (logged[i].load(std::memory_order_relaxed) == address) {
+            return;
+        }
+    }
+    const size_t slot = count.fetch_add(1, std::memory_order_relaxed);
+    if (slot >= MaxLogged) {
+        return;
+    }
+    logged[slot].store(address, std::memory_order_relaxed);
+    LOG_WARNING(Render, "tlg: shader at {} has no binary info yet; draw skipped{}",
+                fmt::ptr(code), slot + 1 == MaxLogged ? " (no more of these are logged)" : "");
+}
+
+/// tlg: the stage's parameters, or nothing when its code has no valid binary info yet; the
+/// caller then treats the stage as missing (the draw or dispatch is skipped).
+static std::optional<Shader::ShaderParams> TryGetParams(const auto& sh) {
+    const auto* code = sh.template Address<const u32*>();
+    const BinaryInfo* bininfo = code ? FindBinaryInfo(code) : nullptr;
+    if (!bininfo) {
+        LogMissingBinaryInfo(code);
+        return std::nullopt;
+    }
+    return Shader::ShaderParams{
+        .user_data = std::span<const u32, Shader::ShaderParams::NumShaderUserData>{sh.user_data},
+        .code = std::span<const u32>{code, bininfo->length / sizeof(u32)},
+        .hash = bininfo->shader_hash,
+    };
 }
 
 static constexpr Shader::ShaderParams GetParams(const auto& sh) {

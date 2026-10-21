@@ -5,6 +5,7 @@
  * Paths containing ".." components are rejected rather than normalized. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "gpu/tlggpu.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,6 +60,7 @@ typedef struct { char guest[64]; char host[512]; } Mount;
 static File files[MAX_FILES];
 static Mount mounts[MAX_MOUNTS];
 static size_t mount_count, opens, reads, writes, missing;
+static size_t bounce_reads, direct_reads; /* TLG_FILE_DIRECT: which path each chunk of a read took */
 static uint64_t bytes_read;
 static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
 
@@ -208,10 +210,16 @@ static int game_path(const char *p) {
 /* All operations return >=0 or -(host errno); wrappers adapt the convention. */
 static void log_io_problem(const char *what,const char *detail,int64_t n,int error);
 static int64_t do_open(const char *guest,int flags,int mode) {
-    if (game_path(guest) && (flags & (3|0x8|0x200|0x400|0x800))) return -EROFS;
+    if (game_path(guest) && (flags & (3|0x8|0x200|0x400|0x800))) {
+        if (runtime_verbose()) log_io_problem("open (read-only game mount)",guest,-EROFS,EROFS);
+        return -EROFS;
+    }
     char path[1024];
     int e=translate(guest,path,sizeof(path));
-    if (e) return -e;
+    if (e) {
+        if (runtime_verbose()) log_io_problem("open (path not translated)",guest,-e,e);
+        return -e;
+    }
 #ifdef _WIN32
     /* Windows cannot open a directory as a CRT descriptor: directories are listings only. */
     (void)mode;
@@ -240,6 +248,7 @@ static int64_t do_open(const char *guest,int flags,int mode) {
     if (host<0) {
         e=errno;
         if (e==ENOENT) { ++missing; printf("Runtime: open(%s) -> not found\n",guest); }
+        else if (runtime_verbose()) log_io_problem("open",guest,host,e);
         return -e;
     }
     struct stat s;
@@ -249,12 +258,18 @@ static int64_t do_open(const char *guest,int flags,int mode) {
     pthread_mutex_lock(&lock);
     int fd=-1;
     for (int i=3;i<MAX_FILES;++i) if (!files[i].used) { fd=i; break; }
-    if (fd<0) { pthread_mutex_unlock(&lock); if (host>=0) close(host); free_listing(dir); return -EMFILE; }
+    if (fd<0) { pthread_mutex_unlock(&lock); if (host>=0) close(host); free_listing(dir); if (runtime_verbose()) log_io_problem("open (descriptor table full)",guest,-EMFILE,EMFILE); return -EMFILE; }
     files[fd]=(File){.used=1,.host=host,.dir=dir,.append=(flags&0x8)!=0};
     pthread_mutex_init(&files[fd].io,NULL);
     snprintf(files[fd].path,sizeof(files[fd].path),"%s",guest);
+    tlggpu_note_open(guest); /* region trace (TLG_REGION_TRACE=1) */
     ++opens;
     pthread_mutex_unlock(&lock);
+    if (runtime_verbose()) {
+        static unsigned verbose_opens;
+        const unsigned n=__atomic_fetch_add(&verbose_opens,1,__ATOMIC_RELAXED);
+        if (n<256 || !(n%1000)) printf("Verbose: file open #%u (%s) -> fd %d, flags %#x, %lld bytes%s\n",n,guest,fd,flags,(long long)s.st_size,dir ? ", directory" : "");
+    }
     if (audio_trace() && strstr(guest,"sound/")) printf("Audio trace: open(%s) -> fd %d, %lld bytes\n",guest,fd,(long long)s.st_size);
     const char *mod_trace=getenv("TLG_MOD_TRACE"), *mod_root=getenv("TLG_MODS_DIR");
     if (mod_trace && mod_trace[0]=='1' && mod_root) {
@@ -274,6 +289,11 @@ static int64_t do_close(int fd) {
     pthread_mutex_lock(&lock);
     File *f=get(fd);
     if (!f) { pthread_mutex_unlock(&lock); return -EBADF; }
+    if (runtime_verbose()) {
+        static unsigned verbose_closes;
+        const unsigned n=__atomic_fetch_add(&verbose_closes,1,__ATOMIC_RELAXED);
+        if (n<256 || !(n%1000)) printf("Verbose: file close #%u (%s) fd %d\n",n,f->path,fd);
+    }
     if (f->host>=0) close(f->host);
     free_listing(f->dir);
     pthread_mutex_destroy(&f->io);
@@ -333,36 +353,53 @@ static void log_io_problem(const char *what,const char *detail,int64_t n,int err
  * after a short read or EFAULT: with precise readbacks the GPU tracker can protect a page again
  * between touch_for_write and the kernel copy, which then stops early without an error. The
  * game treats a short texture read as fatal (JsTex.cpp ASSERT readSize == sizeAlign.m_size). */
-#ifdef _WIN32
-/* Windows: the kernel copy into a GPU-protected guest page fails (ERROR_NOACCESS) instead of
- * faulting to our handler, and touching the pages first is not enough: the GPU can protect them
- * again before the copy (seen under Wine: 64 retries in a row, then a short read). Read into a
- * host buffer instead and copy in user mode, where every fault goes through the handler. */
+/* The kernel copy into a GPU-protected guest page fails (ERROR_NOACCESS on Windows, EFAULT on
+ * Linux) instead of faulting to our handler, and touching the pages first is not enough: the GPU
+ * can protect them again before the copy (Wine: 64 retries in a row, then a short read; Linux
+ * with precise readbacks: 'gave up after 64 retries' on streaming reads, 2026-10-15). Read into
+ * a host buffer instead and copy in user mode, where every fault goes through the handler. */
 enum { BOUNCE_BYTES=4u<<20 };
+/* TLG_FILE_DIRECT=1: read straight into the guest buffer first (one copy instead of two, which
+ * the large streaming reads care about) and fall back to the bounce buffer as soon as the kernel
+ * copy stops early (EFAULT: the GPU tracker protected a page again) or comes back short of what
+ * was asked for. Default off: the bounce path is the one that survived precise readbacks. */
+static int file_direct(void) {
+    static int value=-1;
+    if (value<0) { const char *e=getenv("TLG_FILE_DIRECT"); value=e && e[0]=='1'; }
+    return value;
+}
+/* Straight into the guest buffer; EFAULT here is the GPU tracker's page protection. The pages
+ * are touched first only on the out-of-memory path (as before): with TLG_FILE_DIRECT the touch
+ * would turn every read into tracked CPU writes, and an EFAULT moves the rest to the bounce. */
+static ssize_t direct_read(int h,unsigned char *at,uint64_t size,int64_t offset,int touch) {
+    if (touch) touch_for_write(at,size);
+    ssize_t n=offset<0 ? host_read(h,at,size) : pread(h,at,size,offset);
+    if (n>0) __atomic_add_fetch(&direct_reads,1,__ATOMIC_RELAXED);
+    return n;
+}
 static ssize_t bounce_read(int h,unsigned char *at,uint64_t size,int64_t offset) {
     static _Thread_local unsigned char *bounce;
     if (!bounce && !(bounce=malloc(BOUNCE_BYTES))) return -2;   /* no buffer: read directly */
+    __atomic_add_fetch(&bounce_reads,1,__ATOMIC_RELAXED);
     uint64_t want=size<BOUNCE_BYTES ? size : BOUNCE_BYTES;
     ssize_t n=offset<0 ? host_read(h,bounce,want) : pread(h,bounce,want,offset);
     if (n>0) memcpy(at,bounce,(size_t)n);
     return n;
 }
-#endif
 static ssize_t full_io(int h,void *buffer,uint64_t size,int64_t offset) {
     unsigned char *at=buffer;
     uint64_t done=0;
     int stalls=0;
+    int use_bounce=!file_direct();
     for (; done<size && stalls<64;) {
-#ifdef _WIN32
-        ssize_t n=bounce_read(h,at+done,size-done,offset<0 ? -1 : offset+(int64_t)done);
-        if (n==-2) {
-            touch_for_write(at+done,size-done);
-            n=offset<0 ? host_read(h,at+done,size-done) : pread(h,at+done,size-done,offset+(int64_t)done);
+        ssize_t n=use_bounce ? bounce_read(h,at+done,size-done,offset<0 ? -1 : offset+(int64_t)done)
+                             : direct_read(h,at+done,size-done,offset<0 ? -1 : offset+(int64_t)done,0);
+        if (n==-2) {   /* no bounce buffer (out of memory): read straight into the guest */
+            n=direct_read(h,at+done,size-done,offset<0 ? -1 : offset+(int64_t)done,1);
+        } else if (!use_bounce) {
+            if (n>=0 && (uint64_t)n<size-done) use_bounce=1;      /* short read: bounce the rest */
+            else if (n<0 && errno==EFAULT) { use_bounce=1; continue; } /* protected page */
         }
-#else
-        touch_for_write(at+done,size-done);
-        ssize_t n=offset<0 ? host_read(h,at+done,size-done) : pread(h,at+done,size-done,offset+(int64_t)done);
-#endif
         if (n<0) {
             if (errno==EINTR || errno==EFAULT) { ++stalls; continue; }
             if (done) log_read_problem("io (error after a partial read)",h,size,offset,(ssize_t)done,errno);
@@ -693,7 +730,7 @@ int64_t runtime_file_fstat(int fd,void *s) { return do_fstat(fd,s); }
 int64_t runtime_file_getdents(int fd,char *b,uint64_t n,int64_t *base) { return do_getdents(fd,b,n,base); }
 int runtime_file_translate(const char *guest,char *out,size_t size) { return translate(guest,out,size); }
 void runtime_file_report(void) {
-    printf("Runtime: files opened=%zu, reads=%zu (%llu bytes), writes=%zu, not found=%zu\n",
-           opens,reads,(unsigned long long)bytes_read,writes,missing);
+    printf("Runtime: files opened=%zu, reads=%zu (%llu bytes; %zu chunks via the bounce buffer, %zu direct), writes=%zu, not found=%zu\n",
+           opens,reads,(unsigned long long)bytes_read,bounce_reads,direct_reads,writes,missing);
 }
 

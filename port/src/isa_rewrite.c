@@ -87,6 +87,14 @@ static int record_valid(const IsaSite *s, uint64_t image_size) {
     if (s->kind >= ISA_EXTRQ && s->kind <= ISA_INSERTQ_IMM &&
         (s->dst > 15 || s->mem_slot != ISA_MEM_NONE || ((s->kind != ISA_EXTRQ_IMM) && s->src1 > 15)))
         return 0;
+    /* F16C: VEX.128 or VEX.256 (width 16 or 32 bytes), memory only as VCVTPH2PS source or VCVTPS2PH
+     * destination; the sites are 5+ bytes, so never int3 or relocated. */
+    if ((s->kind == ISA_VCVTPH2PS || s->kind == ISA_VCVTPS2PH) && s->mode != ISA_MODE_UNSUPPORTED) {
+        const int mem_ok = s->kind == ISA_VCVTPH2PS ? s->mem_slot != ISA_MEM_DST : s->mem_slot != ISA_MEM_SRC;
+        if ((s->width != 16 && s->width != 32) || !mem_ok || s->mode != ISA_MODE_JMP) return 0;
+        if ((s->mem_slot == ISA_MEM_DST) != (s->dst == ISA_NO_REG) || (s->mem_slot == ISA_MEM_SRC) != (s->src1 == ISA_NO_REG))
+            return 0;
+    }
     if (s->scale != 1 && s->scale != 2 && s->scale != 4 && s->scale != 8 && !(s->scale == 0 && s->index == ISA_NO_REG))
         return 0;
     if (s->mode == ISA_MODE_JMP && s->length < JMP_BYTES) return 0;
@@ -304,6 +312,60 @@ static size_t emit_sse4a_stub(unsigned char *code, const unsigned char *at, cons
     return emit_return(code, p, at, s, image, protect);
 }
 
+/* vmovdqu [rsp+disp8], ymm (store, VEX.256.F3.0F 7F) or vmovdqu ymm, [rsp+disp8] (load, 6F): C5 {R̄ 1111 1 10}
+ * modrm SIB 24 [disp8]. */
+static void emit_vmovdqu_rsp(unsigned char **p, int store, int ymm, uint8_t disp) {
+    emit_bytes(p, (const uint8_t[]){0xc5, ymm >= 8 ? 0x7e : 0xfe, store ? 0x7f : 0x6f}, 3);
+    emit_u8(p, (uint8_t)((disp ? 0x44 : 0x04) | (ymm & 7) << 3));
+    emit_u8(p, 0x24);
+    if (disp) emit_u8(p, disp);
+}
+
+/* F16C stub (VCVTPH2PS, VCVTPS2PH; the host has AVX but not F16C). It steps over the red zone and
+ * pushes an IsaRegs (gpr[4] then fixed to the guest rsp: memory operands may be rsp-based), saves
+ * rflags and clears DF, copies the source YMM register to a 64-byte buffer and calls
+ * isa_emulate_f16c (software conversion, no XMM) with the site, the registers and the buffer. The
+ * destination register, when there is one, is loaded back whole: the VEX forms zero its bits above
+ * the result. No other XMM/YMM register is touched, every GPR is popped back as it was. */
+static size_t emit_f16c_stub(unsigned char *code, const unsigned char *at, const IsaSite *s, uint64_t *hit,
+                             unsigned char *image, int protect) {
+    static const uint8_t pushes[] = {0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x41, 0x53, 0x41, 0x52, 0x41, 0x51,
+                                     0x41, 0x50, 0x57, 0x56, 0x55, 0x54, 0x53, 0x52, 0x51, 0x50};   /* r15..r8, rdi..rax */
+    static const uint8_t pops_low[] = {0x58, 0x59, 0x5a, 0x5b};                                    /* rax rcx rdx rbx */
+    static const uint8_t pops_high[] = {0x5d, 0x5e, 0x5f, 0x41, 0x58, 0x41, 0x59, 0x41, 0x5a, 0x41, 0x5b,
+                                        0x41, 0x5c, 0x41, 0x5d, 0x41, 0x5e, 0x41, 0x5f};             /* rbp..r15 */
+    unsigned char *p = code;
+    emit_bytes(&p, lea_rsp_below_red_zone, sizeof lea_rsp_below_red_zone);
+    emit_bytes(&p, pushes, sizeof pushes);
+    emit_u8(&p, 0x9c);                                                     /* pushfq: rsp = IsaRegs* */
+    emit_bytes(&p, (const uint8_t[]){0x48, 0x8d, 0x84, 0x24, 0x08, 0x01, 0x00, 0x00}, 8);   /* lea rax,[rsp+0x108] */
+    emit_mov_store(&p, 0, 8 + 8 * 4);                                      /* gpr[4] = guest rsp */
+    emit_u8(&p, 0xfc);                                                     /* cld */
+    emit_bytes(&p, (const uint8_t[]){0x48, 0x8d, 0x64, 0x24, 0xc0}, 5);   /* lea rsp,[rsp-0x40]: the buffer */
+    if (s->src1 != ISA_NO_REG) emit_vmovdqu_rsp(&p, 1, s->src1, 0x20);
+    emit_bytes(&p, (const uint8_t[]){0x48, 0xb8}, 2);                      /* mov rax, &hits[i] */
+    emit_u64(&p, (uint64_t)(uintptr_t)hit);
+    emit_bytes(&p, (const uint8_t[]){0x48, 0xff, 0x00}, 3);                /* inc qword [rax] */
+    emit_bytes(&p, (const uint8_t[]){0x48, 0x89, 0xe5}, 3);                /* mov rbp, rsp */
+    emit_bytes(&p, (const uint8_t[]){0x48, 0x83, 0xe4, 0xf0}, 4);          /* and rsp, -16 */
+    emit_bytes(&p, (const uint8_t[]){0x48, 0xbf}, 2);                      /* mov rdi, site */
+    emit_u64(&p, (uint64_t)(uintptr_t)s);
+    emit_bytes(&p, (const uint8_t[]){0x48, 0x8d, 0x75, 0x40}, 4);          /* lea rsi, [rbp+0x40] (IsaRegs) */
+    emit_bytes(&p, (const uint8_t[]){0x48, 0x89, 0xea}, 3);                /* mov rdx, rbp (the buffer) */
+    emit_bytes(&p, (const uint8_t[]){0x48, 0xb8}, 2);                      /* mov rax, isa_emulate_f16c */
+    emit_u64(&p, (uint64_t)(uintptr_t)isa_emulate_f16c);
+    emit_bytes(&p, (const uint8_t[]){0xff, 0xd0}, 2);                      /* call rax */
+    emit_bytes(&p, (const uint8_t[]){0x48, 0x89, 0xec}, 3);                /* mov rsp, rbp */
+    if (s->dst != ISA_NO_REG) emit_vmovdqu_rsp(&p, 0, s->dst, 0);
+    emit_bytes(&p, (const uint8_t[]){0x48, 0x8d, 0x64, 0x24, 0x40}, 5);   /* lea rsp,[rsp+0x40] */
+    emit_u8(&p, 0x9d);                                                     /* popfq */
+    emit_bytes(&p, pops_low, sizeof pops_low);
+    emit_bytes(&p, (const uint8_t[]){0x48, 0x8d, 0x64, 0x24, 0x08}, 5);   /* lea rsp,[rsp+8]: gpr[4] */
+    emit_bytes(&p, pops_high, sizeof pops_high);
+    emit_bytes(&p, lea_rsp_above_red_zone, sizeof lea_rsp_above_red_zone);
+    return emit_return(code, p, at, s, image, protect);
+}
+
 /* Writes the stub for `s` into `code` (laid out to run at `at`). Returns its size, or 0 when the
  * jmp back is out of rel32 range. */
 static size_t emit_stub(unsigned char *code, const unsigned char *at, const IsaSite *s, uint64_t *hit,
@@ -312,6 +374,7 @@ static size_t emit_stub(unsigned char *code, const unsigned char *at, const IsaS
     static const uint8_t lea_rax_rsp_up[] = {0x48, 0x8d, 0x84, 0x24, 0x00, 0x01, 0x00, 0x00}; /* lea rax,[rsp+0x100] */
     static const uint8_t lea_rsp_up[] = {0x48, 0x8d, 0xa4, 0x24, 0x00, 0x01, 0x00, 0x00};     /* lea rsp,[rsp+0x100] */
     if (isa_kind_is_sse4a(s->kind)) return emit_sse4a_stub(code, at, s, hit, image, protect);
+    if (isa_kind_is_f16c(s->kind)) return emit_f16c_stub(code, at, s, hit, image, protect);
     unsigned char *p = code;
     emit_bytes(&p, lea_rsp_down, sizeof lea_rsp_down);
     for (int reg = 0; reg < 16; reg++)
@@ -484,6 +547,7 @@ int isa_rewrite_trap(IsaTable *t, uintptr_t address, IsaRegs *regs, void *xmm, u
     if (lo == t->count || t->sites[lo].offset != offset) return 0;
     if (t->sites[lo].mode != ISA_MODE_INT3 || *(const unsigned char *)address != 0xcc) return 0;
     const IsaSite *s = &t->sites[lo];
+    if (isa_kind_is_f16c(s->kind)) return 0;   /* never int3 (VEX sites are 5+ bytes); YMM is not in the frame */
     if (isa_kind_is_sse4a(s->kind)) {
         if (!xmm) return 0;
         uint64_t operands[4] = {0, 0, 0, 0};

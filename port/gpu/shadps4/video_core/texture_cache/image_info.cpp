@@ -129,6 +129,11 @@ ImageInfo::ImageInfo(const AmdGpu::Image& image, const Shader::ImageResource& de
     }
     type = image.GetBaseType();
     props.is_host_2d = image.IsBlock1D();
+    if (AmdGpu::All1DAs2D() && props.is_host_2d && type == AmdGpu::ImageType::Color1D) {
+        // tlg: BP09, as a 2D image from here on, so that it matches the 2D render target it is
+        // sampled from (the colour-grading LUT) instead of being a separate, stale image.
+        type = AmdGpu::ImageType::Color2D;
+    }
     if (image.IsBlock1D()) {
         // tlg: diagnostics for the BC 1D -> 2D promotion (one line per distinct shape).
         static std::mutex seen_mutex;
@@ -161,10 +166,89 @@ ImageInfo::ImageInfo(const AmdGpu::Image& image, const Shader::ImageResource& de
 
     alt_tile = Libraries::Kernel::sceKernelIsNeoMode() && image.alt_tile_mode;
     UpdateSize();
+
+    // tlg: TLG_BC_TINY (video_core/amdgpu/tlg_bc_tiny.h): BC1-BC5 images that are 1D or smaller
+    // than a block in either dimension become plain images decoded on the CPU.
+    const auto guest_type = image.GetType();
+    const bool is_1d = guest_type == AmdGpu::ImageType::Color1D ||
+                       guest_type == AmdGpu::ImageType::Color1DArray;
+    const vk::Format decoded = BcTinyDecodedFormat(pixel_format);
+    if (AmdGpu::BcTinyDecode() && props.is_block && !props.is_depth && !props.is_volume &&
+        !props.is_host_2d && num_samples == 1 && decoded != vk::Format::eUndefined &&
+        !AmdGpu::IsMacroTiled(array_mode) && (is_1d || size.width < 4 || size.height < 4)) {
+        static std::mutex seen_mutex;
+        static std::set<u64> seen;
+        const u64 key = (u64(size.width) << 40) | (u64(size.height) << 24) |
+                        (u64(pixel_format) << 8) | u64(guest_type);
+        std::scoped_lock lock{seen_mutex};
+        if (seen.insert(key).second && seen.size() < 64) {
+            LOG_WARNING(Render_Vulkan,
+                        "tlg: BC image {}x{} {} type {} tile {} layers {} mips {} at {:#x} -> {} "
+                        "(CPU decode, TLG_BC_TINY)",
+                        size.width, size.height, vk::to_string(pixel_format), u32(guest_type),
+                        AmdGpu::NameOf(tile_mode), resources.layers, resources.levels,
+                        guest_address, vk::to_string(decoded));
+        }
+        props.is_bc_decoded = true;
+        bc_format = pixel_format;
+        pixel_format = decoded;
+    }
+}
+
+vk::Format BcTinyDecodedFormat(vk::Format format) noexcept {
+    switch (format) {
+    case vk::Format::eBc1RgbUnormBlock:
+    case vk::Format::eBc1RgbaUnormBlock:
+    case vk::Format::eBc2UnormBlock:
+    case vk::Format::eBc3UnormBlock:
+        return vk::Format::eR8G8B8A8Unorm;
+    case vk::Format::eBc1RgbSrgbBlock:
+    case vk::Format::eBc1RgbaSrgbBlock:
+    case vk::Format::eBc2SrgbBlock:
+    case vk::Format::eBc3SrgbBlock:
+        return vk::Format::eR8G8B8A8Srgb;
+    case vk::Format::eBc4UnormBlock:
+        return vk::Format::eR8Unorm;
+    case vk::Format::eBc4SnormBlock:
+        return vk::Format::eR8Snorm;
+    case vk::Format::eBc5UnormBlock:
+        return vk::Format::eR8G8Unorm;
+    case vk::Format::eBc5SnormBlock:
+        return vk::Format::eR8G8Snorm;
+    default:
+        return vk::Format::eUndefined;
+    }
+}
+
+std::optional<BcDecode::Kind> BcTinyDecodeKind(vk::Format format) noexcept {
+    switch (format) {
+    case vk::Format::eBc1RgbUnormBlock:
+    case vk::Format::eBc1RgbaUnormBlock:
+    case vk::Format::eBc1RgbSrgbBlock:
+    case vk::Format::eBc1RgbaSrgbBlock:
+        return BcDecode::Kind::Bc1;
+    case vk::Format::eBc2UnormBlock:
+    case vk::Format::eBc2SrgbBlock:
+        return BcDecode::Kind::Bc2;
+    case vk::Format::eBc3UnormBlock:
+    case vk::Format::eBc3SrgbBlock:
+        return BcDecode::Kind::Bc3;
+    case vk::Format::eBc4UnormBlock:
+        return BcDecode::Kind::Bc4Unorm;
+    case vk::Format::eBc4SnormBlock:
+        return BcDecode::Kind::Bc4Snorm;
+    case vk::Format::eBc5UnormBlock:
+        return BcDecode::Kind::Bc5Unorm;
+    case vk::Format::eBc5SnormBlock:
+        return BcDecode::Kind::Bc5Snorm;
+    default:
+        return std::nullopt;
+    }
 }
 
 bool ImageInfo::IsCompatible(const ImageInfo& info) const {
-    return (IsVulkanFormatCompatible(pixel_format, info.pixel_format) ||
+    return props.is_bc_decoded == info.props.is_bc_decoded &&
+           (IsVulkanFormatCompatible(pixel_format, info.pixel_format) ||
             IsVulkanFormatCompatible(info.pixel_format, pixel_format)) &&
            num_samples == info.num_samples && num_bits == info.num_bits;
 }

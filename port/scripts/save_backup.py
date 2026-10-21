@@ -54,7 +54,7 @@ def backup(user_dir, now=None, keep=KEEP):
     return made
 
 
-def restore(user_dir, name, now=None):
+def restore(user_dir, name, now=None, keep=KEEP):
     """Replaces savedata with backup `name`; returns the backup of the saves it replaced."""
     if not name or name not in list_backups(user_dir):
         raise ValueError(f'No save backup named {name!r}')
@@ -65,8 +65,19 @@ def restore(user_dir, name, now=None):
     staging = Path(user_dir) / 'savedata.restoring'
     shutil.rmtree(staging, ignore_errors=True)
     shutil.copytree(source, staging)
-    shutil.rmtree(savedata, ignore_errors=True)
-    staging.rename(savedata)
-    _prune(user_dir)
+    # Swap by renames: the current saves stay on disk (as `savedata.replaced`) until the restored
+    # ones are in place, so a failure never leaves the folder without saves.
+    aside = Path(user_dir) / 'savedata.replaced'
+    shutil.rmtree(aside, ignore_errors=True)
+    if savedata.exists():
+        savedata.rename(aside)
+    try:
+        staging.rename(savedata)
+    except OSError:
+        if aside.exists():
+            aside.rename(savedata)
+        raise
+    shutil.rmtree(aside, ignore_errors=True)
+    _prune(user_dir, keep)
     return safety
 

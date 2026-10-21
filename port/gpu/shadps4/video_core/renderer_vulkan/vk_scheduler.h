@@ -919,7 +919,32 @@ public:
         priority_pending_ops_cv.notify_one();
     }
 
+    /// tlg: the graphics queue lock: Vulkan needs every submit, sparse bind and present on the
+    /// queue externally synchronized, and the presenter presents on the same queue. Held across
+    /// each whole SubmitExecution unless TLG_SPLIT_SUBMIT_LOCK=1.
     static std::mutex submit_mutex;
+
+    /// tlg: the graphics queue lock for a host call that synchronizes the device or its queues
+    /// outside a submission or a present (vkDeviceWaitIdle, vkDestroySwapchainKHR in the
+    /// swapchain paths): Vulkan needs host access to every queue of the device externally
+    /// synchronized, and other threads submit while the presenter rebuilds the swapchain. Lock
+    /// order is execution_mutex then submit_mutex, so the caller must hold no scheduler lock
+    /// (and must not take one while holding this).
+    [[nodiscard]] static std::unique_lock<std::mutex> LockQueue() {
+        return std::unique_lock<std::mutex>{submit_mutex};
+    }
+
+    /// tlg: TLG_SPLIT_SUBMIT_LOCK=1: each scheduler serializes its own SubmitExecution
+    /// (execution_mutex) and takes submit_mutex only around the queue calls. Lock order:
+    /// execution_mutex, then submit_mutex.
+    static bool SplitSubmitLock();
+
+    /// tlg: submit_mutex for a queue call made inside SubmitExecution (the submit callback's
+    /// sparse binds): locked only in split mode, where SubmitExecution does not hold it.
+    [[nodiscard]] static std::unique_lock<std::mutex> LockQueueInSubmit() {
+        return SplitSubmitLock() ? std::unique_lock<std::mutex>{submit_mutex}
+                                 : std::unique_lock<std::mutex>{};
+    }
 
 private:
     void AllocateWorkerCommandBuffers();
@@ -938,6 +963,7 @@ private:
     CommandPool command_pool;
     DynamicState dynamic_state;
     SubmitFunc on_submit{};
+    std::mutex execution_mutex; ///< tlg: this scheduler's SubmitExecution (split submit lock)
     vk::CommandBuffer current_cmdbuf;
     std::condition_variable_any event_cv;
     struct PendingOp {

@@ -34,6 +34,7 @@ struct Profile {
     bool support_fp32_signed_zero_inf_nan_preserve{};
     bool support_fp64_signed_zero_inf_nan_preserve{};
     bool supports_image_load_store_lod{};
+    bool supports_maximal_reconvergence{}; // tlg: BP06
     bool supports_native_cube_calc{};
     bool supports_trinary_minmax{};
     bool supports_buffer_fp32_atomic_min_max{};
@@ -57,6 +58,10 @@ struct Profile {
     /// tlg: TLG_LIGHTING_TEST=dref (vk_lighting_test.h): depth comparisons return the result
     /// in all four channels instead of (v, 0, 0, 0).
     bool dref_broadcast{};
+    /// tlg: block-compressed 1D textures are 2D images (video_core/amdgpu/tlg_block1d.h).
+    bool block1d_as_2d{};
+    /// tlg: tiny BC textures decoded to plain images (video_core/amdgpu/tlg_bc_tiny.h).
+    bool bc_tiny_decode{};
 
     bool operator==(const Profile&) const = default;
 };

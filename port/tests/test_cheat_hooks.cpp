@@ -34,6 +34,8 @@ int main(int argc, char** argv) {
             assert(hook.offset + hook.length <= image.size());
             assert(tlg_cheat_signature_match(&hook, image.data() + hook.offset, image.size() - hook.offset));
         }
+        // Only the stat stores run here; the very hard and double jump stubs run in cheat-hook-test.
+        if (hook.id > TLG_CHEAT_ORBS) continue;
 #ifdef _WIN32
         auto* executable = static_cast<unsigned char*>(VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
 #else
@@ -101,5 +103,5 @@ int main(int argc, char** argv) {
         munmap(executable, 4096);
 #endif
     }
-    std::puts("cheat-hooks-test: OK (6 hooks, live toggles, registers, flags, signatures, non-player health)");
+    std::puts("cheat-hooks-test: OK (8 hooks, 6 executed, live toggles, registers, flags, signatures, non-player health)");
 }

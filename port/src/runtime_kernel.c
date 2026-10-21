@@ -182,7 +182,8 @@ static ABI __attribute__((noreturn)) void hard_exit(int status) {
 static ABI __attribute__((noreturn)) void raise_exception(uint32_t code,uint64_t argument) {
     fprintf(stderr,"STOP: guest raised debug exception code=0x%x argument=0x%llx\n",code,(unsigned long long)argument);
     runtime_report();
-    exit(23);
+    fflush(NULL);
+    _exit(23); /* no destructors: GPU, audio and guest threads are still running (#189) */
 }
 /* The process was started without arguments other than its own name. */
 static const char *guest_argv[]={"eboot.bin",NULL};
@@ -209,7 +210,8 @@ static ABI void pthread_cxa_finalize(void *dso) { (void)dso; }
 static ABI __attribute__((noreturn)) void unwind_resume(void) {
     fputs("STOP: guest C++ exception unwinding (sigreturn/__Ux86_64_setcontext) is not supported\n",stderr);
     runtime_report();
-    exit(23);
+    fflush(NULL);
+    _exit(23); /* no destructors: GPU, audio and guest threads are still running */
 }
 static ABI int32_t print_backtrace(void) {
     fputs("Runtime: guest requested a backtrace (not available)\n",stderr);
@@ -279,8 +281,14 @@ static ABI int32_t guest_sysctl(const int32_t *name,uint32_t namelen,void *old,u
 }
 
 /* ---- pthread_once and thread-specific data ---- */
+/* The routine runs once; the others wait for the state to become 1. A routine that never returns
+ * normally (thread exit, a longjmp out of it, a crash) leaves the waiters in the loop, as in
+ * FreeBSD's libthr they would stay blocked in the kernel: the loop cannot be resolved without
+ * changing the semantics. It sleeps between checks (a yield at first, then 0.1 ms, then 1 ms)
+ * instead of burning a core with sched_yield. */
 static ABI int32_t thread_once(int32_t *once,void (ABI *routine)(void)) {
     if (!once || !routine) return ERR(22);
+    unsigned turns=0;
     for (;;) {
         int32_t state=__atomic_load_n(once,__ATOMIC_ACQUIRE);
         if (state==1) return 0;
@@ -289,7 +297,14 @@ static ABI int32_t thread_once(int32_t *once,void (ABI *routine)(void)) {
             __atomic_store_n(once,1,__ATOMIC_RELEASE);
             return 0;
         }
-        sched_yield();
+        if (++turns<=8) { sched_yield(); continue; }
+        const uint64_t ns=turns<64 ? 100000 : 1000000;
+#ifdef _WIN32
+        compat_sleep_ns(ns);
+#else
+        struct timespec nap={.tv_sec=0,.tv_nsec=(long)ns};
+        nanosleep(&nap,NULL);
+#endif
     }
 }
 static ABI int32_t posix_once(int32_t *once,void (ABI *routine)(void)) { return thread_once(once,routine) ? 22 : 0; }

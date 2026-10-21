@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include <cctype>
 #include "tlg_settings.h"
 #include "tlg_orbs.h"
 #include "tlg_graphics.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -60,6 +62,20 @@ void Set(Values& v, const std::string& key, const std::string& value) {
     for (unsigned cheat = 0; cheat < TLG_CHEAT_COUNT; ++cheat) {
         if (key == cheat_keys[cheat]) {
             v.cheats[cheat] = i != 0;
+            return;
+        }
+    }
+    if (key.size() == 4 && key[0] == 'b' && key[1] == 'p' && std::isdigit((unsigned char)key[2]) &&
+        std::isdigit((unsigned char)key[3])) {
+        const int n = (key[2] - '0') * 10 + (key[3] - '0');
+        if (n >= 1 && n <= kBackportPrefs && !value.empty()) {
+            v.backport_pref[n - 1] = i != 0;
+        }
+        return;
+    }
+    for (int e = 0; e < kExtraPrefs; ++e) {
+        if (key == kExtraKeys[e]) {
+            v.extra_pref[e] = value.empty() ? -1 : i != 0;
             return;
         }
     }
@@ -151,6 +167,8 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.blue_orb_multiplier = TlgOrbs::ClampMultiplier(f);
     } else if (key == "gold_orb_multiplier") {
         v.gold_orb_multiplier = TlgOrbs::ClampMultiplier(f);
+    } else if (key == "mip_lod_bias") {
+        v.mip_lod_bias = std::isfinite(f) ? std::clamp(f, -3.0f, 3.0f) : 0.0f;
     } else if (key == "fsr4_auto_exposure") {
         v.fsr4_auto_exposure = i != 0;
     } else if (key == "fsr4_invert_jitter") {
@@ -239,6 +257,7 @@ void Load() {
         {"TLG_MOUSE_ACCEL", "mouse_accel"},          {"TLG_MOUSE_DEADZONE", "mouse_deadzone"},
         {"TLG_SMAA", "smaa"},
         {"TLG_CAS", "cas"},                          {"TLG_COLOR_ADJUST", "color_adjust"},
+        {"TLG_MIP_LOD_BIAS", "mip_lod_bias"},
     };
     for (const auto& [env, key] : env_keys) {
         if (const char* value = std::getenv(env); value && value[0]) {
@@ -365,10 +384,20 @@ void Save() {
                  v.engine_fps.load(), int(v.deferred_readback.load()), int(v.stale_readback.load()),
                  int(v.restart_unconfirmed.load()));
     std::fprintf(file,
+    // Fixes: applied on the next start by the launcher (TLG_BPnn / TLG_<NAME>); only the ones
+    // the player or the launcher chose are written.
+    for (int n = 0; n < kBackportPrefs; ++n) {
+        if (const int p = v.backport_pref[n]; p >= 0) std::fprintf(file, "bp%02d=%d\n", n + 1, p);
+    }
+    for (int e = 0; e < kExtraPrefs; ++e) {
+        if (const int p = v.extra_pref[e]; p >= 0) std::fprintf(file, "%s=%d\n", kExtraKeys[e], p);
+    }
+    std::fprintf(file,
                  "mouse_enabled=%d\nmouse_sensitivity=%.2f\nmouse_invert_y=%d\nmouse_smoothing=%.2f\n"
                  "mouse_accel=%.2f\nmouse_deadzone=%.2f\nkey_map=%s\n",
                  int(v.mouse_enabled.load()), v.mouse_sensitivity.load(), int(v.mouse_invert_y.load()),
                  v.mouse_smoothing.load(), v.mouse_accel.load(), v.mouse_deadzone.load(), v.key_map.c_str());
+    std::fprintf(file, "mip_lod_bias=%.3f\n", v.mip_lod_bias.load());
     std::fprintf(file,
                  "smaa=%d\ncas=%d\ncas_strength=%d\ncolor_adjust=%d\ncolor_brightness=%.2f\n"
                  "color_contrast=%.2f\ncolor_saturation=%.2f\ncolor_gamma=%.2f\n",

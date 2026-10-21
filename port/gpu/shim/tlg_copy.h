@@ -33,6 +33,10 @@ void QueueCopy(const Item& item);
 /// Starts the calling thread's batch.
 void FlushBatch();
 
+/// True when the calling thread has a non-empty copy batch or async copy tasks are in flight.
+/// Takes the copy pool's lock: meant for diagnostics, not hot paths.
+bool HasPending();
+
 /// Starts the calling thread's batch, then waits until every task passed to Async() so far
 /// has finished.
 void WaitAsync();
