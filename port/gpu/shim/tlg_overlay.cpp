@@ -310,16 +310,6 @@ void SliderRow(const char* label, std::atomic<int>& value, int lo, int hi, const
     ImGui::PopID();
 }
 
-void FloatRow(const char* label, std::atomic<float>& value, float lo, float hi, const char* format, const char* help) {
-    Row(label);
-    float v = value;
-    if (ImGui::SliderFloat("##value", &v, lo, hi, format, ImGuiSliderFlags_AlwaysClamp)) {
-        Store(value, std::clamp(v, lo, hi), true);
-    }
-    Help(help);
-    ImGui::PopID();
-}
-
 const char* TL(const char* en, const char* pt);
 
 // A float slider over a color range, with a button back to its neutral value.

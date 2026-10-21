@@ -733,6 +733,11 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             Common::Backports::Hit(Common::Backports::Id::PipelineCacheBlob);
         }
     }
+    // tlg: the shader loop budgets in force (0 = off); see recompiler_toggles.h.
+    LOG_INFO(Render_Vulkan,
+             "tlg: shader loop budget {} iterations per loop, {} per invocation "
+             "(TLG_LOOP_LIMIT_PER_LOOP, TLG_LOOP_LIMIT; 0 = off)",
+             Shader::Toggles::PerLoopBudget(), Shader::Toggles::LoopBudget());
 }
 
 PipelineCache::~PipelineCache() {

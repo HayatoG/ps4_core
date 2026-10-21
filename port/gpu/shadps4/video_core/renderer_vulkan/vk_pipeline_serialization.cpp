@@ -26,6 +26,7 @@
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
+#include "shader_recompiler/recompiler_toggles.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_amd_paths.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -38,7 +39,7 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 9u; // tlg: LDS barrier scope per guest wave
+static constexpr u32 ShaderBinaryVersion = 10u; // tlg: loop budgets (SotC, gr2 3331178)
 static constexpr u32 ShaderMetaVersion = 9u; // tlg: LDS barrier scope per guest wave
 static constexpr u32 PipelineKeyVersion = 5u; // tlg: Info layout (ImageResource::needs_native)
 } // namespace Serialization
@@ -49,7 +50,8 @@ namespace {
 // tlg: the test knobs that change recompiled SPIR-V (TLG_LIGHTING_TEST=dref,
 // TLG_AMD_PATHS_OFF=shaderext) get their own shader binary cache version, and so do the
 // recompiler switches of recompiler_toggles.h (TLG_LDS_SMALL/MULTI/READLANE, TLG_WQM,
-// TLG_LANE_DIVERGENCE, TLG_RFL_ALL): the
+// TLG_LANE_DIVERGENCE, TLG_RFL_ALL, and the loop budgets TLG_LOOP_LIMIT /
+// TLG_LOOP_LIMIT_PER_LOOP in the top 8 bits): the
 // base and the lighting salt stay below 64.
 u32 CurrentShaderBinaryVersion() {
     return LightingTest::ShaderBinaryVersion(
@@ -57,7 +59,8 @@ u32 CurrentShaderBinaryVersion() {
                LightingTest::ShaderBinarySalt(LightingTest::Current().dref,
                                               AmdPathsOff::Current().shaderext)) +
            64u * Shader::Toggles::ShaderBinarySalt() +
-           4096u * Common::Backports::ShaderSalt();
+           4096u * Common::Backports::ShaderSalt() +
+           (Shader::Toggles::LoopBudgetSalt() & 0xffu) * (1u << 24);
 }
 } // namespace
 

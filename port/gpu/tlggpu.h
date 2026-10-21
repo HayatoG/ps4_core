@@ -93,25 +93,6 @@ typedef struct { uint64_t submitted, shown, presented, vblanks, faults_in_progre
 void tlggpu_frame_counters(TlgGpuFrameCounters *out);
 /* The game opened a file (guest path): feeds the region trace (TLG_REGION_TRACE=1, gpu/shim/tlg_region.h). */
 void tlggpu_note_open(const char *guest_path);
-/* The mouse, gathered by the window thread while the game has it (SDL relative mode: the window
- * has focus, the port's menu is closed and Esc did not release it; a click takes it again).
- * take: motion in mouse counts and wheel notches since the last call, then cleared. Buttons are
- * bits (1 << (SDL button - 1)): held now, and pressed since the last call (a short click). */
-typedef struct {
-    float dx, dy;
-    uint32_t held, pressed;
-    int32_t wheel_up, wheel_down, wheel_left, wheel_right;
-    int32_t captured;
-} TlgGpuMouse;
-void tlggpu_mouse_take(TlgGpuMouse *mouse);
-/* Mouse and keyboard settings (tlg.ini; the menu changes the mouse ones live). key_map: the
- * tlg.ini key_map value, the TLG_KEY_MAP syntax (runtime_pad.c), read once at start. */
-typedef struct {
-    int32_t mouse_enabled, invert_y;
-    float sensitivity, smoothing, accel, deadzone;
-    char key_map[512];
-} TlgGpuInputSettings;
-void tlggpu_input_settings(TlgGpuInputSettings *settings);
 /* Touchpad mode of the mouse (runtime_pad.c): while active, a small touchpad with the virtual
  * finger is drawn in the corner (x, y: 0..1 over the pad; touching: the game sees the finger;
  * clicking: the pad is pressed). */

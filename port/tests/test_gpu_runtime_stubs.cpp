@@ -25,6 +25,5 @@ int32_t* runtime_errno() { std::abort(); }
 int runtime_memory_write_backing(uintptr_t, const void*, uint64_t) { std::abort(); }
 int runtime_memory_fill_backing(uintptr_t, int, uint64_t) { std::abort(); }
 int runtime_memory_read_backing(uintptr_t, void*, uint64_t) { std::abort(); }
-void runtime_report() {}
 }
 

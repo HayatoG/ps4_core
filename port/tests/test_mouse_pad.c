@@ -42,6 +42,9 @@ static PadData move(float dx, float dy, int samples) {
 
 int main(void) {
     setenv("SDL_VIDEODRIVER","dummy",1);
+    /* The core's default mouse buttons are The Last Guardian's; a game's profile sets its own
+     * through TLG_KEY_MAP. This test uses inFAMOUS' (left R2, right L2, middle R3). */
+    setenv("TLG_KEY_MAP","r2=Mouse Left,l2=Mouse Right,r3=Mouse Middle",1);
     SDL_SetHint(SDL_HINT_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT,"0x1d50/0x6189");
     assert(SDL_Init(SDL_INIT_VIDEO|SDL_INIT_GAMEPAD));
     assert(pad_init()==0 && pad_open(1,0,0,NULL)==1);

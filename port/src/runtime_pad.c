@@ -597,10 +597,21 @@ static uint32_t sample_mouse(PadData *d, const bool *k) {
     return bits;
 }
 /* The mouse finger (sample_mouse) into the pad data: touch (and click) of the left or middle
- * button, or the two fingers of the right one, which play_two_finger makes. */
+ * button, or the two fingers of the right one, laid at the ends of the pad. */
+static uint64_t two_since;
 static void apply_mouse_touch(PadData *d) {
-    if (!mouse_pad.active) return;
-    if (mouse_pad.two_fingers) { d->buttons|=CLICK_LEFT|CLICK_RIGHT; return; }
+    if (!mouse_pad.active) { two_since=0; return; }
+    /* The right button lays both fingers at the ends of the pad and presses it CLICK_LEAD_US
+     * later (gr2 678e18a; the core has no two-finger click gesture of its own). */
+    if (mouse_pad.two_fingers) {
+        if (!two_since) two_since=d->timestamp ? d->timestamp : 1;
+        d->touch_count=0;
+        d->touches[d->touch_count++]=(PadTouch){.x=120,.y=471,.id=20};
+        d->touches[d->touch_count++]=(PadTouch){.x=1800,.y=471,.id=21};
+        if (d->timestamp>=two_since+CLICK_LEAD_US) d->buttons|=BTN_TOUCHPAD;
+        return;
+    }
+    two_since=0;
     if (!mouse_pad.out.touch || d->touch_count>=2) return;
     d->touches[d->touch_count]=(PadTouch){.x=mouse_touch_unit(mouse_pad.out.x,MOUSE_TOUCH_W),
         .y=mouse_touch_unit(mouse_pad.out.y,MOUSE_TOUCH_H),.id=(uint8_t)mouse_pad.out.id};
@@ -647,7 +658,7 @@ static void sample_host(PadData *d) {
     /* The keyboard works with or without a gamepad: its buttons add to the pad's, and a stick
      * follows the keys only while one of them is held. */
     if (!k) return;
-    const uint32_t mouse=sample_mouse(d,motion.mode || k[SDL_SCANCODE_T] || k[SDL_SCANCODE_G],k); /* adds to the right stick */
+    const uint32_t mouse=sample_mouse(d,k); /* adds to the right stick */
     for (size_t i=0;i<key_map.count;++i) {
         const int source=key_map.entries[i].source;
         const bool down=source>=MOUSE_SOURCE ? source<MOUSE_SOURCE_END && (mouse>>(source-MOUSE_SOURCE) & 1)

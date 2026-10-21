@@ -4,6 +4,7 @@
 // apply through "Apply and restart". The launcher reads and writes the same keys.
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <string_view>
 
@@ -32,8 +33,19 @@ constexpr int IndexOf(const std::array<T, N>& values, const T& value, int fallba
     return fallback;
 }
 
+/// Case-insensitive: the launchers wrote "Borderless"/"Fullscreen" and every such tlg.ini
+/// opened the game windowed.
 inline int ParseDisplayMode(std::string_view text) {
-    return IndexOf(DisplayModeKeys, text, Windowed);
+    for (std::size_t i = 0; i < DisplayModeKeys.size(); ++i) {
+        const std::string_view key = DisplayModeKeys[i];
+        if (key.size() == text.size() &&
+            std::equal(key.begin(), key.end(), text.begin(), [](char a, char b) {
+                return a == (b >= 'A' && b <= 'Z' ? char(b - 'A' + 'a') : b);
+            })) {
+            return int(i);
+        }
+    }
+    return Windowed;
 }
 /// A listed limit, else unlimited.
 inline int ParseFpsLimit(int value) {

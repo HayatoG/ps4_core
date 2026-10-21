@@ -29,6 +29,8 @@
 #include <chrono>
 #include <cmath>
 #include <csetjmp>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>

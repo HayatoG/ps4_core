@@ -37,7 +37,7 @@ int main() {
     assert(G::ParseResolution("1440p") == 3 && G::ParseResolution("8K") == 0);
     assert(G::ParseEngineFps(240) == 240 && G::ParseEngineFps(90) == 120);
     assert(G::ParseFramesQueued(2) == 2 && G::ParseFramesQueued(0) == 0 && G::ParseFramesQueued(5) == 1);
-    assert(G::ParseRcasStrength(100) == 100 && G::ParseRcasStrength(101) == 60 && G::ParseRcasStrength(-1) == 60);
+    assert(G::ParseRcasStrength(100) == 100 && G::ParseRcasStrength(101) == 75 && G::ParseRcasStrength(-1) == 75);
     assert(G::RcasAttenuation(100) == 0.0f && G::RcasAttenuation(0) == 2.0f && G::RcasAttenuation(75) == 0.5f);
     assert(G::ParseRcasStrength(101, 50) == 50 && G::CasSharpness(100) == 1.0f && G::CasSharpness(-3) == 0.5f);
     assert(G::ClampColor(G::Gamma, 9.0f) == 2.0f && G::ClampColor(G::Contrast, 0.1f) == 0.5f);
@@ -102,7 +102,7 @@ int main() {
     v.async_shaders = false;
     TlgSettings::Load();
     assert(v.display_mode == G::Windowed && v.fps_limit == 0 && v.render_resolution == 0 && v.engine_fps == 120);
-    assert(v.rcas_strength == 60 && v.frames_queued == 1);
+    assert(v.rcas_strength == 75 && v.frames_queued == 1);
     assert(v.async_shaders);
     {
         std::ofstream out(path);
