@@ -22,8 +22,9 @@ from struct import unpack_from
 import sys
 
 SERIAL = re.compile(r'^[A-Z]{4}[0-9]{5}$')
-# The port's keyed folder name: <serial>-<first 12 hex digits of TLG_SHADER_CACHE_KEY>.
-KEYED = re.compile(r'^([A-Z]{4}[0-9]{5})-[0-9a-f]{12}$')
+# The port's keyed folder name: <serial>-<first 12 hex digits of TLG_SHADER_CACHE_KEY>, with -dma
+# when direct memory access is on (TLG_DIRECT_MEMORY_ACCESS).
+KEYED = re.compile(r'^([A-Z]{4}[0-9]{5})-[0-9a-f]{12}(-dma)?$')
 
 
 def title_id(game_dir):

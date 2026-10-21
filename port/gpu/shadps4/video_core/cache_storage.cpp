@@ -87,7 +87,10 @@ void PruneOtherRevisions(const std::filesystem::path& cache_path) {
     std::error_code ec;
     for (const auto& entry : std::filesystem::directory_iterator(cache_path.parent_path(), ec)) {
         const auto other = entry.path().filename().string();
-        if (entry.is_directory(ec) && other != name &&
+        // tlg: <serial>-<key> and <serial>-<key>-dma (TLG_DIRECT_MEMORY_ACCESS) are the same
+        // revision: switching the option keeps both caches.
+        const std::string base = serial + "-" + TLG_SHADER_CACHE_KEY;
+        if (entry.is_directory(ec) && other != name && other.rfind(base, 0) != 0 &&
             (other == serial || other.rfind(serial + "-", 0) == 0)) {
             LOG_INFO(Render, "Removing shader cache of another recompiler revision: {}", other);
             std::filesystem::remove_all(entry.path(), ec);
@@ -103,8 +106,11 @@ namespace Storage {
 std::filesystem::path GameCacheDir() {
     const std::string serial{Common::ElfInfo::Instance().GameSerial()};
 #ifdef TLG_SHADER_CACHE_KEY
+    // tlg: direct memory access changes how shaders read constants, so its shaders live in a
+    // folder of their own (TLG_DIRECT_MEMORY_ACCESS=1: <serial>-<key>-dma).
     return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
-           (serial + "-" + TLG_SHADER_CACHE_KEY);
+           (serial + "-" + TLG_SHADER_CACHE_KEY +
+            (EmulatorSettings.IsDirectMemoryAccessEnabled() ? "-dma" : ""));
 #else
     return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) / serial;
 #endif

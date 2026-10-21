@@ -65,6 +65,8 @@ port/tools/*
 !port/tests/test_precompile.py
 !port/tests/test_cli_precompile.py
 !port/tests/test_probe_env.py
+!port/tests/test_tlg_patches.py
+!port/tests/test_launcher_options.py
 port/launcher/tlg_vulkan.py
 port/launcher/shader_cache.py
 
